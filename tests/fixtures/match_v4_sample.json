@@ -1,0 +1,2148 @@
+{
+  "status": 200,
+  "data": {
+    "metadata": {
+      "match_id": "11111111-2222-3333-4444-555555555555",
+      "map": {
+        "id": "m-ascent",
+        "name": "Ascent"
+      },
+      "game_version": "release-10.00",
+      "game_length_in_ms": 1920000,
+      "started_at": "2026-11-15T20:04:11Z",
+      "is_completed": true,
+      "queue": {
+        "id": "competitive",
+        "name": "Competitive",
+        "mode_type": "Standard"
+      },
+      "season": {
+        "id": "s-e10a5",
+        "short": "E10A5"
+      },
+      "platform": "pc",
+      "region": "eu",
+      "cluster": "Frankfurt"
+    },
+    "players": [
+      {
+        "puuid": "p-me",
+        "name": "TestMe",
+        "tag": "0001",
+        "team_id": "Blue",
+        "agent": {
+          "id": "a-jett",
+          "name": "Jett"
+        },
+        "stats": {
+          "kills": 13,
+          "deaths": 2,
+          "assists": 3,
+          "score": 4200,
+          "headshots": 4,
+          "bodyshots": 20,
+          "legshots": 1
+        },
+        "account_level": 120
+      },
+      {
+        "puuid": "p-a1",
+        "name": "Ally1",
+        "tag": "1111",
+        "team_id": "Blue",
+        "agent": {
+          "id": "a-omen",
+          "name": "Omen"
+        },
+        "stats": {
+          "kills": 8,
+          "deaths": 9,
+          "assists": 5,
+          "score": 3100,
+          "headshots": 4,
+          "bodyshots": 20,
+          "legshots": 1
+        },
+        "account_level": 120
+      },
+      {
+        "puuid": "p-a2",
+        "name": "Ally2",
+        "tag": "2222",
+        "team_id": "Blue",
+        "agent": {
+          "id": "a-sova",
+          "name": "Sova"
+        },
+        "stats": {
+          "kills": 6,
+          "deaths": 10,
+          "assists": 7,
+          "score": 2800,
+          "headshots": 4,
+          "bodyshots": 20,
+          "legshots": 1
+        },
+        "account_level": 120
+      },
+      {
+        "puuid": "p-a3",
+        "name": "Ally3",
+        "tag": "3333",
+        "team_id": "Blue",
+        "agent": {
+          "id": "a-killjoy",
+          "name": "Killjoy"
+        },
+        "stats": {
+          "kills": 5,
+          "deaths": 11,
+          "assists": 4,
+          "score": 2500,
+          "headshots": 4,
+          "bodyshots": 20,
+          "legshots": 1
+        },
+        "account_level": 120
+      },
+      {
+        "puuid": "p-a4",
+        "name": "Ally4",
+        "tag": "4444",
+        "team_id": "Blue",
+        "agent": {
+          "id": "a-sage",
+          "name": "Sage"
+        },
+        "stats": {
+          "kills": 4,
+          "deaths": 12,
+          "assists": 9,
+          "score": 2400,
+          "headshots": 4,
+          "bodyshots": 20,
+          "legshots": 1
+        },
+        "account_level": 120
+      },
+      {
+        "puuid": "p-f1",
+        "name": "Foe1",
+        "tag": "5555",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-reyna",
+          "name": "Reyna"
+        },
+        "stats": {
+          "kills": 9,
+          "deaths": 10,
+          "assists": 2,
+          "score": 3300,
+          "headshots": 4,
+          "bodyshots": 20,
+          "legshots": 1
+        },
+        "account_level": 120
+      },
+      {
+        "puuid": "p-f2",
+        "name": "Foe2",
+        "tag": "6666",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-raze",
+          "name": "Raze"
+        },
+        "stats": {
+          "kills": 7,
+          "deaths": 11,
+          "assists": 3,
+          "score": 2900,
+          "headshots": 4,
+          "bodyshots": 20,
+          "legshots": 1
+        },
+        "account_level": 120
+      },
+      {
+        "puuid": "p-f3",
+        "name": "Foe3",
+        "tag": "7777",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-brimstone",
+          "name": "Brimstone"
+        },
+        "stats": {
+          "kills": 10,
+          "deaths": 8,
+          "assists": 4,
+          "score": 3400,
+          "headshots": 4,
+          "bodyshots": 20,
+          "legshots": 1
+        },
+        "account_level": 120
+      },
+      {
+        "puuid": "p-f4",
+        "name": "Foe4",
+        "tag": "8888",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-cypher",
+          "name": "Cypher"
+        },
+        "stats": {
+          "kills": 3,
+          "deaths": 9,
+          "assists": 6,
+          "score": 2100,
+          "headshots": 4,
+          "bodyshots": 20,
+          "legshots": 1
+        },
+        "account_level": 120
+      },
+      {
+        "puuid": "p-f5",
+        "name": "Foe5",
+        "tag": "9999",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-skye",
+          "name": "Skye"
+        },
+        "stats": {
+          "kills": 5,
+          "deaths": 10,
+          "assists": 8,
+          "score": 2600,
+          "headshots": 4,
+          "bodyshots": 20,
+          "legshots": 1
+        },
+        "account_level": 120
+      }
+    ],
+    "observers": [],
+    "coaches": [],
+    "teams": [
+      {
+        "team_id": "Blue",
+        "won": true,
+        "rounds": {
+          "won": 13,
+          "lost": 7
+        }
+      },
+      {
+        "team_id": "Red",
+        "won": false,
+        "rounds": {
+          "won": 7,
+          "lost": 13
+        }
+      }
+    ],
+    "rounds": [
+      {
+        "id": 0,
+        "result": "Eliminated",
+        "winning_team": "Blue",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 1,
+        "result": "Eliminated",
+        "winning_team": "Red",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 2,
+        "result": "Eliminated",
+        "winning_team": "Blue",
+        "ceremony": "CeremonyAce"
+      },
+      {
+        "id": 3,
+        "result": "Eliminated",
+        "winning_team": "Red",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 4,
+        "result": "Eliminated",
+        "winning_team": "Blue",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 5,
+        "result": "Eliminated",
+        "winning_team": "Red",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 6,
+        "result": "Eliminated",
+        "winning_team": "Red",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 7,
+        "result": "Eliminated",
+        "winning_team": "Red",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 8,
+        "result": "Eliminated",
+        "winning_team": "Red",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 9,
+        "result": "Eliminated",
+        "winning_team": "Red",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 10,
+        "result": "Detonate",
+        "winning_team": "Red",
+        "ceremony": "CeremonyCloser"
+      },
+      {
+        "id": 11,
+        "result": "Eliminated",
+        "winning_team": "Red",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 12,
+        "result": "Eliminated",
+        "winning_team": "Blue",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 13,
+        "result": "Eliminated",
+        "winning_team": "Red",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 14,
+        "result": "Eliminated",
+        "winning_team": "Blue",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 15,
+        "result": "Eliminated",
+        "winning_team": "Red",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 16,
+        "result": "Eliminated",
+        "winning_team": "Blue",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 17,
+        "result": "Eliminated",
+        "winning_team": "Red",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 18,
+        "result": "Eliminated",
+        "winning_team": "Blue",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 19,
+        "result": "Eliminated",
+        "winning_team": "Red",
+        "ceremony": "CeremonyDefault"
+      },
+      {
+        "id": 20,
+        "result": "Eliminated",
+        "winning_team": "Blue",
+        "ceremony": "CeremonyDefault"
+      }
+    ],
+    "kills": [
+      {
+        "round": 0,
+        "time_in_round_in_ms": 12000,
+        "time_in_match_in_ms": 12000,
+        "killer": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a1",
+          "name": "Ally1",
+          "tag": "1111",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 0,
+        "time_in_round_in_ms": 15000,
+        "time_in_match_in_ms": 15000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 2,
+        "time_in_round_in_ms": 10000,
+        "time_in_match_in_ms": 210000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 2,
+        "time_in_round_in_ms": 15000,
+        "time_in_match_in_ms": 215000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f2",
+          "name": "Foe2",
+          "tag": "6666",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 2,
+        "time_in_round_in_ms": 20000,
+        "time_in_match_in_ms": 220000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 2,
+        "time_in_round_in_ms": 25000,
+        "time_in_match_in_ms": 225000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f4",
+          "name": "Foe4",
+          "tag": "8888",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 2,
+        "time_in_round_in_ms": 30000,
+        "time_in_match_in_ms": 230000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 4,
+        "time_in_round_in_ms": 20000,
+        "time_in_match_in_ms": 420000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 4,
+        "time_in_round_in_ms": 24000,
+        "time_in_match_in_ms": 424000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f2",
+          "name": "Foe2",
+          "tag": "6666",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 4,
+        "time_in_round_in_ms": 28000,
+        "time_in_match_in_ms": 428000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 6,
+        "time_in_round_in_ms": 8000,
+        "time_in_match_in_ms": 608000,
+        "killer": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a1",
+          "name": "Ally1",
+          "tag": "1111",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 6,
+        "time_in_round_in_ms": 11000,
+        "time_in_match_in_ms": 611000,
+        "killer": {
+          "puuid": "p-f2",
+          "name": "Foe2",
+          "tag": "6666",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a2",
+          "name": "Ally2",
+          "tag": "2222",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 6,
+        "time_in_round_in_ms": 14000,
+        "time_in_match_in_ms": 614000,
+        "killer": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a3",
+          "name": "Ally3",
+          "tag": "3333",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 6,
+        "time_in_round_in_ms": 17000,
+        "time_in_match_in_ms": 617000,
+        "killer": {
+          "puuid": "p-f4",
+          "name": "Foe4",
+          "tag": "8888",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a4",
+          "name": "Ally4",
+          "tag": "4444",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 6,
+        "time_in_round_in_ms": 30000,
+        "time_in_match_in_ms": 630000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 6,
+        "time_in_round_in_ms": 36000,
+        "time_in_match_in_ms": 636000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f2",
+          "name": "Foe2",
+          "tag": "6666",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 6,
+        "time_in_round_in_ms": 44000,
+        "time_in_match_in_ms": 644000,
+        "killer": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 8,
+        "time_in_round_in_ms": 10000,
+        "time_in_match_in_ms": 810000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 8,
+        "time_in_round_in_ms": 14000,
+        "time_in_match_in_ms": 814000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f2",
+          "name": "Foe2",
+          "tag": "6666",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 8,
+        "time_in_round_in_ms": 20000,
+        "time_in_match_in_ms": 820000,
+        "killer": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 8,
+        "time_in_round_in_ms": 25000,
+        "time_in_match_in_ms": 825000,
+        "killer": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a1",
+          "name": "Ally1",
+          "tag": "1111",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 8,
+        "time_in_round_in_ms": 28000,
+        "time_in_match_in_ms": 828000,
+        "killer": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a2",
+          "name": "Ally2",
+          "tag": "2222",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 8,
+        "time_in_round_in_ms": 31000,
+        "time_in_match_in_ms": 831000,
+        "killer": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a3",
+          "name": "Ally3",
+          "tag": "3333",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 8,
+        "time_in_round_in_ms": 34000,
+        "time_in_match_in_ms": 834000,
+        "killer": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a4",
+          "name": "Ally4",
+          "tag": "4444",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 10,
+        "time_in_round_in_ms": 10000,
+        "time_in_match_in_ms": 1010000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 10,
+        "time_in_round_in_ms": 14000,
+        "time_in_match_in_ms": 1014000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f2",
+          "name": "Foe2",
+          "tag": "6666",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 10,
+        "time_in_round_in_ms": 18000,
+        "time_in_match_in_ms": 1018000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 10,
+        "time_in_round_in_ms": 22000,
+        "time_in_match_in_ms": 1022000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f4",
+          "name": "Foe4",
+          "tag": "8888",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 10,
+        "time_in_round_in_ms": 26000,
+        "time_in_match_in_ms": 1026000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 10,
+        "time_in_round_in_ms": 46000,
+        "time_in_match_in_ms": 1046000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Judge"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 12,
+        "time_in_round_in_ms": 10000,
+        "time_in_match_in_ms": 1210000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 12,
+        "time_in_round_in_ms": 16000,
+        "time_in_match_in_ms": 1216000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f2",
+          "name": "Foe2",
+          "tag": "6666",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 12,
+        "time_in_round_in_ms": 28000,
+        "time_in_match_in_ms": 1228000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Judge"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 12,
+        "time_in_round_in_ms": 34000,
+        "time_in_match_in_ms": 1234000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 14,
+        "time_in_round_in_ms": 10000,
+        "time_in_match_in_ms": 1410000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 14,
+        "time_in_round_in_ms": 15000,
+        "time_in_match_in_ms": 1415000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f2",
+          "name": "Foe2",
+          "tag": "6666",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 14,
+        "time_in_round_in_ms": 20000,
+        "time_in_match_in_ms": 1420000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 14,
+        "time_in_round_in_ms": 30000,
+        "time_in_match_in_ms": 1430000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-a1",
+          "name": "Ally1",
+          "tag": "1111",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Odin"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 14,
+        "time_in_round_in_ms": 40000,
+        "time_in_match_in_ms": 1440000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Spike"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 16,
+        "time_in_round_in_ms": 6000,
+        "time_in_match_in_ms": 1606000,
+        "killer": {
+          "puuid": "p-a1",
+          "name": "Ally1",
+          "tag": "1111",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 16,
+        "time_in_round_in_ms": 10000,
+        "time_in_match_in_ms": 1610000,
+        "killer": {
+          "puuid": "p-a2",
+          "name": "Ally2",
+          "tag": "2222",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f2",
+          "name": "Foe2",
+          "tag": "6666",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 16,
+        "time_in_round_in_ms": 14000,
+        "time_in_match_in_ms": 1614000,
+        "killer": {
+          "puuid": "p-a3",
+          "name": "Ally3",
+          "tag": "3333",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 16,
+        "time_in_round_in_ms": 18000,
+        "time_in_match_in_ms": 1618000,
+        "killer": {
+          "puuid": "p-a4",
+          "name": "Ally4",
+          "tag": "4444",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f4",
+          "name": "Foe4",
+          "tag": "8888",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 16,
+        "time_in_round_in_ms": 24000,
+        "time_in_match_in_ms": 1624000,
+        "killer": {
+          "puuid": "p-f4",
+          "name": "Foe4",
+          "tag": "8888",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a1",
+          "name": "Ally1",
+          "tag": "1111",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 16,
+        "time_in_round_in_ms": 28000,
+        "time_in_match_in_ms": 1628000,
+        "killer": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a2",
+          "name": "Ally2",
+          "tag": "2222",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 16,
+        "time_in_round_in_ms": 32000,
+        "time_in_match_in_ms": 1632000,
+        "killer": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a3",
+          "name": "Ally3",
+          "tag": "3333",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 16,
+        "time_in_round_in_ms": 36000,
+        "time_in_match_in_ms": 1636000,
+        "killer": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a4",
+          "name": "Ally4",
+          "tag": "4444",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 16,
+        "time_in_round_in_ms": 44000,
+        "time_in_match_in_ms": 1644000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f4",
+          "name": "Foe4",
+          "tag": "8888",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 18,
+        "time_in_round_in_ms": 6000,
+        "time_in_match_in_ms": 1806000,
+        "killer": {
+          "puuid": "p-a1",
+          "name": "Ally1",
+          "tag": "1111",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 18,
+        "time_in_round_in_ms": 12000,
+        "time_in_match_in_ms": 1812000,
+        "killer": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a1",
+          "name": "Ally1",
+          "tag": "1111",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 18,
+        "time_in_round_in_ms": 18000,
+        "time_in_match_in_ms": 1818000,
+        "killer": {
+          "puuid": "p-a2",
+          "name": "Ally2",
+          "tag": "2222",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 18,
+        "time_in_round_in_ms": 22000,
+        "time_in_match_in_ms": 1822000,
+        "killer": {
+          "puuid": "p-a3",
+          "name": "Ally3",
+          "tag": "3333",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f2",
+          "name": "Foe2",
+          "tag": "6666",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 18,
+        "time_in_round_in_ms": 26000,
+        "time_in_match_in_ms": 1826000,
+        "killer": {
+          "puuid": "p-a4",
+          "name": "Ally4",
+          "tag": "4444",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 18,
+        "time_in_round_in_ms": 30000,
+        "time_in_match_in_ms": 1830000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f4",
+          "name": "Foe4",
+          "tag": "8888",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 18,
+        "time_in_round_in_ms": 34000,
+        "time_in_match_in_ms": 1834000,
+        "killer": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a2",
+          "name": "Ally2",
+          "tag": "2222",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 18,
+        "time_in_round_in_ms": 38000,
+        "time_in_match_in_ms": 1838000,
+        "killer": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a3",
+          "name": "Ally3",
+          "tag": "3333",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 18,
+        "time_in_round_in_ms": 42000,
+        "time_in_match_in_ms": 1842000,
+        "killer": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a4",
+          "name": "Ally4",
+          "tag": "4444",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 18,
+        "time_in_round_in_ms": 50000,
+        "time_in_match_in_ms": 1850000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 20,
+        "time_in_round_in_ms": 8000,
+        "time_in_match_in_ms": 2008000,
+        "killer": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 20,
+        "time_in_round_in_ms": 14000,
+        "time_in_match_in_ms": 2014000,
+        "killer": {
+          "puuid": "p-a1",
+          "name": "Ally1",
+          "tag": "1111",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f1",
+          "name": "Foe1",
+          "tag": "5555",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 20,
+        "time_in_round_in_ms": 20000,
+        "time_in_match_in_ms": 2020000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f2",
+          "name": "Foe2",
+          "tag": "6666",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 20,
+        "time_in_round_in_ms": 26000,
+        "time_in_match_in_ms": 2026000,
+        "killer": {
+          "puuid": "p-a2",
+          "name": "Ally2",
+          "tag": "2222",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f3",
+          "name": "Foe3",
+          "tag": "7777",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 20,
+        "time_in_round_in_ms": 30000,
+        "time_in_match_in_ms": 2030000,
+        "killer": {
+          "puuid": "p-a3",
+          "name": "Ally3",
+          "tag": "3333",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f4",
+          "name": "Foe4",
+          "tag": "8888",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 20,
+        "time_in_round_in_ms": 34000,
+        "time_in_match_in_ms": 2034000,
+        "killer": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a1",
+          "name": "Ally1",
+          "tag": "1111",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 20,
+        "time_in_round_in_ms": 38000,
+        "time_in_match_in_ms": 2038000,
+        "killer": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a2",
+          "name": "Ally2",
+          "tag": "2222",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 20,
+        "time_in_round_in_ms": 42000,
+        "time_in_match_in_ms": 2042000,
+        "killer": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a3",
+          "name": "Ally3",
+          "tag": "3333",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 20,
+        "time_in_round_in_ms": 46000,
+        "time_in_match_in_ms": 2046000,
+        "killer": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "victim": {
+          "puuid": "p-a4",
+          "name": "Ally4",
+          "tag": "4444",
+          "team": "Blue"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      },
+      {
+        "round": 20,
+        "time_in_round_in_ms": 54000,
+        "time_in_match_in_ms": 2054000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-f5",
+          "name": "Foe5",
+          "tag": "9999",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-vandal",
+          "name": "Vandal"
+        },
+        "location": {
+          "x": 100,
+          "y": 200
+        }
+      }
+    ]
+  }
+}

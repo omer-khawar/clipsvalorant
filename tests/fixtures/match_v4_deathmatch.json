@@ -1,0 +1,506 @@
+{
+  "status": 200,
+  "data": {
+    "metadata": {
+      "match_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+      "map": {
+        "id": "m-haven",
+        "name": "Haven"
+      },
+      "game_length_in_ms": 480000,
+      "started_at": "2026-11-16T18:00:00Z",
+      "queue": {
+        "id": "deathmatch",
+        "name": "Deathmatch",
+        "mode_type": ""
+      },
+      "region": "eu",
+      "cluster": "Frankfurt"
+    },
+    "players": [
+      {
+        "puuid": "p-me",
+        "name": "TestMe",
+        "tag": "0001",
+        "team_id": "Blue",
+        "agent": {
+          "id": "a-jett",
+          "name": "Jett"
+        },
+        "stats": {
+          "kills": 12,
+          "deaths": 4,
+          "assists": 0,
+          "score": 1000
+        }
+      },
+      {
+        "puuid": "p-r1",
+        "name": "Rando1",
+        "tag": "1111",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-jett",
+          "name": "Jett"
+        },
+        "stats": {
+          "kills": 3,
+          "deaths": 4,
+          "assists": 0,
+          "score": 1000
+        }
+      },
+      {
+        "puuid": "p-r2",
+        "name": "Rando2",
+        "tag": "2222",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-jett",
+          "name": "Jett"
+        },
+        "stats": {
+          "kills": 3,
+          "deaths": 4,
+          "assists": 0,
+          "score": 1000
+        }
+      },
+      {
+        "puuid": "p-r3",
+        "name": "Rando3",
+        "tag": "3333",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-jett",
+          "name": "Jett"
+        },
+        "stats": {
+          "kills": 3,
+          "deaths": 4,
+          "assists": 0,
+          "score": 1000
+        }
+      },
+      {
+        "puuid": "p-r4",
+        "name": "Rando4",
+        "tag": "4444",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-jett",
+          "name": "Jett"
+        },
+        "stats": {
+          "kills": 3,
+          "deaths": 4,
+          "assists": 0,
+          "score": 1000
+        }
+      },
+      {
+        "puuid": "p-r5",
+        "name": "Rando5",
+        "tag": "5555",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-jett",
+          "name": "Jett"
+        },
+        "stats": {
+          "kills": 3,
+          "deaths": 4,
+          "assists": 0,
+          "score": 1000
+        }
+      },
+      {
+        "puuid": "p-r6",
+        "name": "Rando6",
+        "tag": "6666",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-jett",
+          "name": "Jett"
+        },
+        "stats": {
+          "kills": 3,
+          "deaths": 4,
+          "assists": 0,
+          "score": 1000
+        }
+      },
+      {
+        "puuid": "p-r7",
+        "name": "Rando7",
+        "tag": "7777",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-jett",
+          "name": "Jett"
+        },
+        "stats": {
+          "kills": 3,
+          "deaths": 4,
+          "assists": 0,
+          "score": 1000
+        }
+      },
+      {
+        "puuid": "p-r8",
+        "name": "Rando8",
+        "tag": "8888",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-jett",
+          "name": "Jett"
+        },
+        "stats": {
+          "kills": 3,
+          "deaths": 4,
+          "assists": 0,
+          "score": 1000
+        }
+      },
+      {
+        "puuid": "p-r9",
+        "name": "Rando9",
+        "tag": "9999",
+        "team_id": "Red",
+        "agent": {
+          "id": "a-jett",
+          "name": "Jett"
+        },
+        "stats": {
+          "kills": 3,
+          "deaths": 4,
+          "assists": 0,
+          "score": 1000
+        }
+      }
+    ],
+    "teams": [],
+    "rounds": [
+      {
+        "id": 0,
+        "result": "",
+        "winning_team": "",
+        "ceremony": ""
+      }
+    ],
+    "kills": [
+      {
+        "round": 0,
+        "time_in_round_in_ms": 0,
+        "time_in_match_in_ms": 0,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-r1",
+          "name": "Rando1",
+          "tag": "1111",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-classic",
+          "name": "Classic"
+        },
+        "location": {
+          "x": 1,
+          "y": 2
+        }
+      },
+      {
+        "round": 0,
+        "time_in_round_in_ms": 9000,
+        "time_in_match_in_ms": 9000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-r2",
+          "name": "Rando2",
+          "tag": "2222",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-classic",
+          "name": "Classic"
+        },
+        "location": {
+          "x": 1,
+          "y": 2
+        }
+      },
+      {
+        "round": 0,
+        "time_in_round_in_ms": 18000,
+        "time_in_match_in_ms": 18000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-r3",
+          "name": "Rando3",
+          "tag": "3333",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-classic",
+          "name": "Classic"
+        },
+        "location": {
+          "x": 1,
+          "y": 2
+        }
+      },
+      {
+        "round": 0,
+        "time_in_round_in_ms": 27000,
+        "time_in_match_in_ms": 27000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-r1",
+          "name": "Rando1",
+          "tag": "1111",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-classic",
+          "name": "Classic"
+        },
+        "location": {
+          "x": 1,
+          "y": 2
+        }
+      },
+      {
+        "round": 0,
+        "time_in_round_in_ms": 36000,
+        "time_in_match_in_ms": 36000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-r2",
+          "name": "Rando2",
+          "tag": "2222",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-classic",
+          "name": "Classic"
+        },
+        "location": {
+          "x": 1,
+          "y": 2
+        }
+      },
+      {
+        "round": 0,
+        "time_in_round_in_ms": 45000,
+        "time_in_match_in_ms": 45000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-r3",
+          "name": "Rando3",
+          "tag": "3333",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-classic",
+          "name": "Classic"
+        },
+        "location": {
+          "x": 1,
+          "y": 2
+        }
+      },
+      {
+        "round": 0,
+        "time_in_round_in_ms": 54000,
+        "time_in_match_in_ms": 54000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-r1",
+          "name": "Rando1",
+          "tag": "1111",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-classic",
+          "name": "Classic"
+        },
+        "location": {
+          "x": 1,
+          "y": 2
+        }
+      },
+      {
+        "round": 0,
+        "time_in_round_in_ms": 63000,
+        "time_in_match_in_ms": 63000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-r2",
+          "name": "Rando2",
+          "tag": "2222",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-classic",
+          "name": "Classic"
+        },
+        "location": {
+          "x": 1,
+          "y": 2
+        }
+      },
+      {
+        "round": 0,
+        "time_in_round_in_ms": 72000,
+        "time_in_match_in_ms": 72000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-r3",
+          "name": "Rando3",
+          "tag": "3333",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-classic",
+          "name": "Classic"
+        },
+        "location": {
+          "x": 1,
+          "y": 2
+        }
+      },
+      {
+        "round": 0,
+        "time_in_round_in_ms": 81000,
+        "time_in_match_in_ms": 81000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-r1",
+          "name": "Rando1",
+          "tag": "1111",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-classic",
+          "name": "Classic"
+        },
+        "location": {
+          "x": 1,
+          "y": 2
+        }
+      },
+      {
+        "round": 0,
+        "time_in_round_in_ms": 90000,
+        "time_in_match_in_ms": 90000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-r2",
+          "name": "Rando2",
+          "tag": "2222",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-classic",
+          "name": "Classic"
+        },
+        "location": {
+          "x": 1,
+          "y": 2
+        }
+      },
+      {
+        "round": 0,
+        "time_in_round_in_ms": 99000,
+        "time_in_match_in_ms": 99000,
+        "killer": {
+          "puuid": "p-me",
+          "name": "TestMe",
+          "tag": "0001",
+          "team": "Blue"
+        },
+        "victim": {
+          "puuid": "p-r3",
+          "name": "Rando3",
+          "tag": "3333",
+          "team": "Red"
+        },
+        "assistants": [],
+        "weapon": {
+          "id": "w-classic",
+          "name": "Classic"
+        },
+        "location": {
+          "x": 1,
+          "y": 2
+        }
+      }
+    ]
+  }
+}
