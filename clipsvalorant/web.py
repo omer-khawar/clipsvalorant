@@ -644,8 +644,20 @@ class Job:
     finished: float = 0.0
     error: str = ""
     lines: list[str] = field(default_factory=list)
+    # Said out loud, under the progress bar. The log is for afterwards; this
+    # is for the two or three things that change what you should expect from
+    # the run you are watching - a corrected region, a window you did not
+    # actually get.
+    notes: list[str] = field(default_factory=list)
     token: CancelToken = field(default_factory=CancelToken, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def note(self, line: str) -> None:
+        """Say it in the log and keep it in front of the user."""
+        with self._lock:
+            if line not in self.notes:
+                self.notes.append(line)
+        self.say(line)
 
     def stop(self) -> None:
         """Ask this scan to stop, from whichever thread is asking.
@@ -682,6 +694,7 @@ class Job:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             lines = list(self.lines)
+            notes = list(self.notes)
             phase, done, total = self.phase, self.done, self.total
         return {
             "id": self.id,
@@ -694,6 +707,7 @@ class Job:
             "total": total,
             "error": self.error,
             "elapsed": round((self.finished or time.time()) - self.started, 1),
+            "notes": notes,
             "lines": lines,
         }
 
@@ -743,7 +757,7 @@ def _correct_region(acct: Config, job: Job) -> Config:
     real = str(info.get("region") or "").strip().lower()
     if not real or real == acct.region.lower():
         return acct
-    job.say(
+    job.note(
         f"{acct.riot_id} plays on {real.upper()}, not {acct.region.upper()} - "
         f"searching {real.upper()} instead."
     )
@@ -812,9 +826,11 @@ def run_search(
                     (cutoff,),
                 )
             ]
-            newest = conn.execute(
-                "SELECT MAX(started_at_epoch) AS newest FROM match"
-            ).fetchone()["newest"]
+            edges = conn.execute(
+                "SELECT MAX(started_at_epoch) AS newest,"
+                "       MIN(started_at_epoch) AS oldest FROM match"
+            ).fetchone()
+            newest, oldest = edges["newest"], edges["oldest"]
 
         if not ids:
             if newest:
@@ -835,10 +851,19 @@ def run_search(
             job.state = "done"
             return
 
-        if len(ids) >= fetch:
-            job.say(
-                f"Stopped at the {fetch}-match ceiling, so the last {days} days "
-                "may hold more than this."
+        # The ceiling only truncated the window if we ran out of matches
+        # before running out of days. A listing that came back full but still
+        # reaches past the cutoff covered everything that was asked for, and
+        # warning there would cry wolf on every scan by a busy player.
+        covered = (time.time() - oldest) / 86400 if oldest else 0.0
+        if report.seen >= fetch and covered < days * 0.9:
+            # A tenth of the window, not a second of it. A listing that lands
+            # on the boundary has covered what was asked for, and a warning
+            # that fires every time stops being read.
+            job.note(
+                f"Hit the {fetch}-match ceiling after {covered:.1f} days, so this "
+                f"is the most recent {fetch} matches rather than the full {days}. "
+                "Pick a shorter window, or scan again later."
             )
 
         if not acct.has_twitch:
@@ -1322,6 +1347,12 @@ body{
   transition:width .45s cubic-bezier(.22,1,.36,1)}
 .pfill.indet{width:35%;animation:slide 1.4s ease-in-out infinite}
 @keyframes slide{0%{transform:translateX(-110%)}100%{transform:translateX(330%)}}
+.notes{display:grid;gap:6px;margin-top:10px}
+.notes:empty{display:none}
+.notes div{font-size:12.5px;color:var(--ink);padding:8px 11px;border-radius:10px;
+  border:1px solid var(--line);background:var(--panel);line-height:1.45}
+.notes div::before{content:"";display:inline-block;width:5px;height:5px;border-radius:50%;
+  background:var(--accent);margin-right:8px;vertical-align:middle}
 .logbtn{margin-top:10px;border:0;background:none;color:var(--faint);font:inherit;font-size:11px;
   text-transform:uppercase;letter-spacing:.24em;cursor:pointer;padding:0}
 .logbtn:hover{color:var(--ink)}
@@ -1589,6 +1620,7 @@ body{
     <div class="prog" id="prog" hidden>
       <div class="pmeta"><span id="pphase">Starting</span><span id="ppct" class="mono"></span></div>
       <div class="ptrack"><div class="pfill" id="pfill"></div></div>
+      <div class="notes" id="notes"></div>
       <button class="logbtn" id="logbtn" type="button" aria-expanded="false">Show log</button>
       <pre class="log" id="log" hidden></pre>
     </div>
@@ -2209,6 +2241,12 @@ function poll(){
       fill.classList.add("indet"); fill.style.width = "";
       $("#ppct").textContent = j.elapsed + "s";
     }
+    var notes = $("#notes");
+    if (notes) {
+      notes.innerHTML = (j.notes || []).map(function(n){
+        return "<div>" + esc(n) + "</div>";
+      }).join("");
+    }
     var log = $("#log");
     log.textContent = (j.lines || []).join("\n");
     log.scrollTop = log.scrollHeight;
@@ -2234,7 +2272,12 @@ $("#scanform").addEventListener("submit", function(ev){
   if (!riot) { fail("Enter a Riot ID as name#tag."); return; }
   api("/api/search", {
     method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({riot_id: riot, days: S.days, watch: true})
+    /* The ceiling has to follow the window, or picking 14 days quietly
+       gives you eight. Listing more costs one call whatever the size - only
+       matches that are new AND inside the window are fetched in detail - so
+       this is close to free. */
+    body: JSON.stringify({riot_id: riot, days: S.days, watch: true,
+                          fetch: Math.min(100, Math.max(40, S.days * 8))})
   }).then(function(){ $("#log").textContent = ""; watch(); })
     .catch(function(e){ fail(String(e.message || e)); });
 });
