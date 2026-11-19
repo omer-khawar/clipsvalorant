@@ -22,7 +22,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from clipsvalorant import db, web
+from clipsvalorant import calibrate, db, web
 
 MATCH_START = 1_700_000_000
 VOD_START = MATCH_START - 600  # the stream began ten minutes before the match
@@ -44,6 +44,7 @@ def add_everything(
     evidence=None,
     channel="streamer",
     match_id="m1",
+    shift_s=None,
 ):
     """One match, one covering broadcast, one encounter, and some highlights."""
     conn.execute(
@@ -72,6 +73,12 @@ def add_everything(
          "name_match", verdict,
          json.dumps(evidence) if evidence is not None else None, ""),
     )
+    if shift_s is not None:
+        conn.execute(
+            "INSERT OR REPLACE INTO match_vod_offset (match_id, vod_id, shift_s, "
+            "method, votes, measured_at) VALUES (?,?,?,?,?,?)",
+            (match_id, vod_id, shift_s, "measured", 6, ""),
+        )
     conn.commit()
 
 
@@ -149,13 +156,35 @@ def test_known_accounts_skips_files_that_are_not_ours(tmp_path):
 
 # ------------------------------------------------------------ the clip list
 
-def test_offset_is_match_start_plus_moment_minus_stream_start_minus_lead(conn):
-    add_everything(conn, at_ms=(120_000,))
+def test_offset_uses_the_measured_start_of_the_match(conn):
+    """The arithmetic that was wrong for the whole life of the project.
+
+    A match's own timestamp is the queue popping; its in-match clock starts
+    when the map loads. Adding them together ignores agent select and skips
+    back about a round and a half.
+    """
+    add_everything(conn, at_ms=(120_000,), shift_s=100.0)
     clip = web.clip_groups(conn)[0]["clips"][0]
-    # 600s into the broadcast, 120s into the match, 8s of lead-in.
-    assert clip["offset"] == 600 + 120 - web.LEAD_S
-    assert clip["stamp"] == "00h11m52s"
+    # 600s into the broadcast, 100s of agent select and loading, 120s into
+    # the match, 8s of lead-in.
+    assert clip["offset"] == 600 + 100 + 120 - web.LEAD_S
+    assert clip["stamp"] == "00h13m32s"
     assert clip["playable"]
+
+
+def test_offset_falls_back_to_the_median_when_nobody_measured(conn):
+    add_everything(conn, at_ms=(120_000,))
+    group = web.clip_groups(conn)[0]
+    assert group["timing"] == "estimated"
+    assert group["clips"][0]["offset"] == (
+        600 + int(calibrate.FALLBACK_SHIFT_S) + 120 - web.LEAD_S
+    )
+
+
+def test_a_measured_group_says_so(conn):
+    add_everything(conn, shift_s=97.0)
+    group = web.clip_groups(conn)[0]
+    assert group["timing"] == "measured" and group["shift_s"] == 97.0
 
 
 def test_lead_is_subtracted_not_added(conn):
@@ -199,10 +228,22 @@ def test_rejected_encounters_never_reach_the_page(conn):
     assert web.clip_groups(conn) == []
 
 
-def test_confirmed_sorts_above_unverified(conn):
-    add_everything(conn, channel="maybe", verdict="unconfirmed", match_id="m1")
+def test_confirmed_sorts_above_likely(conn):
+    add_everything(conn, channel="maybe", verdict="likely", match_id="m1")
     add_everything(conn, channel="sure", verdict="confirmed", match_id="m2")
-    assert [g["verdict"] for g in web.clip_groups(conn)] == ["confirmed", "unconfirmed"]
+    assert [g["verdict"] for g in web.clip_groups(conn)] == ["confirmed", "likely"]
+
+
+def test_unconfirmed_never_reaches_the_page(conn):
+    """An unconfirmed row is the absence of a judgement, not a weak one.
+
+    Nothing says the broadcast is even Valorant. Giving it timestamps makes
+    it indistinguishable on screen from a streamer we actually found, which
+    is how twitch.tv/solly17x came to be listed with five playable moments
+    of a stream that was Elden Ring from end to end.
+    """
+    add_everything(conn, verdict="unconfirmed")
+    assert web.clip_groups(conn) == []
 
 
 def test_one_group_per_streamer_per_match(conn):

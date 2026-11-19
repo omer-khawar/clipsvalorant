@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
-from clipsvalorant import db
+from clipsvalorant import calibrate, db
 from clipsvalorant.config import Config
 
 log = logging.getLogger(__name__)
@@ -180,23 +180,20 @@ def _evidence_reasons(blob: str | None) -> list[str]:
         return []
 
 
-def _stamp(offset_s: int) -> str:
-    hours, rest = divmod(max(offset_s, 0), 3600)
-    minutes, seconds = divmod(rest, 60)
-    return f"{hours:02d}h{minutes:02d}m{seconds:02d}s"
-
-
 _CLIP_SQL = """
 SELECT e.match_id, e.riot_id, e.channel_login, e.vod_id, e.verdict,
        e.same_team, e.evidence, e.verified_how,
        m.started_at_epoch, m.map, m.mode, m.queue,
        v.created_epoch, v.duration_s, v.title,
-       h.round, h.label, h.kind, h.kill_count, h.time_in_match_ms, h.round_won
+       h.round, h.label, h.kind, h.kill_count, h.time_in_match_ms, h.round_won,
+       o.shift_s, o.method
 FROM encounter e
 JOIN match m      ON m.id = e.match_id
 JOIN twitch_vod v ON v.id = e.vod_id
 JOIN highlight h  ON h.match_id = e.match_id
-WHERE e.vod_id IS NOT NULL AND e.verdict IS NOT NULL AND e.verdict != 'rejected'
+LEFT JOIN match_vod_offset o
+       ON o.match_id = e.match_id AND o.vod_id = e.vod_id
+WHERE e.vod_id IS NOT NULL AND e.verdict IN ('confirmed', 'likely')
 ORDER BY m.started_at_epoch DESC, h.time_in_match_ms ASC
 """
 
@@ -231,13 +228,17 @@ def clip_groups(conn: sqlite3.Connection, *, lead: int = LEAD_S) -> list[dict[st
                 ).strftime("%Y-%m-%d %H:%M UTC"),
                 "vod_title": row["title"] or "",
                 "reasons": _evidence_reasons(row["evidence"]),
+                "timing": row["method"] or "estimated",
+                "shift_s": row["shift_s"] if row["shift_s"] is not None
+                           else calibrate.FALLBACK_SHIFT_S,
                 "clips": [],
             }
-        offset = (
-            row["started_at_epoch"]
-            + row["time_in_match_ms"] // 1000
-            - row["created_epoch"]
-            - lead
+        offset = calibrate.moment_offset(
+            match_start_epoch=row["started_at_epoch"],
+            vod_created_epoch=row["created_epoch"],
+            time_in_match_ms=row["time_in_match_ms"],
+            shift_s=group["shift_s"],
+            lead_s=lead,
         )
         duration = row["duration_s"] or 0
         if offset < 0:
@@ -253,11 +254,12 @@ def clip_groups(conn: sqlite3.Connection, *, lead: int = LEAD_S) -> list[dict[st
             "kills": row["kill_count"],
             "won": None if row["round_won"] is None else bool(row["round_won"]),
             "offset": max(offset, 0),
-            "stamp": _stamp(offset),
+            "stamp": calibrate.stamp(offset),
             "playable": not why,
             "why_not": why,
             "url": (
-                f"https://www.twitch.tv/videos/{row['vod_id']}?t={_stamp(offset)}"
+                f"https://www.twitch.tv/videos/{row['vod_id']}"
+                f"?t={calibrate.stamp(offset)}"
             ),
         })
 
@@ -730,6 +732,7 @@ PAGE = r"""<!doctype html>
   }
   .note { color: var(--dim); font-size: 13px; }
   .err { color: var(--accent); }
+  .warn { color: var(--warn); }
   .spin {
     display: inline-block; width: 11px; height: 11px; margin-right: 7px;
     border: 2px solid var(--line); border-top-color: var(--accent);
@@ -833,6 +836,13 @@ function card(group) {
     + '<div class="meta">' + esc(group.riot_id) + " &middot; " + esc(group.map)
     + " &middot; " + esc(group.mode) + " &middot; " + esc(group.started_text)
     + (group.vod_title ? " &middot; &ldquo;" + esc(group.vod_title) + "&rdquo;" : "")
+    // A match's own timestamp is the queue popping, not the map loading, so
+    // the gap was measured off the screen. Where it could not be, the median
+    // stands in and the timings are a few seconds loose - say which.
+    + (group.timing === "measured" ? ""
+        : '<br><span class="warn">start of match not read off this broadcast'
+          + " &mdash; these timings use the "
+          + Math.round(group.shift_s) + "s median and may be seconds out</span>")
     + "</div>";
 
   const row = document.createElement("div");

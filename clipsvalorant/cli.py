@@ -288,6 +288,7 @@ def resolve(
 
 def _show(conn, cand, lead: int, *, colour: str, marker: str) -> None:
     """One candidate: who, where, on what evidence, and the timestamps."""
+    from clipsvalorant import calibrate
     from clipsvalorant.resolve import vod_link
 
     # Keyed on the match this candidate came from. A channel that streams daily
@@ -319,12 +320,20 @@ def _show(conn, cand, lead: int, *, colour: str, marker: str) -> None:
     ).fetchall()
     if not highlights:
         typer.echo("      (no highlights of yours in this match)")
+    cal = calibrate.load(conn, row["id"], cand.vod.id)
+    if not cal.measured and highlights:
+        typer.secho(
+            f"      (start of match not read off the broadcast; these use the "
+            f"{cal.shift_s:.0f}s median and may be seconds out)",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
     for h in highlights:
-        offset = (
-            row["started_at_epoch"]
-            + h["time_in_match_ms"] // 1000
-            - cand.vod.created_epoch
-            - lead
+        offset = calibrate.moment_offset(
+            match_start_epoch=row["started_at_epoch"],
+            vod_created_epoch=cand.vod.created_epoch,
+            time_in_match_ms=h["time_in_match_ms"],
+            shift_s=cal.shift_s,
+            lead_s=lead,
         )
         # A stream that started mid-match simply does not contain the earlier
         # moments. Say so rather than silently linking to t=0.
@@ -401,9 +410,9 @@ def audit(
     """
     _setup_logging(verbose)
     cfg = _config(require_api_key=False)
-    from clipsvalorant.resolve import audit_rejections
+    from clipsvalorant.resolve import audit_verdicts
 
-    flips, notes = audit_rejections(cfg, limit=limit, frames=frames)
+    flips, notes = audit_verdicts(cfg, limit=limit, frames=frames)
     for note in notes:
         typer.echo(note)
     if not flips:
@@ -416,6 +425,36 @@ def audit(
     for flip in flips:
         typer.secho(f"  {flip}", fg=typer.colors.RED)
     typer.echo("\nThese have been corrected to confirmed. Run 'highlights' for links.")
+
+
+@app.command(name="calibrate")
+def calibrate_cmd(
+    limit: Annotated[int, typer.Option(help="How many encounters to measure.")] = 50,
+    force: Annotated[
+        bool, typer.Option("--force", help="Re-measure ones already measured.")
+    ] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """Measure where each confirmed match really starts inside its broadcast.
+
+    A match carries one wall-clock timestamp and one in-match clock, and they
+    do not share a zero: the timestamp is the queue popping, the clock starts
+    when the map loads. Agent select and loading sit in between - 101, 109 and
+    125 seconds on the three broadcasts this was measured against - so adding
+    the two together lands about a round and a half early.
+
+    This reads the countdown off the screen and writes down the real gap. It
+    costs frames, not API calls.
+    """
+    _setup_logging(verbose)
+    cfg = _config(require_api_key=False)
+    from clipsvalorant.calibrate import backfill
+
+    notes = backfill(cfg, limit=limit, force=force)
+    for note in notes:
+        typer.echo(note)
+    typer.secho("\nLinks will now point at the play rather than a round before it.",
+                fg=typer.colors.GREEN)
 
 
 @app.command()

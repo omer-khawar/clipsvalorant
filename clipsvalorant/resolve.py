@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
-from clipsvalorant import db
+from clipsvalorant import calibrate, db
 from clipsvalorant.config import Config
 from clipsvalorant.models import Match, Player
 from clipsvalorant.twitch import TwitchClient, Vod
@@ -386,6 +386,8 @@ class ResolveReport:
     clip_channels: int = 0
     bios_read: int = 0
     frames_read: int = 0
+    calibrated: int = 0
+    uncalibrated: int = 0
     confirmed: list[Candidate] = field(default_factory=list)
     candidates: list[Candidate] = field(default_factory=list)
     rejected: list[Candidate] = field(default_factory=list)
@@ -751,6 +753,9 @@ def resolve_match(
     # when Valorant was painting names on the screen.
     lobby = wanted_names([(p.name, p.puuid == my_puuid) for p in match.players])
     my_name = me.name if me else ""
+    # Calibration dates a frame by reading the countdown on it, which only
+    # means anything against the times the rounds actually began.
+    round_starts = calibrate.round_starts(match.kills)
     kills = [
         (row["round"], row["time_in_match_ms"] / 1000)
         for row in conn.execute(
@@ -789,6 +794,34 @@ def resolve_match(
         ev.vod_not_this_match = seen.saw_nothing
         report.frames_read += seen.frames_read
 
+    def calibrate_vod(cand: Candidate) -> None:
+        """Measure where this match really starts in this broadcast.
+
+        Only for candidates that survived, and only once per broadcast. It
+        costs around a dozen frames, which is the same order as the check
+        that confirmed them - worth paying for a link that lands on the
+        play, and pure waste on the ninety-odd channels ruled out.
+        """
+        if watcher is None or cand.vod is None or cand.verdict == "rejected":
+            return
+        if calibrate.load(conn, match.id, cand.vod.id).measured:
+            return
+        base = start - cand.vod.created_epoch
+        lo = max(0.0, cand.vod.created_epoch - start) + base
+        hi = min(end, cand.vod.end_epoch) - start + base
+        cal = calibrate.measure(
+            watcher.reader, watcher.frames, cand.vod.id,
+            base=base, starts=round_starts, window=(lo, hi),
+        )
+        if cal.measured:
+            calibrate.store(conn, match.id, cand.vod.id, cal)
+            report.calibrated += 1
+            log.info("%s starts %.0fs into VOD %s beyond its own timestamp "
+                     "(%d frames agreed)", match.id[:8], cal.shift_s,
+                     cand.vod.id, cal.votes)
+        else:
+            report.uncalibrated += 1
+
     def finish(cand: Candidate) -> None:
         gather_evidence(client, conn, cand, match, start, end, game_id, report)
         inspect(cand)
@@ -796,6 +829,7 @@ def resolve_match(
         if cand.verdict == "confirmed":
             _remember_alias(conn, cand.player, cand.channel_id,
                             cand.source.split(":")[-1], cand.confidence)
+        calibrate_vod(cand)
         report.file(cand)
 
     for player in match.players:
@@ -871,10 +905,10 @@ def resolve_match(
             finish(cand)
 
 
-def audit_rejections(
+def audit_verdicts(
     cfg: Config, *, limit: int = 100, frames: int = MAX_FRAMES * 2
 ) -> tuple[list[str], list[str]]:
-    """Re-open broadcasts we ruled out, and check whether we were wrong.
+    """Re-open broadcasts nobody looked at properly, and settle them.
 
     Rejections are not all equal, and the difference matters. Nearly all of
     them say only "no broadcast of this match survived", which no amount of
@@ -883,9 +917,18 @@ def audit_rejections(
     were all something else, a screen we read too few frames of. Those were
     decided on circumstance, and a missed streamer could only be hiding there.
 
-    So this walks exactly that set, re-reads each broadcast with twice the
-    usual frame budget, and reports anything that turns out to have been the
-    match after all. Returns (flips, notes).
+    Unconfirmed rows need the same treatment for the opposite reason. They
+    are not a judgement either - they are the absence of one, left behind
+    when a broadcast was never read, and they are the more dangerous kind.
+    A rejection that was wrong hides a streamer; an unconfirmed row that is
+    wrong *shows* one, with timestamps beside it that look exactly like the
+    confirmed sort. twitch.tv/solly17x sat in this state for a fortnight on
+    nothing but a name that begins the same way and a stream that happened to
+    be running - it was Elden Ring throughout.
+
+    So this walks both sets, re-reads each broadcast with twice the usual
+    frame budget, confirms the ones that turn out to be the match, and rules
+    out the unconfirmed ones that plainly are not. Returns (flips, notes).
     """
     flips: list[str] = []
     notes: list[str] = []
@@ -896,12 +939,13 @@ def audit_rejections(
     with db.session(cfg.db_path) as conn:
         rows = conn.execute(
             "SELECT e.id, e.match_id, e.riot_id, e.channel_login, e.vod_id, "
-            "       e.evidence, m.started_at_epoch AS start, m.game_length_ms, "
+            "       e.evidence, e.verdict, m.started_at_epoch AS start, m.game_length_ms, "
             "       v.created_epoch, v.end_epoch, v.title "
             "FROM encounter e "
             "JOIN match m ON m.id = e.match_id "
             "JOIN twitch_vod v ON v.id = e.vod_id "
-            "WHERE e.verdict = 'rejected' AND e.vod_id IS NOT NULL "
+            "WHERE e.verdict IN ('rejected', 'unconfirmed') "
+            "  AND e.vod_id IS NOT NULL "
             "ORDER BY m.started_at_epoch DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -936,6 +980,11 @@ def audit_rejections(
                 watcher.reader, watcher.frames, row["vod_id"],
                 start - row["created_epoch"], kills, lobby, my_name,
                 limit=frames, window=(lo, hi),
+                # The same exclusion the live path makes, and for the same
+                # reason: this channel is a candidate because it is named
+                # like the player, so its own overlay agreeing with itself
+                # is not evidence of anything.
+                exclude_name=row["riot_id"].partition("#")[0],
             )
             if len(seen.names) >= CERTAIN_NAMES:
                 flips.append(
@@ -949,6 +998,18 @@ def audit_rejections(
                     (row["id"],),
                 )
                 conn.commit()
+            elif row["verdict"] == "unconfirmed" and seen.saw_nothing:
+                notes.append(
+                    f"{row['riot_id']} -> twitch.tv/{row['channel_login']}: "
+                    f"read {seen.frames_read} frames and found no Valorant at all "
+                    "- ruled out"
+                )
+                conn.execute(
+                    "UPDATE encounter SET verdict = 'rejected', "
+                    "verified_how = 'audit:not_this_match' WHERE id = ?",
+                    (row["id"],),
+                )
+                conn.commit()
             elif seen.names:
                 notes.append(
                     f"{row['riot_id']} -> twitch.tv/{row['channel_login']}: "
@@ -957,8 +1018,8 @@ def audit_rejections(
                 )
         notes.insert(
             0,
-            f"{len(rows)} rejection(s) had a broadcast on file; {checked} held enough "
-            "of the match to be worth re-reading",
+            f"{len(rows)} undecided encounter(s) had a broadcast on file; {checked} "
+            "held enough of the match to be worth re-reading",
         )
     return flips, notes
 

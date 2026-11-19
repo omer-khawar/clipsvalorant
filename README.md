@@ -77,10 +77,13 @@ Three things on the page are worth knowing about:
   stored — so two accounts sharing one file would mean one of them silently owning the
   other's highlights. Searching `Someone#ELSE` writes `data/ui-someone-else.db`, and
   the dropdown lists every account searched on this machine.
-- **Confirmed and unverified are kept apart,** with the evidence behind each verdict one
-  click away under *why we think this is them*. An unverified channel was broadcasting
-  across your match and nothing more; a short Riot ID collides with an established
-  streamer more often than not.
+- **Only confirmed and likely encounters get clips.** An *unconfirmed* row is not a weak
+  judgement, it is the absence of one — nothing says the broadcast was even Valorant.
+  Giving those timestamps makes them indistinguishable on screen from a streamer we
+  actually found, which is how `twitch.tv/solly17x` came to be listed with five playable
+  moments of a stream that was Elden Ring from end to end. `python -m clipsvalorant
+  audit` now re-reads those rows and rules them out. The evidence behind every verdict
+  is one click away under *why we think this is them*.
 - **A moment outside the broadcast is shown, not hidden.** A stream that began at round
   14 cannot contain round 2, and one that ended early cannot contain the last round.
   Both say so on the button instead of linking somewhere wrong — Twitch answers an
@@ -188,6 +191,56 @@ a known difference rather than contorting the model to match.
 
 Getting tracker's data out needs a real browser: `api.tracker.gg` returns 403 to
 automated clients, and the match list lives in the page's own `TRN_PINIA` store.
+
+### The two clocks, and the bug that lived between them
+
+A match carries two kinds of time and they do not share a zero.
+`metadata.started_at` is wall-clock — the moment the game server session opens, which
+is when the queue pops and agent select appears. `time_in_match_in_ms`, on every kill,
+counts from when the map finishes loading. Agent select and loading sit between them.
+
+Adding the two together is the obvious thing to do, and it is what this project did
+until it was checked against actual video. Every link came out about a round and a half
+early. Nothing errored. The link opened the right broadcast, on the right map, inside
+the right match, and the play it promised had not happened yet — which is why it
+survived so long: it looks exactly like a correct link, and the detection behind it
+genuinely was correct.
+
+The gap is not a constant. Measured by reading the screen:
+
+| Broadcast | Map | Gap |
+|---|---|---|
+| twitch.tv/vaerie | Corrode | 101s |
+| twitch.tv/cocapuppy | Sunset | 109s |
+| twitch.tv/yayster | Bind | 125s |
+| twitch.tv/yayster | Haven | 79s |
+
+Agent select is fixed; the rest is ten people's machines loading a map, and that is the
+spread. A single constant would leave a link up to twenty-odd seconds out, which on a
+3K is the difference between the fight and the walk towards it.
+
+So it is measured per match, per broadcast, in `calibrate.py`. Valorant draws a
+countdown at the top centre of the screen in every round — the buy phase counts down to
+the barriers dropping, the round itself counts down from 1:40 — and the kill data gives
+the exact moment each round began on the in-match clock. Read the countdown off a frame
+and the frame is dated; the difference between where it sits in the broadcast and where
+it sits in the match is the number.
+
+One frame cannot say *which* round it is looking at, so each one offers an answer per
+round and the answer that keeps recurring across frames wins. A shift that is out by a
+whole round would have to fit every frame at once, and real rounds do not run to a
+fixed length — 85s, then 74s, then 90s — so it cannot. In practice five to eight frames
+agree to within a second.
+
+```bash
+python -m clipsvalorant calibrate
+```
+Measures every confirmed encounter not yet measured. Costs frames, not API calls. New
+resolves do it automatically; this is for links found before the module existed.
+
+Where it cannot be measured — no OCR installed, or a stream that joined too late to
+show a countdown — the 109s median stands in, and the UI says so on the card rather
+than presenting a guess as a measurement.
 
 ### How a streamer is confirmed, and the two ways to get it wrong
 

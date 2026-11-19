@@ -166,11 +166,34 @@ CREATE TABLE IF NOT EXISTS encounter (
 
 CREATE INDEX IF NOT EXISTS idx_encounter_match ON encounter (match_id);
 
--- Measured VOD offsets, so each VOD is calibrated once and reused.
+-- Superseded by match_vod_offset below, which this never grew a row in.
+-- Keyed by VOD alone, which cannot work: one broadcast routinely contains
+-- several matches, and each one needs its own answer.
 CREATE TABLE IF NOT EXISTS vod_calibration (
     vod_id              TEXT PRIMARY KEY,
     measured_offset_s   REAL NOT NULL,
     drift_ms_per_hour   REAL,
     method              TEXT,
     measured_at         TEXT NOT NULL
+);
+
+-- How far a match sits into a broadcast beyond what its own timestamp says.
+--
+-- `metadata.started_at` is when the game server session opened - the queue
+-- pop - while `time_in_match_in_ms` counts from when the map finished
+-- loading. Agent select and loading sit between them, measured at 101, 109
+-- and 125 seconds on three broadcasts. Adding the two clocks together lands
+-- about a round and a half early, in the right match, on the right map,
+-- which is why nothing caught it for so long.
+--
+-- `method` is 'measured' when a countdown was read off the screen and
+-- 'estimated' when the median stood in, and the two are never shown alike.
+CREATE TABLE IF NOT EXISTS match_vod_offset (
+    match_id        TEXT NOT NULL REFERENCES match(id) ON DELETE CASCADE,
+    vod_id          TEXT NOT NULL,
+    shift_s         REAL NOT NULL,
+    method          TEXT NOT NULL,
+    votes           INTEGER NOT NULL DEFAULT 0,
+    measured_at     TEXT NOT NULL,
+    PRIMARY KEY (match_id, vod_id)
 );
