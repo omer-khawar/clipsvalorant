@@ -1,0 +1,27 @@
+# HTTPS for one hostname, and nothing else.
+#
+# Caddy asks Let's Encrypt for a certificate the first time it starts and
+# renews it from then on. That only works if the hostname already resolves to
+# this machine and ports 80 and 443 are actually reachable - which on Oracle
+# means opening them in TWO places. ORACLE.md covers it.
+
+{$SITE_HOST} {
+	encode zstd gzip
+
+	reverse_proxy app:8080 {
+		# A scan runs on a worker thread and the page polls for progress, so
+		# no single request should be slow. The generous timeout is for the
+		# case where one is anyway: a response cut off mid-scan looks to the
+		# page exactly like a server that died, and sends somebody to ask why
+		# the site is broken when it is busy working.
+		transport http {
+			read_timeout 30m
+			write_timeout 30m
+		}
+	}
+
+	# Caddy logs to stdout so `docker compose logs caddy` is the whole story.
+	log {
+		output stdout
+	}
+}

@@ -1,0 +1,18 @@
+# Runs the keepalive health check once. Driven by the .timer beside it.
+#
+# A systemd timer rather than a crontab line because Oracle's Ubuntu image
+# ships without the cron package, and `crontab -` fails silently there -
+# which is the worst way for the thing guarding against reclamation to be
+# missing.
+
+[Unit]
+Description=val:grind health check and DNS refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/clipsvalorant-keepalive
+User=ubuntu
+StandardOutput=append:/var/log/clipsvalorant-keepalive.log
+StandardError=append:/var/log/clipsvalorant-keepalive.log

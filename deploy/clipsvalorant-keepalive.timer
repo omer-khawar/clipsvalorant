@@ -1,0 +1,27 @@
+# Fires the keepalive hourly.
+#
+# Oracle reclaims an Always Free instance only when CPU, network AND (on Arm)
+# memory all sit under 20% for seven continuous days, so hourly is far more
+# often than the policy needs. It is this frequent because it doubles as the
+# monitoring: an hourly 200 in the log is how you know the certificate still
+# renews and the containers still answer.
+#
+# Install:
+#   sudo cp clipsvalorant-keepalive.* /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now clipsvalorant-keepalive.timer
+
+[Unit]
+Description=Run the val:grind health check hourly
+
+[Timer]
+# Seventeen minutes past, not on the hour, to stay off the crowded minute
+# that every other scheduled job in the world picks.
+OnCalendar=*-*-* *:17:00
+# If the machine was off when it was due, run once after boot rather than
+# silently skipping until the next hour.
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

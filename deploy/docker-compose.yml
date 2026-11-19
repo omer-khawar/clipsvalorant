@@ -1,0 +1,59 @@
+# The deployed stack: the app, and Caddy in front of it for HTTPS.
+#
+# Two containers rather than one because the app speaks plain HTTP and has no
+# business holding a certificate. Caddy gets one from Let's Encrypt on its
+# own, renews it on its own, and needs nothing from us but a hostname.
+#
+# Run from this directory: docker compose up -d --build
+# The systemd unit beside this file does exactly that on boot.
+
+services:
+  app:
+    build:
+      # The Dockerfile is at the repo root, and copies pyproject.toml and the
+      # package from there, so the build context has to be the repo - not this
+      # directory.
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # Keys and the shared password. This file is never committed; ORACLE.md
+    # says how to write it on the machine.
+    env_file: .env
+    environment:
+      # Overrides whatever .env says, because in here the only writable place
+      # that survives a rebuild is the mounted volume.
+      DB_PATH: /data/clipsvalorant.db
+      PORT: "8080"
+    volumes:
+      - app_data:/data
+    # No `ports:` on purpose. The app is reachable only through Caddy, so
+    # nothing answers on 8080 from the internet even if the firewall is wrong.
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Substituted by compose from .env in this directory, then read by the
+      # Caddyfile as {$SITE_HOST}.
+      SITE_HOST: ${SITE_HOST}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # The certificate and its renewal state. Losing this means asking
+      # Let's Encrypt for a new certificate on every restart, which is how
+      # people hit its rate limits.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  # The per-account databases, the artwork cache and the frames pulled out of
+  # VODs - everything the app treats as state.
+  app_data:
+  caddy_data:
+  caddy_config:

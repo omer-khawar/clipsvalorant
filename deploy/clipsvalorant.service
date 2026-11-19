@@ -1,0 +1,35 @@
+# Starts the stack on boot and puts it back after a crash.
+#
+# Install:
+#   sudo cp /opt/clipsvalorant/deploy/clipsvalorant.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now clipsvalorant
+#
+# Type=oneshot with RemainAfterExit is right here because `docker compose up
+# -d` returns as soon as the containers are started - systemd is supervising
+# the compose project, not a process, and Docker's own restart policy is what
+# brings a container back. A Type=simple unit would think the service had
+# exited the moment compose returned.
+
+[Unit]
+Description=val:grind (clipsvalorant)
+Documentation=https://github.com/omerkhawar/clipsvalorant
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/clipsvalorant/deploy
+# --build so a `git pull` followed by `systemctl restart clipsvalorant` is a
+# whole deploy. It is a no-op when nothing changed.
+ExecStart=/usr/bin/docker compose up -d --build
+ExecStop=/usr/bin/docker compose down
+ExecReload=/usr/bin/docker compose up -d --build
+# Building the image pulls Debian packages and a few hundred MB of wheels on
+# a first run. No deadline on that.
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
