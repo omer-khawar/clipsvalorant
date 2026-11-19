@@ -91,3 +91,98 @@ def test_fetching_overlaps_rather_than_queueing(tmp_path):
 
 def test_no_offsets_is_not_an_error(tmp_path):
     assert list(FrameReader(cache_dir=tmp_path).iter_frames("v1", [])) == []
+
+
+# --------------------------------------------------------- playlist prefetch
+
+class _Resolver(FrameReader):
+    """A FrameReader whose playlist lookups cost time but no network."""
+
+    def __init__(self, cache_dir, *, delay=0.0, dead=()):
+        super().__init__(cache_dir=cache_dir)
+        self.delay = delay
+        self.dead = set(dead)
+        self.resolved: list[str] = []
+        self._guard = threading.Lock()
+        self.live = 0
+        self.peak = 0
+
+    def _resolve(self, vod_id):
+        with self._guard:
+            self.resolved.append(vod_id)
+            self.live += 1
+            self.peak = max(self.peak, self.live)
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            return None if vod_id in self.dead else f"http://example.invalid/{vod_id}.m3u8"
+        finally:
+            with self._guard:
+                self.live -= 1
+
+
+def test_playlists_are_resolved_together(tmp_path):
+    """The whole point. Resolving one costs about two and a half seconds and
+    is almost all waiting, so a lobby with four broadcasts used to spend ten
+    seconds doing nothing."""
+    r = _Resolver(tmp_path, delay=0.15)
+    ids = ["a", "b", "c", "d"]
+    started = time.perf_counter()
+    r.prefetch_playlists(ids)
+    took = time.perf_counter() - started
+
+    assert sorted(r.resolved) == ids
+    assert r.peak > 1, "the lookups did not overlap: they are still serial"
+    assert took < 0.15 * len(ids), f"took {took:.2f}s, barely better than serial"
+
+
+def test_a_prefetched_playlist_is_not_looked_up_again(tmp_path):
+    """`playlist` must answer from the cache afterwards, or the prefetch has
+    bought nothing and every lookup is simply done twice."""
+    r = _Resolver(tmp_path)
+    r.prefetch_playlists(["a", "b"])
+    assert r.resolved == ["a", "b"] or sorted(r.resolved) == ["a", "b"]
+    before = len(r.resolved)
+    assert r.playlist("a") == "http://example.invalid/a.m3u8"
+    assert r.playlist("b") == "http://example.invalid/b.m3u8"
+    assert len(r.resolved) == before, "a prefetched playlist was resolved again"
+
+
+def test_one_already_known_playlist_is_left_alone(tmp_path):
+    r = _Resolver(tmp_path)
+    r.playlist("a")
+    r.prefetch_playlists(["a", "a", "b"])
+    assert r.resolved.count("a") == 1, "a cached playlist was resolved twice"
+    assert "b" in r.resolved
+
+
+def test_a_dead_vod_is_remembered_as_dead_not_retried(tmp_path):
+    """A VOD past Twitch's retention has no playlist, and that is the single
+    commonest outcome in a sweep. Treating it as a transient miss would mean
+    re-asking yt-dlp about it on every frame."""
+    r = _Resolver(tmp_path, dead={"gone"})
+    r.prefetch_playlists(["gone", "here"])
+    before = len(r.resolved)
+    assert r.playlist("gone") is None
+    assert len(r.resolved) == before, "a dead VOD was looked up a second time"
+
+
+def test_one_lookup_that_explodes_does_not_cost_the_others(tmp_path):
+    """A pool that lets an exception escape loses the whole lobby's frames."""
+    class Angry(_Resolver):
+        def _resolve(self, vod_id):
+            if vod_id == "bad":
+                raise RuntimeError("yt-dlp fell over")
+            return super()._resolve(vod_id)
+
+    r = Angry(tmp_path)
+    r.prefetch_playlists(["bad", "good"])
+    assert r.playlist("bad") is None
+    assert r.playlist("good") == "http://example.invalid/good.m3u8"
+
+
+def test_nothing_to_prefetch_is_not_an_error(tmp_path):
+    r = _Resolver(tmp_path)
+    r.prefetch_playlists([])
+    r.prefetch_playlists(["", None])
+    assert r.resolved == []

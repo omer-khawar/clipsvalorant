@@ -93,11 +93,12 @@ def resolved(cfg, sample_match):
     def run(twitch, **kwargs):
         from clipsvalorant.resolve import ResolveReport
         report = ResolveReport()
+        kwargs.setdefault("watcher", None)
+        kwargs.setdefault("game_id", None)
         with db.session(cfg.db_path) as conn:
             resolve_match(
                 conn, twitch, sample_match,
-                my_puuid=me.puuid, report=report,
-                watcher=None, game_id=None, **kwargs,
+                my_puuid=me.puuid, report=report, **kwargs,
             )
         return report
 
@@ -214,3 +215,79 @@ def test_a_covering_broadcast_still_reaches_the_evidence(resolved, sample_match)
              if c.channel_id == cid]
     assert filed, "the candidate with a covering broadcast was not filed"
     assert filed[0].evidence.vod_overlap_s > 0
+
+
+# ------------------------------------------- opening the broadcasts together
+
+class _Frames:
+    """Stands in for FrameReader, recording how the playlists were asked for."""
+
+    def __init__(self):
+        self.prefetched: list[list[str]] = []
+        self.singles: list[str] = []
+        self.order: list[str] = []
+
+    def prefetch_playlists(self, vod_ids, **kw):
+        ids = list(vod_ids)
+        self.prefetched.append(ids)
+        self.order.append("prefetch")
+
+    def playlist(self, vod_id):
+        self.singles.append(vod_id)
+        return "http://example.invalid/x.m3u8"
+
+    def iter_frames(self, vod_id, offsets, **kw):
+        self.order.append(f"look:{vod_id}")
+        for off in offsets:
+            yield off, None
+
+
+class _Reader:
+    available = True
+
+    def read(self, path):
+        return None
+
+
+class _Watcher:
+    def __init__(self):
+        self.frames = _Frames()
+        self.reader = _Reader()
+        self.limit = 4
+        self.ready = True
+
+
+def _vods_for(cands):
+    return sorted({c.channel_id for c in cands})
+
+
+def test_every_broadcast_is_opened_before_any_of_them_is_read(resolved, sample_match):
+    """Resolving one VOD's playlist is about two and a half seconds of pure
+    waiting - half of it yt-dlp starting up - so doing them one at a time
+    inside the loop is the longest avoidable stall in a scan."""
+    others = [p for p in sample_match.players if p.puuid != resolved.me.puuid]
+    start = int(sample_match.metadata.started_at.timestamp())
+    vods = {}
+    for i, p in enumerate(others[:3]):
+        cid = f"id-{p.name.lower()}"
+        vods[cid] = [Vod(id=f"v{i}", channel_id=cid, stream_id=None,
+                         title="valorant ranked", created_at="",
+                         created_epoch=start - 600, duration_s=7200, url="")]
+    watcher = _Watcher()
+    resolved(FakeTwitch(videos_for=vods), watcher=watcher)
+
+    assert watcher.frames.prefetched, "the playlists were never opened together"
+    asked = [v for batch in watcher.frames.prefetched for v in batch]
+    assert sorted(asked) == sorted(f"v{i}" for i in range(3)), asked
+
+    # and nothing was read before they were all open
+    first_look = next(i for i, step in enumerate(watcher.frames.order)
+                      if step.startswith("look:"))
+    assert watcher.frames.order[:first_look].count("prefetch") >= 1
+
+
+def test_a_lobby_with_no_broadcasts_opens_nothing(resolved):
+    watcher = _Watcher()
+    resolved(FakeTwitch(), watcher=watcher)
+    assert all(batch == [] for batch in watcher.frames.prefetched)
+    assert not any(s.startswith("look:") for s in watcher.frames.order)

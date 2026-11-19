@@ -269,6 +269,46 @@ Where it cannot be measured — no OCR installed, or a stream that joined too la
 show a countdown — the 109s median stands in, and the UI says so on the card rather
 than presenting a guess as a measurement.
 
+### Where the page came from
+
+The page is one file — `PAGE` in `clipsvalorant/web.py` — with no build step, no
+framework and no CDN, because the server is a stdlib `ThreadingHTTPServer` and the
+whole point is that it starts with one command.
+
+Its design is taken from [wundercorp/awesome-components][awesome]. That catalogue is
+worth being precise about: it indexes 6,591 components, and **none of them ships any
+source code** — every `prompt.md` in it says "No reference source files were
+available". What it does ship is a rendered DOM snapshot of each component and a
+screenshot. The snapshot is the useful part, because a post-render Tailwind class
+string is a measurement: `rounded-2xl`, `border-neutral-900/10`, `p-5`,
+`tracking-[0.35em]`, `shadow-[0_10px_40px_rgba(0,0,0,0.04)]` are exact values, not
+impressions. Those were read off and reimplemented in plain CSS.
+
+| Part of the page | Taken from |
+|---|---|
+| Shell, dot-grid, hairline rules, card system, modular spans | `reapollo/bento-monochrome` |
+| Metric tiles | `reapollo/glassmorphism-minimal-metrics-block-shadcnui` |
+| Three-way theme control | `ncdai/theme-switcher-1` |
+| Window and filter controls | `ruixenui/segmented-button-group` |
+| Scrubber ticks and round-jump buttons | `ruixenui/audio-timeline-with-chapters` |
+| Riot ID field | `kokonutd/action-search-bar` |
+| Scan progress | `educalvolpz/animated-progress-bar` |
+
+The background shader is not from the catalogue — there is no shader source anywhere
+in it, `gl_FragColor` appears zero times across all 6,591 entries. It is a WebGL
+domain-warped fbm written here, deliberately greyscale and low-contrast, following the
+monochrome silk of `reuno-ui/background-paper-shaders`. It runs at 30fps, caps device
+pixel ratio at 1.25, stops when the tab is hidden, freezes under
+`prefers-reduced-motion`, and if WebGL is missing the canvas simply hides — the
+dot-grid and vignette carry the background on their own.
+
+The dot-grid is the one piece doing real work rather than decoration. It is a 20px
+grid masked down to dashes, and every element on the page sits on it: a 12-column
+layout, 12px gutters, a 1152px measure, vertical rhythm in multiples of four, and
+tabular figures everywhere a number appears.
+
+[awesome]: https://github.com/wundercorp/awesome-components
+
 ### Where a scan spends its time
 
 Measured before anything was changed, because every guess about this was wrong.
@@ -295,12 +335,44 @@ away. HenrikDev charges a point per call plus one per Riot request it triggers b
 the scenes, and sleeps out the window when it runs dry, so those were not merely wasted
 calls but wasted minutes.
 
-Two things that sound like savings and are not. OCR does not thread — onnxruntime
+A second round of measurement, after the above, found the longest single stall was
+not in either list. Opening a broadcast means asking `yt-dlp` for its HLS URL, which
+costs 2.6s — and 1.25s of that is `yt-dlp` starting Python up, before it has touched
+the network. It was paid once per candidate, in a row, inside the loop. The VODs a
+match needs are all known before any of them is opened, so they are now resolved
+together.
+
+That left OCR, and OCR turned out to have no settings worth changing. Each of these
+was measured over twelve real frames, comparing the text that came back and not just
+the clock:
+
+| | speed | text |
+|---|---|---|
+| Larger recognition batches (24) | **0.61x** — slower | 65 strings lost |
+| Larger recognition batches (48) | **0.38x** — slower | 95 strings lost |
+| Smaller detection side (640px) | 0.99x | 59 strings lost |
+| Skipping the angle-classifier pass | 1.05x | 2 lost, 8 gained |
+
+Bigger batches are *slower* because every crop in a batch is padded to the widest one
+in it. Nothing here buys speed without changing what is read, so none of it was taken.
+
+What was left is not reading the same frame twice. Frames were already cached on disk
+so that a re-run downloads nothing; now what was read off them is cached beside them,
+which is most of what a sweep over the same fortnight was spending its time
+rediscovering. A frame's text never changes, so this cannot move a verdict.
+
+| | before | after |
+|---|---|---|
+| Four broadcasts' playlists | 9.11s | 2.98s |
+| Twelve frames, looked at a second time | 15.9s | 0.08s |
+
+Three things that sound like savings and are not. OCR does not thread — onnxruntime
 already uses every core, so running frames in parallel made a pass *slower* (8.9s to
-12.9s on six frames). And calibrating from frames the confirmation pass already read
+12.9s on six frames). Calibrating from frames the confirmation pass already read
 rarely fires, because a streamer confirmed from the screen is usually confirmed on the
-first frame, leaving nothing to reuse. It is kept because it costs nothing when it
-misses, but it is not where the time went.
+first frame, leaving nothing to reuse. And none of the OCR engine's own knobs help, as
+above. All three are kept or left alone because they cost nothing when they miss, but
+none of them is where the time went.
 
 What is left is the shape of the problem rather than an inefficiency: klips.live is
 fast partly because its alias database is shared across everybody who uses it, so most

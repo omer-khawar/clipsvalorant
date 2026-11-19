@@ -12,6 +12,9 @@ rules for reading it, and for what to do when the answer is no.
 """
 
 from clipsvalorant.resolve import Evidence
+import json
+
+from clipsvalorant import vision
 from clipsvalorant.vision import FrameRead, TextBox, normalise, wanted_names
 from clipsvalorant.watch import CERTAIN_NAMES, Watched, sample_offsets
 
@@ -371,3 +374,115 @@ def test_watch_asks_for_offsets_in_the_order_it_wants_them():
     watch(_Reader({}), frames, "v1", 0.0, KILLS, LOBBY, limit=6)
     assert frames.asked == sorted(frames.asked, key=lambda o: frames.asked.index(o))
     assert frames.asked == [int(o) for o in sample_offsets(KILLS, limit=6)]
+
+
+# ------------------------------------------------- frames remembered on disk
+
+class _CountingReader(vision.Reader):
+    """A Reader with a scripted engine, counting how often it actually runs."""
+
+    def __init__(self, boxes=(("CURRY", 10, 10, 60, 24),), fails=False):
+        super().__init__()
+        self._tried = True
+        self._engine = object()      # merely has to be non-None
+        self.runs = 0
+        self._boxes = boxes
+        self._fails = fails
+
+    def _read_uncached(self, path):
+        self.runs += 1
+        if self._fails:
+            return None
+        return vision.FrameRead(
+            tuple(vision.TextBox(t, x0, y0, x1, y1)
+                  for t, x0, y0, x1, y1 in self._boxes),
+            1280, 720,
+        )
+
+
+def _png(tmp_path, name="f.png"):
+    p = tmp_path / name
+    p.write_bytes(b"not really a png")
+    return p
+
+
+def test_a_frame_read_once_is_not_read_again_by_a_later_run(tmp_path):
+    """The reason this exists. OCR is about a second and a quarter of CPU per
+    frame, it does not thread and no engine setting makes it cheaper, so the
+    only saving left is not doing it twice - which is most of what a sweep
+    over the same fortnight was spending its time on."""
+    frame = _png(tmp_path)
+    first = _CountingReader()
+    assert first.read(frame) is not None
+    assert first.runs == 1
+
+    later = _CountingReader()          # a whole new process, as a sweep is
+    got = later.read(frame)
+    assert later.runs == 0, "the frame was read from scratch a second time"
+    assert got is not None
+    assert got.blob == "curry"
+    assert (got.width, got.height) == (1280, 720)
+
+
+def test_what_comes_back_from_disk_is_what_went_in(tmp_path):
+    """A verdict rests on box positions as well as text: the match timer is
+    only a timer because of where on the screen it sits."""
+    boxes = (("1:34", 600.5, 12.0, 648.0, 40.5), ("CURRY", 10, 10, 60, 24))
+    frame = _png(tmp_path)
+    _CountingReader(boxes).read(frame)
+    got = _CountingReader(boxes).read(frame)
+    assert [(b.text, b.x0, b.y0, b.x1, b.y1) for b in got.boxes] == [
+        ("1:34", 600.5, 12.0, 648.0, 40.5), ("CURRY", 10.0, 10.0, 60.0, 24.0)
+    ]
+    assert got.has_match_timer
+
+
+def test_a_frame_that_could_not_be_read_is_not_remembered_as_empty(tmp_path):
+    """A half-written frame or a busy engine is a passing problem. Writing it
+    down would turn it into a permanent one, and an empty read is exactly what
+    `saw_nothing` treats as evidence of absence."""
+    frame = _png(tmp_path)
+    broken = _CountingReader(fails=True)
+    assert broken.read(frame) is None
+
+    working = _CountingReader()
+    assert working.read(frame) is not None
+    assert working.runs == 1, "the failure was cached and never retried"
+
+
+def test_a_note_from_an_older_format_is_ignored(tmp_path):
+    """Should the engine or its settings ever change, every note on disk is
+    stale. The version is what lets that be a re-read rather than a wrong
+    answer served forever."""
+    frame = _png(tmp_path)
+    _CountingReader().read(frame)
+    note = vision._sidecar(frame)
+    blob = json.loads(note.read_text(encoding="utf-8"))
+    blob["v"] = vision.OCR_SIDECAR_VERSION + 1
+    note.write_text(json.dumps(blob), encoding="utf-8")
+
+    again = _CountingReader()
+    assert again.read(frame) is not None
+    assert again.runs == 1, "a note from another version was trusted"
+
+
+def test_a_damaged_note_is_ignored_rather_than_fatal(tmp_path):
+    frame = _png(tmp_path)
+    _CountingReader().read(frame)
+    vision._sidecar(frame).write_text("{ this is not json", encoding="utf-8")
+    r = _CountingReader()
+    assert r.read(frame) is not None
+    assert r.runs == 1
+
+
+def test_a_read_still_works_where_nothing_can_be_written(tmp_path, monkeypatch):
+    """The cache is a shortcut, never a requirement."""
+    frame = _png(tmp_path)
+
+    def no(*a, **k):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(vision.Path, "write_text", no)
+    r = _CountingReader()
+    assert r.read(frame) is not None
+    assert r.runs == 1

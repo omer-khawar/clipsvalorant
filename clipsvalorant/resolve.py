@@ -886,10 +886,8 @@ def resolve_match(
         else:
             report.uncalibrated += 1
 
-    def finish(cand: Candidate,
-               listings: dict[str, list[Vod] | str] | None = None) -> None:
-        gather_evidence(client, conn, cand, match, start, end, game_id, report,
-                        listings)
+    def settle(cand: Candidate) -> None:
+        """Everything after the evidence is in: look, judge, write it down."""
         inspect(cand)
         _remember_encounter(conn, match.id, cand, cand.player.team == my_team)
         if cand.verdict == "confirmed":
@@ -897,6 +895,22 @@ def resolve_match(
                             cand.source.split(":")[-1], cand.confidence)
         calibrate_vod(cand)
         report.file(cand)
+
+    def open_broadcasts(cands: list[Candidate]) -> None:
+        """Resolve every playlist we are about to need, together.
+
+        `inspect` opens a VOD by asking yt-dlp for its HLS URL, which takes
+        about two and a half seconds and is almost all waiting - half of it
+        is yt-dlp's own interpreter starting. Left inside the loop below,
+        one lobby pays that once per candidate, in a row. The VODs are all
+        known by this point, so they are resolved at once instead and every
+        `inspect` after this finds its playlist already in hand.
+        """
+        if watcher is None:
+            return
+        watcher.frames.prefetch_playlists(
+            c.vod.id for c in cands if c.vod is not None
+        )
 
     others = [p for p in match.players if p.puuid != my_puuid]
 
@@ -996,19 +1010,34 @@ def resolve_match(
         client, {c.channel_id for _, cs in per_player for c in cs}, report
     )
 
+    # Evidence first for the whole lobby, because it is what decides which
+    # broadcasts are worth opening - and only then are those opened, all at
+    # once. Judging still happens below, candidate by candidate in lobby
+    # order, so nothing about the verdicts or what is written down changes.
+    for _player, candidates in per_player:
+        for cand in candidates:
+            gather_evidence(client, conn, cand, match, start, end, game_id,
+                            report, listings)
+    open_broadcasts([c for _, cs in per_player for c in cs])
+
     for player, candidates in per_player:
         for cand in candidates:
-            finish(cand, listings)
+            settle(cand)
 
         if not any(c.player.puuid == player.puuid for c in report.confirmed):
             unresolved.append(player)
 
     # Layer 4 - anyone name matching could not reach.
     if unresolved and game_id:
-        for cand in clip_derived_candidates(
+        late = list(clip_derived_candidates(
             conn, client, match, unresolved, start, end, game_id, report
-        ):
-            finish(cand)
+        ))
+        for cand in late:
+            gather_evidence(client, conn, cand, match, start, end, game_id,
+                            report)
+        open_broadcasts(late)
+        for cand in late:
+            settle(cand)
 
 
 def audit_verdicts(

@@ -36,6 +36,13 @@ FRAME_TIMEOUT_S = 120
 # past the point where more helps: measured at 2.2x on four workers and 2.6x
 # on eight, against ffmpeg processes that are not free to spawn.
 PREFETCH = 4
+# How many VODs to resolve playlists for at once. Resolving one costs about
+# 2.6 seconds, of which 1.25 is `yt-dlp` starting Python up before it has
+# touched the network at all - so this is idle time twice over, and a scan
+# that looks at several broadcasts used to pay it once per broadcast in a
+# row. Six at a time is comfortable: they are separate processes waiting on
+# Twitch, not work this machine is doing.
+PLAYLIST_WORKERS = 6
 # 720p is the sweet spot: the HUD text is legible to OCR and the segments are
 # small. Below 480p the killfeed stops being readable at all.
 MAX_HEIGHT = 720
@@ -66,7 +73,12 @@ class FrameReader:
         """The direct HLS URL for a VOD, or None if it is gone or subscriber-only."""
         if vod_id in self._playlists:
             return self._playlists[vod_id]
-        url = None
+        url = self._resolve(vod_id)
+        self._playlists[vod_id] = url
+        return url
+
+    def _resolve(self, vod_id: str) -> str | None:
+        """Ask yt-dlp for the HLS URL. No caching: the callers do that."""
         try:
             done = subprocess.run(
                 ["yt-dlp", "-g", "--no-warnings",
@@ -74,14 +86,45 @@ class FrameReader:
                  f"https://www.twitch.tv/videos/{vod_id}"],
                 capture_output=True, text=True, timeout=PLAYLIST_TIMEOUT_S,
             )
-            for line in done.stdout.splitlines():
-                if line.startswith("http"):
-                    url = line.strip()
-                    break
         except (subprocess.SubprocessError, OSError):
-            url = None
-        self._playlists[vod_id] = url
-        return url
+            return None
+        for line in done.stdout.splitlines():
+            if line.startswith("http"):
+                return line.strip()
+        return None
+
+    def prefetch_playlists(
+        self, vod_ids: Iterable[str], *, workers: int = PLAYLIST_WORKERS
+    ) -> None:
+        """Resolve several VODs' playlists at once, into the same cache.
+
+        Nothing here returns anything: callers go on using `playlist`, which
+        afterwards answers from the cache. It exists because resolving a
+        playlist is the longest single wait in a scan and the least
+        productive - a subprocess starting up, then a round trip to Twitch -
+        and because the VODs a match needs are all known before any of them
+        is opened. Done one at a time they stack; done together they cost
+        about as much as the slowest one.
+
+        A VOD that fails is cached as a failure exactly as `playlist` would
+        cache it, so this never changes what a later call concludes - only
+        when it was found out.
+        """
+        wanted = [v for v in dict.fromkeys(vod_ids) if v and v not in self._playlists]
+        if not wanted:
+            return
+        if len(wanted) == 1:
+            self.playlist(wanted[0])
+            return
+        with ThreadPoolExecutor(max_workers=min(workers, len(wanted))) as pool:
+            jobs = {pool.submit(self._resolve, v): v for v in wanted}
+            for job, vod_id in jobs.items():
+                try:
+                    self._playlists[vod_id] = job.result()
+                except Exception:
+                    # Same answer `playlist` gives when yt-dlp will not talk
+                    # to us: there is no playlist, and that is not an error.
+                    self._playlists[vod_id] = None
 
     def frame(self, vod_id: str, offset_s: float) -> Path | None:
         """One frame, `offset_s` into the broadcast. None if it could not be read.
