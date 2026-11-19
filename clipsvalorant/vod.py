@@ -23,11 +23,19 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from collections.abc import Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 PLAYLIST_TIMEOUT_S = 90
 FRAME_TIMEOUT_S = 120
+# How many frames to have in flight while the caller is reading one. Fetching
+# a frame costs about two seconds and OCR about two and a half, and they use
+# different resources, so overlapping them hides most of the fetch. Four is
+# past the point where more helps: measured at 2.2x on four workers and 2.6x
+# on eight, against ffmpeg processes that are not free to spawn.
+PREFETCH = 4
 # 720p is the sweet spot: the HUD text is legible to OCR and the segments are
 # small. Below 480p the killfeed stops being readable at all.
 MAX_HEIGHT = 720
@@ -101,6 +109,50 @@ class FrameReader:
         except (subprocess.SubprocessError, OSError):
             return None
         return self._keep_if_real(dest)
+
+    def iter_frames(
+        self, vod_id: str, offsets: Iterable[float], *, ahead: int = PREFETCH,
+    ) -> Iterator[tuple[float, Path | None]]:
+        """Frames in the order asked for, fetched several at a time.
+
+        Fetching and reading a frame cost about the same and compete for
+        nothing: one is ffmpeg waiting on Twitch, the other is OCR on the CPU.
+        Run serially they add up, which is what made a ten-frame look at a
+        broadcast take the better part of a minute.
+
+        Only `ahead` frames are in flight at once, and the rest are never
+        submitted, because every caller here stops early - `watch` the moment
+        the answer is certain. Fetching all of them up front would pay for
+        frames nobody looks at, which on a channel that is obviously the right
+        one is most of them.
+        """
+        offsets = list(offsets)
+        if not offsets:
+            return
+        # The playlist is fetched once, here, rather than raced for by the
+        # first `ahead` workers at the same time.
+        self.playlist(vod_id)
+        pool = ThreadPoolExecutor(max_workers=max(1, ahead))
+        pending: dict[int, Future] = {}
+        try:
+            nxt = 0
+            for i in range(min(ahead, len(offsets))):
+                pending[i] = pool.submit(self.frame, vod_id, offsets[i])
+                nxt = i + 1
+            for i in range(len(offsets)):
+                future = pending.pop(i)
+                try:
+                    path = future.result()
+                except Exception:  # a frame that will not read is not an error
+                    path = None
+                if nxt < len(offsets):
+                    pending[nxt] = pool.submit(self.frame, vod_id, offsets[nxt])
+                    nxt += 1
+                yield offsets[i], path
+        finally:
+            for future in pending.values():
+                future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
 
     @staticmethod
     def _keep_if_real(dest: Path) -> Path | None:

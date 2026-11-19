@@ -572,14 +572,17 @@ def run_search(
     previous = package.level
     package.setLevel(logging.INFO)
     try:
+        cutoff = int(time.time()) - days * 86400
+
         job.step("ingest")
         job.say(f"Looking up {acct.riot_id} in {acct.region.upper()}...")
-        report = ingest(acct, limit=fetch, mode=mode)
+        # The window is handed to ingest, not applied after it. A match
+        # outside it is never going to be resolved, and its detail call is
+        # the most expensive thing in the whole run.
+        report = ingest(acct, limit=fetch, mode=mode, since_epoch=cutoff)
         job.say(report.summary())
         for err in report.errors[:5]:
             job.say(f"! {err}")
-
-        cutoff = int(time.time()) - days * 86400
         with db.session(acct.db_path) as conn:
             ids = [
                 r["id"]

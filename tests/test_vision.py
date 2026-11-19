@@ -253,3 +253,121 @@ def test_being_live_is_still_not_evidence_about_this_match():
 def test_normalise_strips_what_ocr_invents():
     assert normalise("TAG | PlayerOne") == "tagplayerone"
     assert normalise("COMBAT REPORT") == "combatreport"
+
+
+# ------------------------------------------------- the pass over a broadcast
+
+class _Reader:
+    """An OCR engine that returns a prepared frame per offset."""
+
+    def __init__(self, screens: dict[int, FrameRead], available: bool = True):
+        self.screens = screens
+        self.available = available
+        self.read_paths: list[str] = []
+
+    def read(self, path):
+        self.read_paths.append(str(path))
+        return self.screens.get(int(str(path)))
+
+
+class _Frames:
+    """Stands in for FrameReader. Records the order offsets were asked for."""
+
+    def __init__(self, missing=()):
+        self.missing = set(missing)
+        self.asked: list[int] = []
+
+    def frame(self, vod_id, offset):
+        self.asked.append(int(offset))
+        return None if int(offset) in self.missing else str(int(offset))
+
+    def iter_frames(self, vod_id, offsets, *, ahead=4):
+        for offset in offsets:
+            yield offset, self.frame(vod_id, offset)
+
+
+# Ten seconds apart, one round each, so sample_offsets lands predictably.
+KILLS = [(r, 100.0 + r * 60.0) for r in range(8)]
+LOBBY = wanted_names([(f"Player{n}", False) for n in "ABCDEFGH"])
+
+
+def _named(*names: str) -> FrameRead:
+    return _frame(*[(n, 600, 300 + i * 20) for i, n in enumerate(names)])
+
+
+def test_watch_stops_as_soon_as_the_answer_is_certain():
+    """Four independent names settle it, and every further frame is spend on a
+    question already answered - about three seconds each, on a channel that is
+    obviously the right one."""
+    from clipsvalorant.watch import watch
+
+    screens = {}
+    for off in [int(100.0 + r * 60.0 + 5.0) for r in range(8)]:
+        screens[off] = _named("PlayerA", "PlayerB", "PlayerC", "PlayerD")
+    frames = _Frames()
+    reader = _Reader(screens)
+    seen = watch(reader, frames, "v1", 0.0, KILLS, LOBBY, limit=10)
+
+    assert seen.certain
+    assert seen.frames_read == 1
+    assert len(frames.asked) < 10  # the rest were never fetched
+
+
+def test_watch_gives_up_on_a_broadcast_that_yields_no_frames():
+    """A VOD past Twitch's retention has no playlist, so every frame fails.
+    Discovering that ten times over is the commonest way to waste a sweep."""
+    from clipsvalorant.watch import watch
+
+    frames = _Frames(missing=range(0, 100_000))
+    seen = watch(_Reader({}), frames, "v1", 0.0, KILLS, LOBBY, limit=10)
+
+    assert seen.frames_read == 0
+    assert seen.frames_failed == 2  # stopped, rather than spending the budget
+    assert not seen.certain
+
+
+def test_watch_keeps_what_it_read_for_calibration_to_reuse():
+    """Confirming the streamer and timing the match are one act with two
+    questions asked of it. Paying twice to read one broadcast is what made a
+    scan slow."""
+    from clipsvalorant.watch import watch
+
+    first = int(100.0 + 5.0)
+    screens = {first: _named("PlayerA", "PlayerB")}
+    frames = _Frames()
+    seen = watch(_Reader(screens), frames, "v1", 0.0, KILLS, LOBBY, limit=3)
+
+    assert [off for off, _ in seen.reads] == [float(first)]
+    assert seen.reads[0][1] is screens[first]
+
+
+def test_watch_drops_the_candidates_own_name_before_looking():
+    """A channel is a candidate because its name resembles the player's, so
+    its own branding names something very like them by construction."""
+    from clipsvalorant.watch import watch
+
+    off = int(100.0 + 5.0)
+    screens = {off: _named("PlayerA", "PlayerB")}
+    seen = watch(_Reader(screens), _Frames(), "v1", 0.0, KILLS, LOBBY,
+                 limit=1, exclude_name="PlayerA")
+    assert seen.names == {"PlayerB"}
+
+
+def test_watch_without_an_ocr_engine_says_so_rather_than_ruling_out():
+    from clipsvalorant.watch import watch
+
+    seen = watch(_Reader({}, available=False), _Frames(), "v1", 0.0, KILLS, LOBBY)
+    assert seen.unavailable and seen.frames_read == 0
+    assert not seen.saw_nothing  # we did not look, so we concluded nothing
+
+
+def test_watch_asks_for_offsets_in_the_order_it_wants_them():
+    """Prefetching must not reorder: round ends are tried before killfeed
+    frames because they are worth far more per frame, and an early exit on a
+    reordered list would spend the budget on the wrong ones."""
+    from clipsvalorant.watch import watch
+
+    frames = _Frames()
+    watch(_Reader({}), frames, "v1", 0.0, KILLS, LOBBY, limit=6)
+    assert frames.asked == sorted(frames.asked, key=lambda o: frames.asked.index(o))
+    assert frames.asked == [int(o) for o in sample_offsets(KILLS, limit=6)]

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import datetime as _dt
+import time
 import sys
 from datetime import datetime, timezone
 from typing import Annotated, Optional
@@ -95,6 +96,13 @@ def ingest(
     refetch: Annotated[
         bool, typer.Option(help="Re-download matches already in the database.")
     ] = False,
+    days: Annotated[
+        int,
+        typer.Option(
+            help="Skip matches older than this many days without fetching them. "
+                 "0 fetches everything listed.",
+        ),
+    ] = 0,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
     """Pull recent matches from the HenrikDev API and store them."""
@@ -103,7 +111,10 @@ def ingest(
     from clipsvalorant.ingest import ingest as run_ingest
 
     typer.echo(f"Fetching up to {limit} {mode or 'any-mode'} matches for {cfg.riot_id} ({cfg.region})...")
-    report = run_ingest(cfg, limit=limit, mode=mode, refetch=refetch)
+    report = run_ingest(
+        cfg, limit=limit, mode=mode, refetch=refetch,
+        since_epoch=(int(time.time()) - days * 86400) if days > 0 else None,
+    )
     typer.echo(report.summary())
 
     for err in report.errors:

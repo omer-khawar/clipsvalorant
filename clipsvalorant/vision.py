@@ -99,12 +99,21 @@ class FrameRead:
         return {original for key, original in names.items() if key in blob}
 
 
+# Frames remembered per run. OCR is the expensive half of looking at a
+# broadcast - between half a second and five, depending on how much text is on
+# screen - and the same frame is routinely asked for twice: once to hunt for
+# lobby names and again to read the round countdown off it. A few hundred
+# parsed frames cost very little to keep and save seconds each.
+OCR_CACHE_MAX = 512
+
+
 class Reader:
     """Wraps the OCR engine, which is loaded once and is slow to start."""
 
     def __init__(self) -> None:
         self._engine = None
         self._tried = False
+        self._cache: dict[str, "FrameRead | None"] = {}
 
     @property
     def available(self) -> bool:
@@ -128,6 +137,19 @@ class Reader:
         self._load()
         if self._engine is None:
             return None
+        key = str(path)
+        if key in self._cache:
+            return self._cache[key]
+        out = self._read_uncached(path)
+        if len(self._cache) >= OCR_CACHE_MAX:
+            # Oldest first; insertion order is close enough to use order here,
+            # and the alternative is an LRU for a dictionary that rarely fills.
+            for stale in list(self._cache)[: OCR_CACHE_MAX // 4]:
+                self._cache.pop(stale, None)
+        self._cache[key] = out
+        return out
+
+    def _read_uncached(self, path: Path) -> FrameRead | None:
         try:
             from PIL import Image
             with Image.open(path) as im:

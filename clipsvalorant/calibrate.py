@@ -30,7 +30,6 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
@@ -204,6 +203,49 @@ def scan_offsets(
     return [o for o in out if lo <= o <= hi]
 
 
+def _votes_in(reads: Iterable[tuple[float, object]], base: float,
+              starts: dict[int, float]) -> list[float]:
+    """Every shift the given frames vote for, pooled."""
+    votes: list[float] = []
+    for offset, frame in reads:
+        if frame is None:
+            continue
+        timer = read_timer(frame)  # type: ignore[arg-type]
+        if timer is None:
+            continue
+        blob = frame.blob  # type: ignore[attr-defined]
+        votes.extend(votes_from(
+            offset, base, timer,
+            any(word in blob for word in _BUY_WORDS), starts,
+        ))
+    return votes
+
+
+def from_reads(
+    reads: Iterable[tuple[float, object]], *,
+    base: float, starts: dict[int, float], vod_id: str = "",
+) -> Calibration:
+    """A shift derived from frames somebody else already paid to read.
+
+    Looking for lobby names and looking for the round countdown are the same
+    act with two questions asked of it, and they used to be two passes over
+    the same broadcast - ten frames to confirm the streamer, then thirteen
+    more to time the match. The frames the first pass read carry a countdown
+    as often as any others, so the second pass is usually unnecessary.
+
+    It is not always enough: a pass that stopped after three frames, or one
+    that landed on scoreboards with the clock hidden, will not reach
+    MIN_VOTES. `measure` is still there for that, and still costs what it
+    always did - it is just no longer the common case.
+    """
+    if not starts:
+        return ESTIMATE
+    shift, agreed = best_cluster(_votes_in(reads, base, starts))
+    if agreed < MIN_VOTES:
+        return ESTIMATE
+    return Calibration(shift, "measured", agreed, vod_id)
+
+
 def measure(
     reader: Reader, frames: FrameReader, vod_id: str, *,
     base: float, starts: dict[int, float], window: tuple[float, float],
@@ -216,27 +258,15 @@ def measure(
     if not offsets:
         return ESTIMATE
 
-    def grab(offset: float) -> tuple[float, object]:
-        return offset, frames.frame(vod_id, offset)
+    reads: list[tuple[float, object]] = []
+    for offset, path in frames.iter_frames(vod_id, offsets, ahead=workers):
+        if path is None:
+            continue
+        frame = reader.read(path)
+        if frame is not None:
+            reads.append((offset, frame))
 
-    votes: list[float] = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for offset, path in pool.map(grab, offsets):
-            if path is None:
-                continue
-            frame = reader.read(path)
-            if frame is None:
-                continue
-            timer = read_timer(frame)
-            if timer is None:
-                continue
-            blob = frame.blob
-            votes.extend(votes_from(
-                offset, base, timer,
-                any(word in blob for word in _BUY_WORDS), starts,
-            ))
-
-    shift, agreed = best_cluster(votes)
+    shift, agreed = best_cluster(_votes_in(reads, base, starts))
     if agreed < MIN_VOTES:
         log.debug("calibration of %s inconclusive (%d agreeing)", vod_id, agreed)
         return ESTIMATE

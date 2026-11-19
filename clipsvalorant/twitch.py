@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -105,6 +106,7 @@ class TwitchClient:
         self._id = client_id
         self._secret = client_secret
         self._token: str | None = None
+        self._auth_lock = threading.Lock()
         self._remaining: int | None = None
         self._reset_at: float = 0.0
         self._owns_client = client is None
@@ -137,8 +139,15 @@ class TwitchClient:
         log.debug("Obtained a Twitch app access token")
 
     def _headers(self) -> dict[str, str]:
+        # Guarded because evidence for a whole lobby is gathered on several
+        # threads at once: without it, ten threads starting cold would each
+        # ask for a token, and a 401 mid-run would set off the same stampede.
+        # httpx.Client itself is safe to share; this is the one piece of
+        # mutable state on the way through it.
         if self._token is None:
-            self._authenticate()
+            with self._auth_lock:
+                if self._token is None:
+                    self._authenticate()
         return {"Authorization": f"Bearer {self._token}", "Client-Id": self._id}
 
     # ---- plumbing ------------------------------------------------------

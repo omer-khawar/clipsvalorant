@@ -28,6 +28,7 @@ class IngestReport:
     skipped: int = 0
     failed: int = 0
     highlights: int = 0
+    too_old: int = 0
     errors: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -37,6 +38,8 @@ class IngestReport:
             f"{self.skipped} already known",
             f"{self.highlights} highlight(s)",
         ]
+        if self.too_old:
+            parts.append(f"{self.too_old} past the window, not fetched")
         if self.failed:
             parts.append(f"{self.failed} failed")
         return ", ".join(parts)
@@ -209,8 +212,18 @@ def ingest(
     limit: int = 20,
     mode: str | None = "competitive",
     refetch: bool = False,
+    since_epoch: int | None = None,
 ) -> IngestReport:
-    """Fetch the most recent `limit` matches and store any we do not already have."""
+    """Fetch the most recent `limit` matches and store any we do not already have.
+
+    `since_epoch` is the oldest match worth having. The listing already
+    carries each match's start time, so a match older than that can be
+    dropped before its detail is fetched - and the detail is the expensive
+    part. HenrikDev charges a point per call plus one per Riot request it
+    triggers behind the scenes, and when the window runs dry the client
+    sleeps it out, so fetching forty matches to resolve twelve is not merely
+    wasteful, it is most of the wall clock.
+    """
     report = IngestReport()
 
     with db.session(cfg.db_path) as conn:
@@ -227,6 +240,14 @@ def ingest(
                 if match_id in already and not refetch:
                     report.skipped += 1
                     continue
+                if since_epoch is not None:
+                    try:
+                        when = _epoch(entry.meta.started_at)
+                    except (AttributeError, TypeError, ValueError):
+                        when = None  # no date on the listing: fetch it and see
+                    if when is not None and when < since_epoch:
+                        report.too_old += 1
+                        continue
 
                 try:
                     match = client.match_detail(match_id, cfg.region)

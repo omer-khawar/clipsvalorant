@@ -151,7 +151,12 @@ def sweep(cfg: Config, *, limit: int = 20, mode: str | None = None,
         return report
 
     try:
-        ingested = ingest(cfg, limit=limit, mode=mode)
+        # Nothing past retention is ever resolved, so nothing past retention
+        # is worth a detail call either. See RETENTION_DAYS above.
+        ingested = ingest(
+            cfg, limit=limit, mode=mode,
+            since_epoch=int(time.time()) - RETENTION_DAYS * 86400,
+        )
     except Exception as exc:  # a scheduled run must still try to resolve
         report.errors.append(f"ingest failed: {exc}")
         log.warning("Ingest failed, carrying on with what is already stored: %s", exc)

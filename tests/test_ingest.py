@@ -84,3 +84,87 @@ def test_known_match_ids(cfg):
     ingest_file(cfg, FIXTURE)
     with db.session(cfg.db_path) as conn:
         assert db.known_match_ids(conn) == {"11111111-2222-3333-4444-555555555555"}
+
+
+# ------------------------------------------------- the window, before fetching
+
+class _Entry:
+    """A row of the stored-matches listing: an id and a date, nothing more."""
+
+    def __init__(self, match_id, started_at):
+        self.meta = type("M", (), {"id": match_id, "started_at": started_at})()
+
+
+class _Client:
+    """A HenrikDev client that counts what it was actually asked to fetch."""
+
+    def __init__(self, listed):
+        self.listed = listed
+        self.detail_calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def stored_matches(self, name, tag, region, *, mode=None, size=20):
+        return self.listed[:size]
+
+    def match_detail(self, match_id, region):
+        self.detail_calls.append(match_id)
+        raise LookupError("detail not needed for this test")
+
+
+def _listing(now, ages_days):
+    from datetime import timedelta
+    return [_Entry(f"m{i}", now - timedelta(days=d))
+            for i, d in enumerate(ages_days)]
+
+
+def test_a_match_past_the_window_is_never_fetched(cfg, monkeypatch):
+    """The listing already carries the date, and the detail call is the
+    expensive half - HenrikDev charges per call plus whatever Riot requests it
+    triggers, and sleeps the window out when it runs dry. Fetching forty
+    matches to resolve twelve was most of the wall clock."""
+    from datetime import datetime, timezone
+    from clipsvalorant.ingest import ingest
+
+    now = datetime.now(timezone.utc)
+    client = _Client(_listing(now, [1, 3, 20, 40, 2]))
+    monkeypatch.setattr("clipsvalorant.ingest.HenrikClient", lambda *a, **k: client)
+
+    cutoff = int(now.timestamp()) - 14 * 86400
+    report = ingest(cfg, limit=20, since_epoch=cutoff)
+
+    assert report.too_old == 2                      # the 20 and 40 day old ones
+    assert sorted(client.detail_calls) == ["m0", "m1", "m4"]
+    assert "past the window" in report.summary()
+
+
+def test_no_window_means_fetch_everything_listed(cfg, monkeypatch):
+    from datetime import datetime, timezone
+    from clipsvalorant.ingest import ingest
+
+    now = datetime.now(timezone.utc)
+    client = _Client(_listing(now, [1, 40]))
+    monkeypatch.setattr("clipsvalorant.ingest.HenrikClient", lambda *a, **k: client)
+
+    report = ingest(cfg, limit=20)
+    assert report.too_old == 0
+    assert len(client.detail_calls) == 2
+
+
+def test_a_listing_with_no_date_is_fetched_rather_than_assumed(cfg, monkeypatch):
+    """A field that moved or vanished must not silently empty a whole scan."""
+    from datetime import datetime, timezone
+    from clipsvalorant.ingest import ingest
+
+    now = datetime.now(timezone.utc)
+    entry = _Entry("m0", None)
+    client = _Client([entry])
+    monkeypatch.setattr("clipsvalorant.ingest.HenrikClient", lambda *a, **k: client)
+
+    report = ingest(cfg, limit=5, since_epoch=int(now.timestamp()))
+    assert report.too_old == 0
+    assert client.detail_calls == ["m0"]

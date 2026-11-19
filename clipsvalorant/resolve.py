@@ -34,6 +34,7 @@ import logging
 import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
@@ -65,6 +66,12 @@ MIN_OVERLAP = 0.6
 # The cap is only about cost - a 4-character Riot ID like "Nuke" resembles
 # hundreds of channels, and each one costs a /videos call.
 MIN_PREFIX_LEN = 5
+
+# Twitch lookups run this many at a time. They are round trips, not work:
+# the process is idle waiting for each one, and a lobby needs one name
+# search per player and one broadcast listing per candidate. Helix allows
+# 800 points a minute, so the ceiling here is politeness rather than quota.
+LOOKUP_WORKERS = 8
 # Enough of a match inside a broadcast to be worth opening it. Below this there
 # is no room for a sampling point to land on anything.
 MIN_WATCH_WINDOW_S = 90
@@ -388,6 +395,9 @@ class ResolveReport:
     frames_read: int = 0
     calibrated: int = 0
     uncalibrated: int = 0
+    # Of `calibrated`, how many needed no frames of their own because
+    # the confirmation pass had already read enough.
+    calibrated_free: int = 0
     confirmed: list[Candidate] = field(default_factory=list)
     candidates: list[Candidate] = field(default_factory=list)
     rejected: list[Candidate] = field(default_factory=list)
@@ -554,6 +564,30 @@ def _prefix_related(a: str, b: str, *, min_len: int = 3) -> bool:
     return a.startswith(b) or b.startswith(a)
 
 
+def _prefetch_videos(
+    client: TwitchClient, channel_ids: set[str], report: ResolveReport,
+) -> dict[str, list[Vod] | str]:
+    """Each channel's broadcast listing, fetched all at once.
+
+    Maps channel id to its VODs, or to the reason it could not be fetched -
+    which is kept rather than dropped, because "we could not look" and "there
+    was nothing there" are the two answers this program most needs to tell
+    apart.
+    """
+    out: dict[str, list[Vod] | str] = {}
+    ids = sorted(channel_ids)
+    if not ids:
+        return out
+    with ThreadPoolExecutor(max_workers=min(LOOKUP_WORKERS, len(ids))) as pool:
+        jobs = {pool.submit(client.videos, cid, limit=100): cid for cid in ids}
+        for job, cid in jobs.items():
+            try:
+                out[cid] = job.result()
+            except Exception as exc:
+                out[cid] = str(exc)
+    return out
+
+
 def gather_evidence(
     client: TwitchClient,
     conn: sqlite3.Connection,
@@ -563,14 +597,27 @@ def gather_evidence(
     end: int,
     game_id: str | None,
     report: ResolveReport,
+    listings: dict[str, list[Vod] | str] | None = None,
 ) -> None:
-    """Fill in cand.evidence: find a covering VOD, then ask what was on screen."""
+    """Fill in cand.evidence: find a covering VOD, then ask what was on screen.
+
+    `listings` is this channel's broadcasts if somebody already fetched them.
+    The call is made here when they did not, so this function still works on
+    its own - the audit path calls it that way.
+    """
     ev = cand.evidence
-    try:
-        vods = client.videos(cand.channel_id, limit=100)
-    except Exception as exc:
-        report.errors.append(f"{cand.channel_login}: videos failed: {exc}")
+    ready = (listings or {}).get(cand.channel_id)
+    if isinstance(ready, str):  # the fetch failed, and we know why
+        report.errors.append(f"{cand.channel_login}: videos failed: {ready}")
         return
+    if ready is not None:
+        vods = ready
+    else:
+        try:
+            vods = client.videos(cand.channel_id, limit=100)
+        except Exception as exc:
+            report.errors.append(f"{cand.channel_login}: videos failed: {exc}")
+            return
     for vod in vods:
         _remember_vod(conn, vod)
 
@@ -765,6 +812,9 @@ def resolve_match(
         )
     ]
 
+    # Frames `inspect` parsed, per channel, for `calibrate_vod` to reuse.
+    watched: dict[str, list[tuple[float, object]]] = {}
+
     def inspect(cand: Candidate) -> None:
         """Open the broadcast and see whether this match is in it.
 
@@ -793,6 +843,10 @@ def resolve_match(
         ev.valorant_ui_frames = seen.valorant_frames
         ev.vod_not_this_match = seen.saw_nothing
         report.frames_read += seen.frames_read
+        # Hand the parsed frames on. Calibration wants a round countdown off
+        # frames exactly like these, and paying twice to read one broadcast
+        # was most of what made a scan slow.
+        watched[cand.channel_id] = seen.reads
 
     def calibrate_vod(cand: Candidate) -> None:
         """Measure where this match really starts in this broadcast.
@@ -809,10 +863,20 @@ def resolve_match(
         base = start - cand.vod.created_epoch
         lo = max(0.0, cand.vod.created_epoch - start) + base
         hi = min(end, cand.vod.end_epoch) - start + base
-        cal = calibrate.measure(
-            watcher.reader, watcher.frames, cand.vod.id,
-            base=base, starts=round_starts, window=(lo, hi),
+        # The cheap way first: frames `inspect` already read, OCR and all.
+        # On a streamer whose broadcast was confirmed from the screen, those
+        # frames carry a countdown often enough to settle this for nothing.
+        cal = calibrate.from_reads(
+            watched.get(cand.channel_id, ()),
+            base=base, starts=round_starts, vod_id=cand.vod.id,
         )
+        if cal.measured:
+            report.calibrated_free += 1
+        else:
+            cal = calibrate.measure(
+                watcher.reader, watcher.frames, cand.vod.id,
+                base=base, starts=round_starts, window=(lo, hi),
+            )
         if cal.measured:
             calibrate.store(conn, match.id, cand.vod.id, cal)
             report.calibrated += 1
@@ -822,8 +886,10 @@ def resolve_match(
         else:
             report.uncalibrated += 1
 
-    def finish(cand: Candidate) -> None:
-        gather_evidence(client, conn, cand, match, start, end, game_id, report)
+    def finish(cand: Candidate,
+               listings: dict[str, list[Vod] | str] | None = None) -> None:
+        gather_evidence(client, conn, cand, match, start, end, game_id, report,
+                        listings)
         inspect(cand)
         _remember_encounter(conn, match.id, cand, cand.player.team == my_team)
         if cand.verdict == "confirmed":
@@ -832,15 +898,39 @@ def resolve_match(
         calibrate_vod(cand)
         report.file(cand)
 
-    for player in match.players:
-        if player.puuid == my_puuid:
-            continue
+    others = [p for p in match.players if p.puuid != my_puuid]
+
+    # Layer 1's name search is one HTTP round trip per player and nine of them
+    # in a row is nine round trips of waiting. They do not depend on each
+    # other, so they go out together; everything that touches the database
+    # still happens below, on this thread, in lobby order.
+    aliases = {p.puuid: _known_aliases(conn, p.name, p.tag) for p in others}
+    searches: dict[str, list[dict]] = {}
+    unsearchable: dict[str, str] = {}
+    to_search = [p for p in others if not aliases[p.puuid]]
+    if to_search:
+        with ThreadPoolExecutor(max_workers=min(LOOKUP_WORKERS, len(to_search))) as pool:
+            jobs = {
+                pool.submit(client.search_channels, p.name, limit=40): p
+                for p in to_search
+            }
+            for job, player in jobs.items():
+                try:
+                    searches[player.puuid] = job.result()
+                except Exception as exc:
+                    unsearchable[player.puuid] = str(exc)
+
+    # Built for the whole lobby first, so the broadcast listings they all need
+    # can be fetched together rather than one at a time inside the loop.
+    per_player: list[tuple[Player, list[Candidate]]] = []
+
+    for player in others:
         report.players_checked += 1
 
         candidates: list[Candidate] = []
 
         # Layer 2 - anything already confirmed about this Riot ID.
-        for row in _known_aliases(conn, player.name, player.tag):
+        for row in aliases[player.puuid]:
             cand = Candidate(match.id, player, row["channel_id"], row["login"] or "",
                              row["display_name"] or "", f"alias:{row['source']}")
             cand.evidence.name_exact = normalise(row["login"] or "") == normalise(player.name)
@@ -849,12 +939,14 @@ def resolve_match(
         # Layer 1 - Twitch name search. Zero database, catches the easy cases -
         # and collides with every established streamer who shares a short name.
         if not candidates:
-            target = normalise(player.name)
-            try:
-                hits = client.search_channels(player.name, limit=40)
-            except Exception as exc:
-                report.errors.append(f"{player.name}#{player.tag}: search failed: {exc}")
+            if player.puuid in unsearchable:
+                report.errors.append(
+                    f"{player.name}#{player.tag}: search failed: "
+                    f"{unsearchable[player.puuid]}"
+                )
                 continue
+            target = normalise(player.name)
+            hits = searches.get(player.puuid, [])
             near = 0
             for hit in hits:
                 login = hit.get("broadcaster_login", "")
@@ -891,8 +983,22 @@ def resolve_match(
             for cand in candidates:
                 cand.evidence.live_on_valorant = live.get(cand.channel_id) == game_id
 
+        per_player.append((player, candidates))
+
+    # Every candidate needs its channel's broadcast listing, and that is the
+    # single most-made call in the program: one per candidate, and most
+    # lobbies produce dozens. Serially that is dozens of round trips spent
+    # waiting; fetched together it is one. Distinct channels only, because a
+    # name search routinely returns the same big streamer for several
+    # players, and the result is handed to gather_evidence rather than
+    # fetched again there.
+    listings = _prefetch_videos(
+        client, {c.channel_id for _, cs in per_player for c in cs}, report
+    )
+
+    for player, candidates in per_player:
         for cand in candidates:
-            finish(cand)
+            finish(cand, listings)
 
         if not any(c.player.puuid == player.puuid for c in report.confirmed):
             unresolved.append(player)

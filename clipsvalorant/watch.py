@@ -60,6 +60,11 @@ class Watched:
     names: set[str] = field(default_factory=set)
     me_seen: bool = False
     unavailable: str = ""
+    # Every frame this pass actually parsed, as (offset in the broadcast, the
+    # read). Calibration wants the round countdown off frames like these, and
+    # it used to pay for a second pass of its own to get them. The OCR is
+    # already done here; handing it on is free.
+    reads: list[tuple[float, object]] = field(default_factory=list)
 
     @property
     def certain(self) -> bool:
@@ -153,8 +158,9 @@ def watch(reader, frames, vod_id: str, vod_offset_s: float,
         seen.unavailable = "no lobby name long enough to search for"
         return seen
 
-    for at in sample_offsets(kills, limit=limit, window=window):
-        path = frames.frame(vod_id, vod_offset_s + at)
+    wanted = [vod_offset_s + at for at in
+              sample_offsets(kills, limit=limit, window=window)]
+    for offset, path in frames.iter_frames(vod_id, wanted):
         if path is None:
             seen.frames_failed += 1
             # A VOD with no playlist at all will never produce a frame; do not
@@ -167,6 +173,7 @@ def watch(reader, frames, vod_id: str, vod_offset_s: float,
             seen.frames_failed += 1
             continue
         seen.frames_read += 1
+        seen.reads.append((offset, read))
         if read.looks_like_valorant:
             seen.valorant_frames += 1
         if read.has_match_timer:

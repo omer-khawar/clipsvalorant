@@ -180,11 +180,24 @@ class _Reader:
 
 
 class _Frames:
+    """Stands in for FrameReader, including its prefetching iterator.
+
+    `iter_frames` is the real one's contract: offsets in the order asked for,
+    fetched several at a time. Order is what the fake has to preserve, since
+    a vote is only meaningful against the offset it was read at.
+    """
+
     def __init__(self, fail=()):
         self.fail = set(fail)
+        self.asked: list[float] = []
 
     def frame(self, vod_id, offset):
+        self.asked.append(offset)
         return None if int(offset) in self.fail else str(int(offset))
+
+    def iter_frames(self, vod_id, offsets, *, ahead=4):
+        for offset in offsets:
+            yield offset, self.frame(vod_id, offset)
 
 
 def _screen(timer, buy=False):
@@ -311,3 +324,43 @@ def test_remeasuring_replaces_the_old_answer(conn):
     calibrate.store(conn, "m1", "v1", calibrate.ESTIMATE)
     calibrate.store(conn, "m1", "v1", calibrate.Calibration(101.0, "measured", 6))
     assert calibrate.load(conn, "m1", "v1").measured
+
+
+# ------------------------------------- calibrating off frames already read
+
+def test_from_reads_settles_the_shift_without_fetching_anything():
+    """Confirming the streamer and timing the match read the same frames.
+    Paying twice for one broadcast was most of what made a scan slow."""
+    starts = {r: 55.0 + r * 90.0 for r in range(6)}
+    shift = 100.0
+    # Three frames inside round 0, dated by the countdown on them.
+    reads = []
+    for offset in (160.0, 175.0, 190.0):
+        into_round = offset - shift - starts[0]
+        reads.append((offset, _screen(_mmss(calibrate.ROUND_TIMER_S - into_round))))
+
+    cal = calibrate.from_reads(reads, base=0.0, starts=starts, vod_id="v1")
+    assert cal.measured
+    assert abs(cal.shift_s - shift) < calibrate.CLUSTER_S
+    assert cal.votes >= calibrate.MIN_VOTES
+
+
+def test_from_reads_declines_rather_than_guessing_from_one_frame():
+    """One frame cannot say which round it is in, so it offers a candidate per
+    round and none of them recur. An answer here would be a coin toss."""
+    starts = {r: 55.0 + r * 90.0 for r in range(6)}
+    reads = [(160.0, _screen(_mmss(45.0)))]
+    assert not calibrate.from_reads(reads, base=0.0, starts=starts).measured
+
+
+def test_from_reads_ignores_frames_with_no_clock_on_them():
+    starts = {r: 55.0 + r * 90.0 for r in range(6)}
+    blank = frame([TextBox("FOLLOW FOR MORE", 100, 600, 400, 640)])
+    cal = calibrate.from_reads([(160.0, blank), (175.0, blank)],
+                               base=0.0, starts=starts)
+    assert cal is calibrate.ESTIMATE or not cal.measured
+
+
+def _mmss(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60}:{seconds % 60:02d}"
