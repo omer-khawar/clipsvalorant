@@ -440,6 +440,19 @@ def test_clips_defaults_to_the_configured_account(srv):
     assert data["groups"][0]["channel"] == "streamer"
 
 
+def test_the_summary_carries_the_account_and_its_own_region(srv, cfg):
+    """The chip shows the region of the account on screen.
+
+    Not the server's configuration. A scan works the shard out from the
+    Riot ID itself and overrides whatever this machine was set to, so a
+    chip reading the server's setting told every visitor NA whoever they
+    were and wherever they play.
+    """
+    _, data = srv.get("/api/clips")
+    assert data["summary"]["region"] == cfg.region
+    assert data["summary"]["riot_id"] == cfg.riot_id
+
+
 def test_clips_for_an_unknown_account_explains_itself(srv):
     status, data = srv.get("/api/clips?key=nobody")
     assert status == 200 and data["groups"] == [] and data["error"]
@@ -1153,6 +1166,15 @@ def test_searching_is_gated_too(srv, monkeypatch):
         urllib.request.urlopen(req)
     assert caught.value.code == 401
     assert srv.started == []
+
+
+def test_the_favicon_answers_without_the_password(srv, monkeypatch):
+    """A browser asks for the tab icon before anyone can have typed one."""
+    monkeypatch.setenv(web.PASSWORD_ENV, "hunter2")
+    status, body, headers = _raw_get(srv.port, "/favicon.svg")
+    assert status == 200
+    assert headers.get("Content-Type") == "image/svg+xml"
+    assert body.startswith(b"<svg") and b"</svg>" in body
 
 
 def test_the_health_check_answers_without_the_password(srv, monkeypatch):

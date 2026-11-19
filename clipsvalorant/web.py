@@ -84,6 +84,22 @@ MAX_JOB_LINES = 400
 # no session to expire and no cookie to get wrong.
 PASSWORD_ENV = "CLIPS_PASSWORD"
 
+# The tab icon: the mark on the brand sheet's black tile. Inline rather than
+# a file on disk because the whole UI is one module and a favicon is not
+# worth a second deployable artefact; SVG rather than ICO because it stays
+# sharp on every display and both colours come straight off the sheet.
+FAVICON = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    b'<rect width="32" height="32" rx="7" fill="#050505"/>'
+    b'<g transform="translate(4 4)">'
+    b'<path d="M3.2 9.4V3.2h6.2" fill="none" stroke="#fafafa" stroke-width="2.4"/>'
+    b'<path d="M20.8 14.6v6.2h-6.2" fill="none" stroke="#fafafa" stroke-width="2.4"/>'
+    b'<rect x="13.1" y="6.9" width="3.4" height="3.4" fill="#a97bff"/>'
+    b'<rect x="8.3" y="10.3" width="3.4" height="3.4" fill="#a97bff"/>'
+    b'<rect x="13.1" y="13.7" width="3.4" height="3.4" fill="#a97bff"/>'
+    b"</g></svg>"
+)
+
 VERDICT_ORDER = {"confirmed": 0, "likely": 1, "unconfirmed": 2, "rejected": 3}
 
 # Highlights are ranked for the "open with this" list. An ace beats a clutch
@@ -652,7 +668,13 @@ def account_summary(conn: sqlite3.Connection) -> dict[str, Any]:
         " (SELECT COUNT(*) FROM encounter) AS encounters,"
         " (SELECT COUNT(*) FROM encounter WHERE verdict = 'rejected') AS rejected,"
         " (SELECT COUNT(*) FROM encounter"
-        "  WHERE verdict IN ('confirmed', 'likely')) AS found"
+        "  WHERE verdict IN ('confirmed', 'likely')) AS found,"
+        # Whose account this is, and which shard it actually plays on -
+        # written at ingest from HenrikDev's own answer, not from whatever
+        # region the server happens to be configured for.
+        " (SELECT region FROM riot_account WHERE is_me = 1 LIMIT 1) AS region,"
+        " (SELECT name || '#' || tag FROM riot_account WHERE is_me = 1 LIMIT 1)"
+        "   AS riot_id"
     ).fetchone()
     return dict(row)
 
@@ -1347,6 +1369,11 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
             if route == "/healthz":
                 self._send(200, b"ok\n", "text/plain; charset=utf-8")
                 return
+            # Also outside the gate: a tab icon gives nothing away, and a
+            # browser asks for it before anyone has typed a password.
+            if route == "/favicon.svg":
+                self._send(200, FAVICON, "image/svg+xml")
+                return
             if not self._authorized():
                 self._ask_for_password()
                 return
@@ -1573,6 +1600,8 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>val:grind</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<meta name="theme-color" content="#050505">
 <style>
 /* ===========================================================================
    Design read off github.com/wundercorp/awesome-components. That catalogue
@@ -2426,7 +2455,14 @@ function renderMatches(){
             (me.hs != null ? ' &middot; ' + me.hs + '% hs' : '') + '</span>' +
         '</span>' +
         '<span class="mrow3">' + pips(g) +
-          '<span class="mcount"><b>' + (g.playable || 0) + '</b> to watch</span>' +
+          /* Starred moments when there are any, kills when there are not.
+             A match with no ace or clutch in it still has every round and
+             every kill to open, and "0 to watch" on a card listing twenty
+             rounds reads as a broken card rather than a quiet match. */
+          '<span class="mcount">' + (g.playable
+            ? '<b>' + g.playable + '</b> to watch'
+            : '<b>' + (g.kill_count || 0) + '</b> kill' +
+              ((g.kill_count === 1) ? '' : 's')) + '</span>' +
         '</span>' +
       '</span></button>';
   }).join("");
@@ -2744,6 +2780,15 @@ function fail(msg){
 function loadClips(key){
   return api("/api/clips?key=" + encodeURIComponent(key)).then(function(j){
     S.key = j.key; S.groups = j.groups || [];
+    /* The chip is the region of the account on screen, not the server's
+       own setting. A scan works out the shard from the Riot ID itself and
+       overrides whatever this machine was configured for, so the old chip
+       told every visitor NA no matter who they were or where they play. */
+    var sum = j.summary || {};
+    var chip = $("#region");
+    if (sum.region) { chip.hidden = false; chip.textContent = sum.region; }
+    else { chip.hidden = true; }
+    if (sum.riot_id) { nameplate(sum.riot_id); }
     renderTotals(); renderMatches();
     if (!group()) { S.sel = S.groups.length ? S.groups[0].id : null; S.round = null; }
     if (S.sel) { select(S.sel); } else { $("#stageWrap").innerHTML = ""; }
@@ -2767,7 +2812,6 @@ function boot(){
     try { mine = localStorage.getItem("vg:riot") || ""; } catch(e){}
     $("#riot").value = mine;
     nameplate(mine || j.default_riot_id);
-    if (j.region) { var c = $("#region"); c.hidden = false; c.textContent = j.region; }
     if (!j.has_twitch) { fail("No Twitch credentials configured, so nothing can be confirmed from a broadcast."); }
     S.ticket = readTicket();
     if (S.ticket) { watch(); }
