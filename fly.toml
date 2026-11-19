@@ -1,0 +1,60 @@
+# Fly.io deployment. `fly launch` would write a file like this itself; it is
+# checked in so that a deploy is one command, and so that the three settings
+# that actually matter here are visible rather than buried in a dashboard:
+# one machine, one volume, and scale to zero when nobody is looking.
+#
+# App names are global on Fly, so if `clipsvalorant` is taken, change it here
+# and `fly launch` will follow. Nothing in this file is a secret -- the Riot
+# ID, the API keys and the password all arrive through `fly secrets set`.
+
+app = "clipsvalorant"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DB_PATH = "/data/clipsvalorant.db"
+  PORT = "8080"
+  RIOT_REGION = "na"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+
+  # One machine stays up, deliberately. The queue lives in memory, so a
+  # machine that stops takes the line with it: everyone waiting is told
+  # their ticket means nothing, and the scan that was running dies halfway.
+  # That was an acceptable trade when one person used this and could simply
+  # scan again; it is not when the URL has been handed to friends who are
+  # waiting their turn.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  # One machine, deliberately, and `fly deploy --ha=false` to keep it that
+  # way. Two would each hold their own copy of the SQLite file and their own
+  # "one search at a time" lock, so which half of your results you saw would
+  # depend on which machine the proxy happened to pick.
+  processes = ["app"]
+
+# /healthz is the one route outside the password gate, so that a failed check
+# means a dead machine rather than a missing header.
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "15s"
+  method = "GET"
+  path = "/healthz"
+
+# Databases, artwork and cached VOD frames. Without this the container's disk
+# is thrown away on every deploy, and every scan starts from nothing.
+[[mounts]]
+  source = "clipsvalorant_data"
+  destination = "/data"
+
+# OCR is the heavy part: onnxruntime wants room to load its models, and
+# ffmpeg pulls segments in parallel. 1GB is enough; 256MB is not.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"

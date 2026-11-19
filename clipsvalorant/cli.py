@@ -508,10 +508,13 @@ def serve(
         bool, typer.Option("--open/--no-open", help="Open a browser window.")
     ] = True,
 ) -> None:
-    """Start the local web UI: search for a Riot ID and watch what it finds.
+    """Start the web UI: search for a Riot ID and watch what it finds.
 
-    Bound to localhost, because the page has no authentication and would hand
-    anyone who reached it the ability to spend this machine's API quota.
+    Bound to localhost by default, because the page has no authentication of
+    its own and would otherwise hand anyone who reached it the ability to
+    spend this machine's API quota. Bind it wider - `--host 0.0.0.0`, which is
+    what a container needs - and set CLIPS_PASSWORD, which gates every route
+    but /healthz behind one shared password.
     """
     cfg = _config(require_api_key=False)
     from clipsvalorant.web import serve as run_server

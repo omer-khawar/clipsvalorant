@@ -22,15 +22,20 @@ things.
 
 from __future__ import annotations
 
+import base64
 import dataclasses
+import hmac
 import json
 import logging
+import os
 import re
+import secrets
 import socket
 import sqlite3
 import threading
 import time
 import webbrowser
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -64,6 +69,20 @@ DEFAULT_FETCH = 40
 MAX_FETCH = 100
 
 MAX_JOB_LINES = 400
+
+# A shared password, read from the environment at request time. Unset means no
+# gate at all, which is what keeps `serve` on localhost exactly as it was;
+# set means nothing but /healthz answers without it.
+#
+# The gate exists because the page has nothing else protecting it. Bound to
+# localhost that is correct - there is no one else on the interface - but on a
+# public hostname anyone who finds the URL is spending this machine's
+# HenrikDev quota and holding the one search slot the whole server has.
+#
+# Basic auth rather than a login form: the browser then replays it on the
+# page, the five JSON endpoints and the artwork alike, with nothing to store,
+# no session to expire and no cookie to get wrong.
+PASSWORD_ENV = "CLIPS_PASSWORD"
 
 VERDICT_ORDER = {"confirmed": 0, "likely": 1, "unconfirmed": 2, "rejected": 3}
 
@@ -636,12 +655,19 @@ class Job:
     id: str
     riot_id: str
     key: str
-    state: str = "running"  # running | done | error | cancelled
+    state: str = "running"  # queued | running | done | error | cancelled
     phase: str = "starting"  # starting | ingest | resolve | done
     done: int = 0
     total: int = 0
     started: float = field(default_factory=time.time)
     finished: float = 0.0
+    # Who asked, and what they asked for. Both belong to the queue rather
+    # than to the scan itself: the first is how "your scan" is told apart
+    # from somebody else's with nobody logging in, and the second is what
+    # the worker replays when the turn finally comes round.
+    client: str = ""
+    options: dict[str, Any] = field(default_factory=dict)
+    queued_at: float = 0.0
     error: str = ""
     lines: list[str] = field(default_factory=list)
     # Said out loud, under the progress bar. The log is for afterwards; this
@@ -919,15 +945,265 @@ def run_search(
         package.setLevel(previous)
 
 
+# ---------------------------------------------------------------- the queue
+
+# How many scans run at once. One, because everything downstream is rate
+# limited by a single HenrikDev key: two scans do not finish in half the
+# time, they share the same requests per minute and both crawl, and the
+# resolver's own ffmpeg workers already saturate a small machine between
+# them. Serialising was always the behaviour - the queue is what makes it
+# legible, "you are third", instead of a search that mysteriously refuses to
+# start.
+WORKERS = 1
+
+# A ceiling on the line. Past this, the wait is longer than anyone will sit
+# through, and saying so at once is kinder than handing out a position
+# nobody reaches.
+MAX_WAITING = 24
+
+# How long a finished scan stays readable after it ends. Long enough to
+# reload the page and still find what it did, short enough that a busy
+# evening does not accumulate in memory.
+KEEP_DONE_S = 20 * 60
+
+# What a scan tends to cost, used only to turn a position into a number of
+# minutes. Measured on the 14-day scans this mostly runs, which land between
+# two and five minutes depending on how many broadcasts have to be opened.
+TYPICAL_SCAN_S = 210
+
+
+class Queue:
+    """Scans waiting their turn, and the worker thread that runs them.
+
+    The old behaviour - start on arrival, refuse if busy - was right for one
+    person on localhost and fails quietly for four people on a URL. Refusing
+    tells the second person to try again with no idea when; running both
+    would split one API key's quota and make each scan slower than if they
+    had taken turns. A queue is the honest version of what the rate limit
+    already forces.
+
+    Everything here is in memory, deliberately. A queue that outlived a
+    restart would hand people back a position in a line whose running scan
+    died with the process, which is worse than being told to ask again.
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        runner: Callable[..., None],
+        workers: int = WORKERS,
+    ) -> None:
+        self.cfg = cfg
+        self.runner = runner
+        self._cv = threading.Condition()
+        self._waiting: deque[Job] = deque()
+        self._running: dict[str, Job] = {}
+        self._finished: dict[str, Job] = {}
+        self._closed = False
+        self._threads = [
+            threading.Thread(target=self._work, daemon=True, name=f"scan-{n}")
+            for n in range(max(1, workers))
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    # -- asking
+
+    def submit(self, riot_id: str, *, client: str = "", **options: Any) -> Job:
+        """Join the line, or raise RuntimeError saying why not."""
+        with self._cv:
+            self._sweep()
+            mine = self._active_for(client)
+            if mine is not None:
+                raise RuntimeError(
+                    f"You already have a scan {mine.state} for {mine.riot_id}."
+                )
+            if len(self._waiting) >= MAX_WAITING:
+                raise RuntimeError(
+                    f"{len(self._waiting)} scans are already waiting. "
+                    "Try again in a few minutes."
+                )
+            # An unguessable id, because it is the only thing standing
+            # between one person's scan and another person's cancel button.
+            job = Job(
+                id=secrets.token_urlsafe(9),
+                riot_id=riot_id,
+                key="",
+                state="queued",
+                client=client,
+                options=dict(options),
+                queued_at=time.time(),
+            )
+            self._waiting.append(job)
+            self._cv.notify()
+            return job
+
+    def cancel(self, ticket: str, *, client: str = "") -> Job:
+        """Drop a scan, whether it is waiting or already running."""
+        with self._cv:
+            job = self._find(ticket)
+            if job is None:
+                raise KeyError(ticket)
+            if job.client and client and job.client != client:
+                raise PermissionError(ticket)
+            if job.state == "queued":
+                job.state = "cancelled"
+                job.finished = time.time()
+                try:
+                    self._waiting.remove(job)
+                except ValueError:  # pragma: no cover - a worker just took it
+                    pass
+                self._finished[job.id] = job
+                return job
+        # Outside the lock: stopping narrates into the job, and the worker
+        # thread holds nothing of ours while it runs.
+        if job.state == "running":
+            job.stop()
+        return job
+
+    # -- looking
+
+    def snapshot(self, ticket: str) -> dict[str, Any]:
+        """One client's scan, with its place in the line if it is waiting."""
+        with self._cv:
+            self._sweep()
+            job = self._find(ticket)
+            if job is None:
+                # Not an error. A ticket from before a restart, or one that
+                # has aged out, should put the page back to a usable state
+                # rather than show it a failure it can do nothing about.
+                return {"state": "unknown"}
+            snap = job.snapshot()
+            if job.state == "queued":
+                ahead = 0
+                for other in self._waiting:
+                    if other is job:
+                        break
+                    ahead += 1
+                snap["position"] = ahead + 1
+                snap["ahead"] = ahead
+                snap["waiting"] = round(time.time() - job.queued_at, 1)
+                snap["eta"] = int((ahead + len(self._running)) * TYPICAL_SCAN_S)
+                # What is happening instead of your scan. Carried on the
+                # same poll so the waiting screen needs one request rather
+                # than two, and so a queue that is moving looks like it.
+                snap["now"] = [
+                    {
+                        "riot_id": other.riot_id,
+                        "phase": other.phase,
+                        "done": other.done,
+                        "total": other.total,
+                    }
+                    for other in self._running.values()
+                ]
+            return snap
+
+    def stats(self) -> dict[str, Any]:
+        """The state of the line, for anyone looking, ticket or not."""
+        with self._cv:
+            self._sweep()
+            running = [
+                {
+                    "riot_id": job.riot_id,
+                    "phase": job.phase,
+                    "done": job.done,
+                    "total": job.total,
+                    "elapsed": round(time.time() - job.started, 1),
+                }
+                for job in self._running.values()
+            ]
+            return {
+                "running": running,
+                "waiting": len(self._waiting),
+                "workers": len(self._threads),
+                "max_waiting": MAX_WAITING,
+                "typical_scan_s": TYPICAL_SCAN_S,
+            }
+
+    def close(self) -> None:
+        """Let the workers finish. For tests and for a tidy shutdown."""
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
+    # -- the worker
+
+    def _work(self) -> None:
+        while True:
+            with self._cv:
+                while not self._waiting and not self._closed:
+                    self._cv.wait()
+                if self._closed and not self._waiting:
+                    return
+                job = self._waiting.popleft()
+                if job.state != "queued":  # cancelled while it waited
+                    continue
+                job.state = "running"
+                job.started = time.time()
+                self._running[job.id] = job
+            try:
+                self.runner(self.cfg, job, **job.options)
+            except Exception as exc:  # the worker is the last line of defence
+                job.state = "error"
+                job.error = f"{type(exc).__name__}: {exc}"
+                log.exception("Queued search for %s failed", job.riot_id)
+            finally:
+                # A runner that returned without saying how it went still
+                # has to leave the queue, or the next person waits forever.
+                if job.state == "running":
+                    job.state = "done"
+                if not job.finished:
+                    job.finished = time.time()
+                with self._cv:
+                    self._running.pop(job.id, None)
+                    self._finished[job.id] = job
+
+    # -- bookkeeping, all called with the lock held
+
+    def _find(self, ticket: str) -> Job | None:
+        if not ticket:
+            return None
+        job = self._running.get(ticket) or self._finished.get(ticket)
+        if job is not None:
+            return job
+        for waiting in self._waiting:
+            if waiting.id == ticket:
+                return waiting
+        return None
+
+    def _active_for(self, client: str) -> Job | None:
+        """The scan this client already has in flight, if any.
+
+        One at a time per person, which is what stops a single browser - or
+        a single impatient refresh - from filling a queue everyone shares.
+        """
+        if not client:
+            return None
+        for job in list(self._running.values()) + list(self._waiting):
+            if job.client == client:
+                return job
+        return None
+
+    def _sweep(self) -> None:
+        cutoff = time.time() - KEEP_DONE_S
+        stale = [
+            ticket
+            for ticket, job in self._finished.items()
+            if job.finished and job.finished < cutoff
+        ]
+        for ticket in stale:
+            del self._finished[ticket]
+
+
 @dataclass
 class State:
-    """What the handler is allowed to touch. One search at a time."""
+    """What the handler is allowed to touch."""
 
     cfg: Config
-    job: Job | None = None
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     runner: Callable[..., None] = run_search
     _assets: Any = None
+    _queue: Queue | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def assets(self) -> Assets:
@@ -939,28 +1215,17 @@ class State:
     def data_dir(self) -> Path:
         return self.cfg.db_path.parent
 
-    def busy(self) -> bool:
+    @property
+    def queue(self) -> Queue:
+        """Built on first use, so a page nobody searches on starts no threads."""
         with self._lock:
-            return self.job is not None and self.job.state == "running"
+            if self._queue is None:
+                self._queue = Queue(self.cfg, self.runner)
+            return self._queue
 
-    def start(self, riot_id: str, **kwargs: Any) -> Job:
-        """Begin a search, or raise RuntimeError if one is already running.
-
-        Serialised deliberately. Two searches at once would race for the same
-        API quota and, for the same account, the same database rows.
-        """
-        with self._lock:
-            if self.job is not None and self.job.state == "running":
-                raise RuntimeError(
-                    f"A search for {self.job.riot_id} is still running."
-                )
-            job = Job(id=f"job-{int(time.time() * 1000)}", riot_id=riot_id, key="")
-            self.job = job
-        thread = threading.Thread(
-            target=self.runner, args=(self.cfg, job), kwargs=kwargs, daemon=True
-        )
-        thread.start()
-        return job
+    def close(self) -> None:
+        if self._queue is not None:
+            self._queue.close()
 
 
 # ---------------------------------------------------------------- HTTP
@@ -1002,12 +1267,77 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 return {}
             return parsed if isinstance(parsed, dict) else {}
 
+        # -- who is asking
+
+        def _client(self) -> str:
+            """Who is asking, as well as anything here can know.
+
+            There are no accounts, so "one scan at a time per person" has to
+            mean per address. Fly's proxy puts the real one in Fly-Client-IP;
+            behind anything else the first entry of X-Forwarded-For is the
+            usual convention, and on localhost it is simply the socket.
+
+            Both headers are client-settable, so this is a courtesy rather
+            than a boundary: it stops an impatient refresh from filling a
+            shared queue, not a determined person from trying.
+            """
+            for header in ("Fly-Client-IP", "X-Forwarded-For"):
+                raw = self.headers.get(header, "")
+                if raw.strip():
+                    return raw.split(",")[0].strip()[:64]
+            try:
+                return str(self.client_address[0])
+            except (AttributeError, IndexError):  # pragma: no cover
+                return ""
+
+        # -- the gate
+
+        def _authorized(self) -> bool:
+            """True when this request carries the configured password, or there isn't one."""
+            secret = os.environ.get(PASSWORD_ENV, "").strip()
+            if not secret:
+                return True
+            scheme, _, token = self.headers.get("Authorization", "").partition(" ")
+            if scheme.lower() != "basic":
+                return False
+            try:
+                decoded = base64.b64decode(token.strip(), validate=True).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                return False
+            # Any username; the password is the whole secret. One field is
+            # less to mistype on a phone, and there are no accounts here to
+            # tell apart.
+            _, _, offered = decoded.partition(":")
+            return hmac.compare_digest(offered, secret)
+
+        def _ask_for_password(self) -> None:
+            body = b"clipsvalorant: password required\n"
+            self.send_response(401)
+            self.send_header(
+                "WWW-Authenticate", 'Basic realm="clipsvalorant", charset="UTF-8"'
+            )
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
         # -- routes
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
             url = urlparse(self.path)
             query = parse_qs(url.query)
             route = url.path.rstrip("/") or "/"
+            # Outside the gate deliberately: a host's health check has no
+            # password to offer, and a 401 would read as a dead machine and
+            # get it restarted under a running scan.
+            if route == "/healthz":
+                self._send(200, b"ok\n", "text/plain; charset=utf-8")
+                return
+            if not self._authorized():
+                self._ask_for_password()
+                return
             try:
                 if route == "/":
                     self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
@@ -1018,8 +1348,9 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 elif route.startswith("/api/icon/"):
                     self._icon(route)
                 elif route == "/api/job":
-                    job = state.job
-                    self._json(job.snapshot() if job else {"state": "idle"})
+                    self._json(state.queue.snapshot(query.get("ticket", [""])[0]))
+                elif route == "/api/queue":
+                    self._json(state.queue.stats())
                 else:
                     self._json({"error": "no such endpoint"}, 404)
             except Exception as exc:
@@ -1030,13 +1361,20 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             route = urlparse(self.path).path.rstrip("/") or "/"
+            if not self._authorized():
+                self._ask_for_password()
+                return
             if route == "/api/cancel":
-                job = state.job
-                if job is None or job.state != "running":
-                    self._json({"error": "nothing is running"}, 409)
+                ticket = str(self._body().get("ticket") or "").strip()
+                try:
+                    state.queue.cancel(ticket, client=self._client())
+                except KeyError:
+                    self._json({"error": "that scan is not in the queue"}, 404)
                     return
-                job.stop()
-                self._json(job.snapshot(), 202)
+                except PermissionError:
+                    self._json({"error": "that scan belongs to someone else"}, 403)
+                    return
+                self._json(state.queue.snapshot(ticket), 202)
                 return
             if route != "/api/search":
                 self._json({"error": "no such endpoint"}, 404)
@@ -1061,8 +1399,9 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 mode = None
             region = str(body.get("region") or "").strip().lower() or None
             try:
-                job = state.start(
+                job = state.queue.submit(
                     riot_id,
+                    client=self._client(),
                     days=days,
                     fetch=fetch,
                     mode=mode,
@@ -1072,13 +1411,12 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
             except RuntimeError as exc:
                 self._json({"error": str(exc)}, 409)
                 return
-            self._json(job.snapshot(), 202)
+            self._json(state.queue.snapshot(job.id), 202)
 
         # -- payloads
 
         def _state_payload(self) -> dict[str, Any]:
             cfg = state.cfg
-            job = state.job
             return {
                 "default_riot_id": cfg.riot_id,
                 "default_key": cfg.db_path.stem,
@@ -1087,7 +1425,7 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 "region": cfg.region,
                 "has_twitch": cfg.has_twitch,
                 "accounts": known_accounts(state.data_dir),
-                "job": job.snapshot() if job else None,
+                "queue": state.queue.stats(),
             }
 
         def _icon(self, route: str) -> None:
@@ -1171,7 +1509,15 @@ def serve(
     open_browser: bool = True,
     say: Callable[[str], None] = print,
 ) -> None:
-    """Run the UI until interrupted."""
+    """Run the UI until interrupted.
+
+    `host` defaults to loopback, which is the only configuration that needs no
+    password: nothing outside the machine can reach it. Bind anything wider -
+    a container binds 0.0.0.0 by necessity - and the gate matters, so set
+    CLIPS_PASSWORD there. This prints a warning when it is missing rather than
+    refusing, because "wider than loopback" is also a LAN address someone
+    typed on purpose to open the page on their phone.
+    """
     state = State(cfg=cfg)
     port = free_port(port, host)
     server = ThreadingHTTPServer((host, port), make_handler(state))
@@ -1181,11 +1527,19 @@ def serve(
     # location.hostname, so the URL offered here has to be the name, not the
     # address it resolves to.
     url = f"http://localhost:{port}/"
-    say(f"clipsvalorant UI on {url}")
+    if host in ("127.0.0.1", "localhost", "::1"):
+        say(f"clipsvalorant UI on {url}")
+    else:
+        say(f"clipsvalorant UI listening on {host}:{port}")
     say(f"  database: {cfg.db_path}")
     say(f"  account:  {cfg.riot_id} ({cfg.region.upper()})")
     if not cfg.has_twitch:
         say("  ! Twitch credentials missing - searching will stop after ingest.")
+    if os.environ.get(PASSWORD_ENV, "").strip():
+        say("  password: required (any username)")
+    elif host not in ("127.0.0.1", "localhost", "::1"):
+        say(f"  ! Bound to {host} with no password. Anyone who can reach this")
+        say(f"  ! machine can spend its API quota. Set {PASSWORD_ENV} to gate it.")
     say("Press Ctrl+C to stop.")
     if open_browser:
         threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
@@ -1196,6 +1550,7 @@ def serve(
     finally:
         server.shutdown()
         server.server_close()
+        state.close()
 
 
 # ---------------------------------------------------------------- the page
@@ -1205,7 +1560,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>clipsvalorant</title>
+<title>val:grind</title>
 <style>
 /* ===========================================================================
    Design read off github.com/wundercorp/awesome-components. That catalogue
@@ -1291,6 +1646,9 @@ body{
 .chip{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border-radius:999px;
   border:1px solid var(--line);color:var(--muted);font-size:10px;text-transform:uppercase;
   letter-spacing:.28em;background:var(--panel);backdrop-filter:blur(12px)}
+/* A class selector beats the browser's own [hidden] rule, so a hidden chip
+   stays a visible empty pill without this. */
+.chip[hidden]{display:none}
 
 /* theme: ncdai/theme-switcher-1 */
 .themer{display:inline-flex;align-items:center;border-radius:999px;background:var(--panel);
@@ -1378,6 +1736,124 @@ body{
 .head{display:flex;align-items:center;justify-content:space-between;gap:12px;
   padding:12px 16px;border-bottom:1px solid var(--hair);min-height:52px}
 .head .t{font-size:11px;text-transform:uppercase;letter-spacing:.28em;color:var(--faint)}
+
+/* =========================== BRAND =======================================
+   The mark is a frame with two corners drawn and three squares inside it:
+   a moment bracketed out of something longer, which is the whole product.
+   Rebuilt here as inline SVG from the brand sheet rather than linked as a
+   file, because one <symbol> theming itself off currentColor survives the
+   light/dark switch that a PNG would not.
+
+   The wordmark's colon is two squares rather than a typed ':' - the glyph
+   is round in most sans faces, and the squares are the mark's own shape
+   repeated. Sized in em, so it scales with whatever it sits in.
+   ========================================================================= */
+/* `vgmark`, not `mark`: the scrubber's ticks took that name first, and
+   theirs is position:absolute - a brand mark inheriting it leaves the
+   logo pinned to the top-left corner of the viewport. */
+.vgmark{display:block;color:var(--ink)}
+.vgmark .br{stroke:currentColor;fill:none;stroke-linecap:square}
+.vgmark .sq{fill:var(--accent)}
+.lockup{display:flex;align-items:center;gap:11px;text-decoration:none}
+.lockup .vgmark{width:26px;height:26px}
+.lockup .br{stroke-width:2.3}
+.lockup .word{font-size:20px}
+.word{font-weight:800;letter-spacing:-.035em;line-height:1;color:var(--ink);white-space:nowrap}
+.word .cl{display:inline-block;position:relative;width:.19em;margin:0 .13em;
+  vertical-align:baseline}
+.word .cl::before,.word .cl::after{content:"";position:absolute;left:0;
+  width:.19em;height:.19em;background:var(--accent)}
+.word .cl::before{bottom:.44em}
+.word .cl::after{bottom:.02em}
+
+/* =========================== SPLASH ======================================
+   Once per browser session, not once per page view: a brand animation you
+   cannot get past is charming the first time and an obstacle every time
+   after. Click, key or Escape cuts it short, and reduced-motion skips it.
+   ========================================================================= */
+#splash{position:fixed;inset:0;z-index:140;display:grid;place-items:center;
+  background:var(--bg);transition:opacity .45s ease,visibility .45s}
+#splash[hidden]{display:none}
+#splash.gone{opacity:0;visibility:hidden;pointer-events:none}
+.sp{display:grid;justify-items:center;gap:20px;padding:24px;text-align:center}
+.sp .vgmark{width:96px;height:96px}
+/* pathLength="1" is what makes one dasharray work for both corners whatever
+   the viewBox - the browser normalises the length for us. */
+.sp .br{stroke-width:2.1;stroke-dasharray:1;stroke-dashoffset:1;
+  animation:vgdraw .6s cubic-bezier(.22,1,.36,1) forwards}
+.sp .br.b2{animation-delay:.12s}
+.sp .sq{opacity:0;transform-origin:center;
+  animation:vgpop .38s cubic-bezier(.34,1.56,.64,1) forwards}
+.sp .s1{animation-delay:.46s} .sp .s2{animation-delay:.56s} .sp .s3{animation-delay:.66s}
+.sp .word{font-size:clamp(34px,8vw,52px);opacity:0;animation:vgrise .6s .74s cubic-bezier(.22,1,.36,1) forwards}
+.sp .tagline{font-size:clamp(15px,3.4vw,19px);font-weight:600;color:var(--muted);
+  opacity:0;animation:vgrise .6s .92s cubic-bezier(.22,1,.36,1) forwards}
+.sp .tc{display:flex;align-items:center;gap:14px;opacity:0;
+  animation:vgrise .6s 1.04s cubic-bezier(.22,1,.36,1) forwards}
+.sp .tc span{font-size:11px;letter-spacing:.22em;color:var(--faint)}
+.sp .tc .bar{width:clamp(80px,22vw,150px);height:1px;background:var(--line);position:relative}
+.sp .tc .bar::after{content:"";position:absolute;inset:0 100% 0 0;background:var(--accent);
+  animation:vgwipe 1.1s .2s cubic-bezier(.22,1,.36,1) forwards}
+@keyframes vgdraw{to{stroke-dashoffset:0}}
+@keyframes vgpop{0%{opacity:0;transform:scale(.25)}100%{opacity:1;transform:scale(1)}}
+@keyframes vgrise{0%{opacity:0;transform:translateY(12px)}100%{opacity:1;transform:none}}
+@keyframes vgwipe{to{inset:0 0 0 0}}
+
+/* ============================ THE QUEUE ==================================
+   Shown only while your own scan is waiting. Somebody else's scan never
+   takes the page away from you - the clips already found are readable the
+   whole time, which is why there is a way out of this screen.
+   ========================================================================= */
+#gate{position:fixed;inset:0;z-index:130;display:grid;place-items:center;padding:24px;
+  background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(18px);
+  animation:vgfade .45s ease}
+#gate[hidden]{display:none}
+#gate.gone{opacity:0;pointer-events:none;transition:opacity .4s ease}
+@keyframes vgfade{0%{opacity:0}100%{opacity:1}}
+.gt{display:grid;justify-items:center;gap:22px;text-align:center;max-width:460px;width:100%}
+.gt .vgmark{width:64px;height:64px}
+.gt .br{stroke-width:2.2;animation:vgbreathe 2.6s ease-in-out infinite}
+/* The idle animation: the three squares take turns, in the order they are
+   stacked, at the pace of something working rather than something stuck. */
+.gt .sq{animation:vgblip 1.9s ease-in-out infinite}
+.gt .s2{animation-delay:.22s} .gt .s3{animation-delay:.44s}
+@keyframes vgblip{0%,68%,100%{opacity:.22}18%,42%{opacity:1}}
+@keyframes vgbreathe{0%,100%{opacity:.45}50%{opacity:1}}
+.gt .eyebrow{letter-spacing:.32em}
+.gt .pos{font-size:clamp(64px,18vw,92px);font-weight:800;letter-spacing:-.045em;line-height:.88}
+.gt .posnote{font-size:14px;color:var(--muted);margin-top:-8px}
+.gt .now{font-size:12.5px;color:var(--faint);line-height:1.6}
+.gt .now b{color:var(--ink);font-weight:600}
+/* The timeline motif off the brand sheet: ticks, and a marker that moves. */
+.qrail{position:relative;height:1px;background:var(--line);width:100%;max-width:380px;
+  margin:6px 0 2px}
+.qrail i{position:absolute;top:-3px;width:1px;height:7px;background:var(--line)}
+.qrail .me{top:-5px;width:2px;height:11px;background:var(--accent);
+  transition:left .7s cubic-bezier(.22,1,.36,1)}
+.qends{display:flex;justify-content:space-between;width:100%;max-width:380px;
+  font-size:10.5px;letter-spacing:.2em;color:var(--faint)}
+.gtbtns{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}
+.ghost{height:40px;padding:0 16px;border-radius:999px;border:1px solid var(--line);
+  background:var(--panel);color:var(--muted);font:inherit;font-size:13px;cursor:pointer;
+  backdrop-filter:blur(12px);transition:color .2s,border-color .2s}
+.ghost:hover{color:var(--ink);border-color:color-mix(in srgb,var(--ink) 25%,transparent)}
+.ghost:disabled{opacity:.5;cursor:default}
+
+/* The compact version, for when you have stepped out of the queue screen. */
+.qback{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:60;
+  display:flex;align-items:center;gap:12px;height:44px;padding:0 8px 0 16px;
+  border-radius:999px;border:1px solid var(--line);background:var(--solid);
+  box-shadow:var(--shadow-h);font-size:13px}
+.qback[hidden]{display:none}
+.qback b{font-weight:700}
+.qback button{height:30px;padding:0 13px;border-radius:999px;border:0;cursor:pointer;
+  background:var(--ink);color:var(--bg);font:inherit;font-size:12px;font-weight:600}
+
+@media (prefers-reduced-motion:reduce){
+  .sp .br,.sp .sq,.sp .word,.sp .tagline,.sp .tc,.sp .tc .bar::after,
+  .gt .sq,.gt .br{animation:none!important;opacity:1;stroke-dashoffset:0;transform:none}
+  #gate{animation:none}
+}
 
 /* ================= THE MATCH PICKER - the hero of the page ================ */
 .pick{margin:18px 0 6px}
@@ -1566,13 +2042,68 @@ body{
 <div class="dotgrid" aria-hidden="true"></div>
 <div class="vignette" aria-hidden="true"></div>
 
+<div id="splash" hidden>
+  <div class="sp">
+    <svg class="vgmark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path class="br b1" pathLength="1" d="M3.2 9.4V3.2h6.2"/>
+      <path class="br b2" pathLength="1" d="M20.8 14.6v6.2h-6.2"/>
+      <rect class="sq s1" x="13.1" y="6.9" width="3.4" height="3.4"/>
+      <rect class="sq s2" x="8.3" y="10.3" width="3.4" height="3.4"/>
+      <rect class="sq s3" x="13.1" y="13.7" width="3.4" height="3.4"/>
+    </svg>
+    <div class="word">val<span class="cl"></span>grind</div>
+    <div class="tagline">Your play. Their POV.</div>
+    <div class="tc"><span class="mono">00:00:00</span><span class="bar"></span>
+      <span class="mono" id="sptc">00:24:08</span></div>
+  </div>
+</div>
+
+<div id="gate" hidden>
+  <div class="gt">
+    <svg class="vgmark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path class="br b1" pathLength="1" d="M3.2 9.4V3.2h6.2"/>
+      <path class="br b2" pathLength="1" d="M20.8 14.6v6.2h-6.2"/>
+      <rect class="sq s1" x="13.1" y="6.9" width="3.4" height="3.4"/>
+      <rect class="sq s2" x="8.3" y="10.3" width="3.4" height="3.4"/>
+      <rect class="sq s3" x="13.1" y="13.7" width="3.4" height="3.4"/>
+    </svg>
+    <span class="eyebrow">In the queue</span>
+    <div>
+      <div class="pos mono" id="gatepos">&mdash;</div>
+      <div class="posnote" id="gatenote">Working out where you are</div>
+    </div>
+    <div class="qrail" id="qrail"><i class="me" id="qme" style="left:0"></i></div>
+    <div class="qends"><span class="mono">NOW</span><span class="mono" id="qeta"></span></div>
+    <div class="now" id="gatenow"></div>
+    <div class="gtbtns">
+      <button type="button" class="ghost" id="gatebrowse">Browse stored clips</button>
+      <button type="button" class="ghost" id="gateleave">Leave the queue</button>
+    </div>
+  </div>
+</div>
+
+<div class="qback" id="qback" hidden>
+  <span>Queued &middot; <b id="qbackpos">&mdash;</b></span>
+  <button type="button" id="qbackopen">Show</button>
+</div>
+
 <main class="wrap">
   <header class="top">
     <div class="brand">
-      <span class="eyebrow">clipsvalorant</span>
+      <a class="lockup" href="/" aria-label="val:grind">
+        <svg class="vgmark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path class="br b1" pathLength="1" d="M3.2 9.4V3.2h6.2"/>
+          <path class="br b2" pathLength="1" d="M20.8 14.6v6.2h-6.2"/>
+          <rect class="sq s1" x="13.1" y="6.9" width="3.4" height="3.4"/>
+          <rect class="sq s2" x="8.3" y="10.3" width="3.4" height="3.4"/>
+          <rect class="sq s3" x="13.1" y="13.7" width="3.4" height="3.4"/>
+        </svg>
+        <span class="word">val<span class="cl"></span>grind</span>
+      </a>
       <h1 id="who">&mdash;</h1>
     </div>
     <div class="topright">
+      <span class="chip" id="qchip" hidden></span>
       <span class="chip" id="region" hidden></span>
       <div class="themer" role="radiogroup" aria-label="Colour theme">
         <button type="button" role="radio" data-theme="system" aria-checked="false" aria-label="Match the system theme" title="System">
@@ -1750,9 +2281,14 @@ var short = function(riot){ return String(riot || "").split("#")[0]; };
    moment list can never disagree with each other. */
 var rno = function(n){ return Number(n) + 1; };
 
+var pad2 = function(n){ return (n < 10 ? "0" : "") + n; };
+
 var S = {
   key: "", groups: [], sel: null, filter: "all", days: 14, round: null,
-  player: null, poll: null, tick: null
+  player: null, poll: null, tick: null,
+  /* the queue: your ticket, and whether you have stepped out of the
+     waiting screen to look at clips while you wait */
+  ticket: "", gateOut: false, qtick: null
 };
 
 /* ---- theme: ncdai/theme-switcher-1, with a circular View Transition ---- */
@@ -2202,35 +2738,168 @@ function loadClips(key){
     $("#footright").textContent = ((j.summary && j.summary.matches) || 0) + " matches stored";
   });
 }
+function nameplate(riot){
+  var bits = String(riot || "").split("#");
+  $("#who").innerHTML = riot
+    ? esc(bits[0]) + '<span class="tag">#' + esc(bits[1] || "") + "</span>"
+    : "Find your plays";
+}
 function boot(){
+  splash();
   api("/api/state").then(function(j){
-    $("#riot").value = j.default_riot_id || "";
-    var bits = String(j.default_riot_id || "").split("#");
-    $("#who").innerHTML = j.default_riot_id
-      ? esc(bits[0]) + '<span class="tag">#' + esc(bits[1] || "") + "</span>"
-      : "Find your plays";
+    /* Deliberately not the server's own Riot ID. On one machine that was a
+       convenience; on a URL handed to friends it is a loaded gun - press
+       Scan without looking and you have spent the queue's turn on somebody
+       else's account. Yours, if this browser has scanned before. */
+    var mine = "";
+    try { mine = localStorage.getItem("vg:riot") || ""; } catch(e){}
+    $("#riot").value = mine;
+    nameplate(mine || j.default_riot_id);
     if (j.region) { var c = $("#region"); c.hidden = false; c.textContent = j.region; }
     if (!j.has_twitch) { fail("No Twitch credentials configured, so nothing can be confirmed from a broadcast."); }
-    if (j.job && j.job.state === "running") { watch(); }
-    return loadClips(j.default_key || "");
+    S.ticket = readTicket();
+    if (S.ticket) { watch(); }
+    queueChip();
+    S.qtick = setInterval(queueChip, 6000);
+    var key = "";
+    try { key = localStorage.getItem("vg:key") || ""; } catch(e){}
+    return loadClips(key || j.default_key || "");
   }).catch(function(e){ fail(String(e.message || e)); });
 }
 
-/* ---- scan + progress ---- */
+/* ---- the splash -----------------------------------------------------
+   Once per browser session rather than once per load: a brand animation
+   you cannot skip is charming the first time and an obstacle every time
+   after. Any click or key cuts it short, and reduced-motion never sees it.
+   --------------------------------------------------------------------- */
+function splash(){
+  var el = $("#splash");
+  if (!el) { return; }
+  var seen = false;
+  try { seen = sessionStorage.getItem("vg:splash") === "1"; } catch(e){}
+  if (seen || matchMedia("(prefers-reduced-motion: reduce)").matches) { el.remove(); return; }
+  try { sessionStorage.setItem("vg:splash", "1"); } catch(e){}
+  el.hidden = false;
+  document.documentElement.style.overflow = "hidden";
+  var end = 24 * 60 + 8, t0 = Date.now();
+  var tick = setInterval(function(){
+    var p = Math.min(1, (Date.now() - t0) / 1250), sec = Math.round(end * p);
+    $("#sptc").textContent = "00:" + pad2(Math.floor(sec / 60)) + ":" + pad2(sec % 60);
+    if (p >= 1) { clearInterval(tick); }
+  }, 40);
+  var leave = function(){
+    clearInterval(tick);
+    el.classList.add("gone");
+    document.documentElement.style.overflow = "";
+    setTimeout(function(){ if (el.parentNode) { el.remove(); } }, 500);
+    removeEventListener("keydown", leave);
+  };
+  addEventListener("keydown", leave);
+  el.addEventListener("click", leave);
+  setTimeout(leave, 1900);
+}
+
+/* ---- the state of the line, for anyone looking ---- */
+function queueChip(){
+  api("/api/queue").then(function(q){
+    var chip = $("#qchip"), running = (q.running || []).length, waiting = q.waiting || 0;
+    if (!running && !waiting) { chip.hidden = true; return; }
+    chip.hidden = false;
+    chip.textContent = running
+      ? (waiting ? running + " scanning · " + waiting + " waiting" : running + " scanning")
+      : waiting + " waiting";
+  }).catch(function(){});
+}
+
+/* ---- scan, queue and progress ---------------------------------------
+   Three states share one poll. Queued raises the waiting screen; running
+   paints the progress bar exactly as it always did; anything terminal
+   clears the ticket and reloads the clips. The ticket lives in
+   localStorage, so closing the tab and coming back finds your place in
+   the line instead of losing it.
+   --------------------------------------------------------------------- */
 var PHASES = {starting:"Starting", ingest:"Reading match history",
               resolve:"Checking the lobby", done:"Done"};
+var TICKET = "vg:ticket";
+
+function readTicket(){ try { return localStorage.getItem(TICKET) || ""; } catch(e){ return ""; } }
+function saveTicket(t){ S.ticket = t || ""; try { localStorage.setItem(TICKET, S.ticket); } catch(e){} }
+function dropTicket(){ S.ticket = ""; try { localStorage.removeItem(TICKET); } catch(e){} }
+
 function watch(){
-  $("#prog").hidden = false;
-  $("#go").disabled = true;
-  $("#stop").hidden = false;
-  $("#stop").disabled = false;
+  if (!S.ticket) { return; }
   if (S.poll) { clearInterval(S.poll); }
-  S.poll = setInterval(poll, 700);
+  S.poll = setInterval(poll, 900);
   poll();
 }
+function unwatch(){
+  if (S.poll) { clearInterval(S.poll); S.poll = null; }
+  $("#go").disabled = false;
+  $("#stop").hidden = true;
+}
+
+/* ---- the waiting screen ---- */
+function railTicks(){
+  var rail = $("#qrail");
+  if (rail.dataset.ticked) { return; }
+  rail.dataset.ticked = "1";
+  for (var p = 0; p <= 100; p += 25) {
+    var t = document.createElement("i");
+    t.style.left = p + "%";
+    rail.appendChild(t);
+  }
+}
+function paintGate(j){
+  railTicks();
+  var gate = $("#gate");
+  if (!S.gateOut) { gate.hidden = false; gate.classList.remove("gone"); }
+  $("#qback").hidden = !S.gateOut;
+  $("#prog").hidden = true;
+  $("#go").disabled = true;
+  $("#stop").hidden = true;
+
+  var pos = j.position || 1, ahead = j.ahead || 0;
+  $("#gatepos").textContent = pad2(pos);
+  $("#qbackpos").textContent = "#" + pos;
+  $("#gatenote").textContent = ahead === 0
+    ? "You are next. Yours starts the moment the running one finishes."
+    : ahead + (ahead === 1 ? " scan" : " scans") + " ahead of you";
+  $("#qeta").textContent = j.eta ? "~" + Math.max(1, Math.round(j.eta / 60)) + " MIN" : "";
+  /* The marker walks leftwards as the line moves. It is distance left to
+     go, not a percentage of anything, which is why zero ahead sits at the
+     start of the rail rather than the end of it. */
+  $("#qme").style.left = Math.round(ahead / (ahead + 1) * 100) + "%";
+
+  var now = (j.now || [])[0];
+  $("#gatenow").innerHTML = now
+    ? "Running now: <b>" + esc(short(now.riot_id)) + "</b><br>"
+      + esc(PHASES[now.phase] || now.phase || "working")
+      + (now.total ? " · " + now.done + " / " + now.total : "")
+    : "Nothing is running. Yours starts in a moment.";
+}
+function hideGate(){
+  var gate = $("#gate");
+  if (!gate.hidden) {
+    gate.classList.add("gone");
+    setTimeout(function(){ gate.hidden = true; gate.classList.remove("gone"); }, 420);
+  }
+  $("#qback").hidden = true;
+  S.gateOut = false;
+}
+
 function poll(){
-  api("/api/job").then(function(j){
-    if (!j || j.state === "idle") { return; }
+  api("/api/job?ticket=" + encodeURIComponent(S.ticket)).then(function(j){
+    /* Unknown covers a ticket from before a restart and one that has aged
+       out. Either way the page belongs back in a state you can use. */
+    if (!j || j.state === "idle" || j.state === "unknown") {
+      unwatch(); hideGate(); dropTicket(); return;
+    }
+    if (j.state === "queued") { paintGate(j); return; }
+
+    hideGate();
+    $("#prog").hidden = false;
+    $("#go").disabled = true;
+    if (j.state === "running") { $("#stop").hidden = false; $("#stop").disabled = false; }
     $("#pphase").textContent = PHASES[j.phase] || j.phase || "Working";
     var fill = $("#pfill");
     if (j.total > 0) {
@@ -2252,14 +2921,16 @@ function poll(){
     log.scrollTop = log.scrollHeight;
     if (j.stopping) { $("#pphase").textContent = "Stopping"; }
     if (j.state !== "running") {
-      clearInterval(S.poll); S.poll = null;
-      $("#go").disabled = false;
-      $("#stop").hidden = true;
+      unwatch();
+      dropTicket();
       fill.classList.remove("indet");
       fill.style.width = j.state === "cancelled" ? fill.style.width : "100%";
       $("#pphase").textContent = j.state === "error" ? "Failed"
                               : j.state === "cancelled" ? "Stopped" : "Done";
       if (j.error && j.state === "error") { fail(j.error); }
+      /* Remember whose results these are, so this browser comes back to
+         its own account rather than to whoever the server belongs to. */
+      if (j.key) { try { localStorage.setItem("vg:key", j.key); } catch(e){} }
       loadClips(j.key || S.key).catch(function(e){ fail(String(e.message || e)); });
     }
   }).catch(function(){});
@@ -2278,18 +2949,55 @@ $("#scanform").addEventListener("submit", function(ev){
        this is close to free. */
     body: JSON.stringify({riot_id: riot, days: S.days, watch: true,
                           fetch: Math.min(100, Math.max(40, S.days * 8))})
-  }).then(function(){ $("#log").textContent = ""; watch(); })
-    .catch(function(e){ fail(String(e.message || e)); });
+  }).then(function(j){
+    $("#log").textContent = "";
+    S.gateOut = false;
+    try { localStorage.setItem("vg:riot", riot); } catch(e){}
+    nameplate(riot);
+    saveTicket(j.id || "");
+    if (j.state === "queued") { paintGate(j); }
+    watch();
+  }).catch(function(e){ $("#go").disabled = false; fail(String(e.message || e)); });
 });
 
-$("#stop").addEventListener("click", function(){
-  var btn = this;
-  btn.disabled = true;
-  $("#pphase").textContent = "Stopping";
-  api("/api/cancel", {method: "POST"}).catch(function(e){
-    btn.disabled = false;
+function abandon(btn){
+  if (btn) { btn.disabled = true; }
+  return api("/api/cancel", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ticket: S.ticket})
+  }).catch(function(e){
+    if (btn) { btn.disabled = false; }
     fail(String(e.message || e));
   });
+}
+
+$("#stop").addEventListener("click", function(){
+  $("#pphase").textContent = "Stopping";
+  abandon(this);
+});
+
+$("#gateleave").addEventListener("click", function(){
+  var btn = this;
+  abandon(btn).then(function(){
+    unwatch(); hideGate(); dropTicket();
+    btn.disabled = false;
+  });
+});
+
+/* Stepping out of the waiting screen, not out of the queue: the ticket
+   keeps its place and the pill at the bottom says where it is. */
+$("#gatebrowse").addEventListener("click", function(){
+  S.gateOut = true;
+  var gate = $("#gate");
+  gate.classList.add("gone");
+  setTimeout(function(){ gate.hidden = true; gate.classList.remove("gone"); }, 420);
+  $("#qback").hidden = false;
+});
+$("#qbackopen").addEventListener("click", function(){
+  S.gateOut = false;
+  $("#qback").hidden = true;
+  $("#gate").hidden = false;
+  $("#gate").classList.remove("gone");
 });
 
 $("#logbtn").addEventListener("click", function(){

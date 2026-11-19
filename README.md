@@ -1,5 +1,14 @@
 # clipsvalorant
 
+**Live at [clipsvalorant.fly.dev](https://clipsvalorant.fly.dev)** — type a Riot ID and
+scan. One shared HenrikDev key runs it, so scans take turns in a queue rather than all
+at once; the page tells you where you are in the line.
+
+> **The page is called val:grind** — *your play, their POV*. The brand lives in the web
+> UI: the mark, the wordmark, the splash and the queue screen. The package, the CLI and
+> this repository keep the name `clipsvalorant`, because renaming an import path buys
+> nothing a logo does not already do.
+
 Find your own Valorant plays in other people's Twitch VODs — when someone in your match
 was streaming, jump straight to the moment you killed them, from their point of view.
 
@@ -30,6 +39,7 @@ Then edit `.env`:
 | `RIOT_NAME` / `RIOT_TAG` | Your Riot ID, split. `PlayerOne#NA1` → `PlayerOne` and `NA1` |
 | `RIOT_REGION` | `eu`, `na`, `ap`, `kr`, `latam` or `br` |
 | `DB_PATH` | Defaults to `data/clipsvalorant.db` |
+| `CLIPS_PASSWORD` | Optional, and empty is right for local use. One shared password for the web UI, needed only if you bind it past localhost — see [Deploying it](#deploying-it) |
 
 ### Getting a HenrikDev API key
 
@@ -158,6 +168,116 @@ python -m clipsvalorant ingest-file tests/fixtures/match_v4_sample.json
 
 Loads a saved match JSON from disk. Useful for working on the pipeline offline, and it is
 how the test suite runs.
+
+---
+
+## Deploying it
+
+`serve` is a standard-library HTTP server, which rules out the serverless hosts: there is
+no WSGI app to hand them, and a scan is a background thread that outlives the request
+that started it by several minutes. What it needs is an ordinary process with a disk.
+`Dockerfile` and `fly.toml` are that, on [Fly.io](https://fly.io) — one machine, one
+volume, scaled to zero when nobody is looking.
+
+The deployed page is better off than the local one in one respect: Twitch's embedded
+player wants a real hostname in its `parent` parameter, and `clipsvalorant.fly.dev` is
+one.
+
+### The queue
+
+Several people, one HenrikDev key. Running every search as it arrives does not get them
+done sooner — they share the same requests per minute and all crawl — and refusing the
+second one, which is what this did when it only ever had one user, tells somebody to come
+back with no idea when. So scans take turns, one at a time, and the page says where you
+are in the line.
+
+What that means in the code:
+
+- `Queue` owns a FIFO of jobs and a single worker thread. `WORKERS = 1` is not a
+  placeholder; it is the API key's rate limit expressed as a number.
+- Submitting returns a **ticket** — an unguessable id the browser keeps in
+  `localStorage`. It is how `/api/job` tells your scan from someone else's, how a reload
+  finds your place again, and how `/api/cancel` refuses to drop a scan you do not own.
+- One scan in flight per person, by address. It is a courtesy, not a boundary: the
+  address comes from `Fly-Client-IP`, which a determined client can set. It stops an
+  impatient refresh from filling a queue everyone shares, which is the thing that
+  actually happens.
+- `/api/queue` needs no ticket at all. It is what the header chip and the waiting screen
+  read to show that the line is moving.
+- The queue is in memory on purpose. One that survived a restart would hand people back
+  a position in a line whose running scan died with the process.
+
+### The password
+
+`CLIPS_PASSWORD` gates every route but `/healthz` behind one shared password — any
+username, since there are no accounts to tell apart. Unset, as it is on the deployed
+copy, the page is open to anyone with the link.
+
+Leaving it off is a real trade and worth naming: the HenrikDev key is yours, the quota
+spent is yours, and HenrikDev's terms bar "big analytic projects" and ask for user
+consent. A password is what keeps a hosted copy recognisably a personal tool. Turn it
+back on with one command and no redeploy:
+
+```bash
+fly secrets set CLIPS_PASSWORD=something -a clipsvalorant
+```
+
+### First deploy
+
+```bash
+pwsh -Command "iwr https://fly.io/install.ps1 -useb | iex"
+```
+Installs `flyctl`. Then `fly auth signup` (or `fly auth login`) — Fly wants a card on
+file even for small machines.
+
+```bash
+fly apps create clipsvalorant
+```
+App names are global, so if that one is taken, pick another and change `app` in
+`fly.toml` to match.
+
+```bash
+fly volumes create clipsvalorant_data -r iad -s 3 -y
+```
+Three gigabytes for the databases, the artwork cache and the VOD frames. `-y`
+acknowledges that a single volume lives on a single host: lose it and you lose a cache,
+which is all of it that cannot be rebuilt by running the scan again. Change `-r` if `iad`
+is not near you, and `primary_region` in `fly.toml` with it.
+
+```bash
+fly secrets set HENRIK_API_KEY=HDEV-... TWITCH_CLIENT_ID=... TWITCH_CLIENT_SECRET=... RIOT_NAME=... RIOT_TAG=... CLIPS_PASSWORD=...
+```
+The Riot ID is in here rather than in `fly.toml` for the same reason `data/` is
+gitignored: `fly.toml` is committed, and your Riot ID is not the repository's business.
+`RIOT_REGION` is in `fly.toml`, where it is visible and harmless.
+
+```bash
+fly deploy --remote-only --ha=false
+```
+`--remote-only` builds the image on Fly's builder, so Docker is not needed locally.
+`--ha=false` keeps it at one machine: two would each hold their own copy of the SQLite
+file and their own "one search at a time" lock, so which half of your results you saw
+would depend on which machine the proxy picked.
+
+Then `fly open`, or <https://clipsvalorant.fly.dev>. After that, every change is
+`fly deploy --remote-only`.
+
+### What is different up there
+
+- **The machine stays up.** `min_machines_running = 1`, because the queue is in memory:
+  a machine that scaled to zero would take the line with it and kill the scan that was
+  running. That is a few dollars a month rather than nothing, and it is the price of a
+  URL other people can use.
+- **OCR's models load on first use**, so the first scan after a deploy has a slower
+  start than the ones after it.
+- **The line is shared, and so is the key.** Everyone's scans go through one HenrikDev
+  key at 30 requests a minute. A bigger tier makes each scan faster; it does not make
+  them parallel, because `WORKERS` is still 1. Raise it only if the key's limit really
+  has moved, and expect the machine's CPU to become the next ceiling.
+- **A shared CPU is a slow OCR.** Confirmation reads frames through ffmpeg and
+  onnxruntime, and `shared-cpu-1x` does that several times slower than your desktop.
+  `fly scale vm shared-cpu-2x` if scans drag; remove the `[[vm]]` block from `fly.toml`
+  first, or the next deploy resets the size.
 
 ---
 

@@ -12,6 +12,7 @@ The second is that a Riot ID typed into a browser becomes a filename. Nothing
 else in this project takes a path from untrusted input.
 """
 
+import base64
 import dataclasses
 import json
 import sqlite3
@@ -319,24 +320,56 @@ class _Harness:
         job.state = "done"
         job.finished = time.time()
 
-    def get(self, path):
-        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as r:
+    def get(self, path, client=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        if client:
+            req.add_header("X-Forwarded-For", client)
+        with urllib.request.urlopen(req) as r:
             return r.status, json.loads(r.read() or b"{}")
 
-    def post(self, path, payload):
+    def post(self, path, payload, client=None):
+        """A request, optionally from somebody other than this machine.
+
+        The queue tells people apart by address, so simulating a second
+        person means sending the header Fly's proxy would have set.
+        """
+        headers = {"Content-Type": "application/json"}
+        if client:
+            headers["X-Forwarded-For"] = client
         req = urllib.request.Request(
             f"http://127.0.0.1:{self.port}{path}",
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(req) as r:
             return r.status, json.loads(r.read() or b"{}")
 
+    def wait_started(self, n=1, timeout=3.0):
+        """Block until the worker has picked up n scans."""
+        end = time.time() + timeout
+        while time.time() < end:
+            if len(self.started) >= n:
+                return True
+            time.sleep(0.01)
+        return False
+
     def close(self):
         self.release.set()
+        self.state.close()
         self.server.shutdown()
         self.server.server_close()
+
+
+@pytest.fixture(autouse=True)
+def _no_password_unless_a_test_asks_for_one(monkeypatch):
+    """Whether these tests pass must not depend on the developer's own shell.
+
+    The gate reads its password from the environment at request time, so a
+    CLIPS_PASSWORD exported for a deployment would otherwise turn every
+    request in this file into a 401.
+    """
+    monkeypatch.delenv(web.PASSWORD_ENV, raising=False)
 
 
 @pytest.fixture()
@@ -391,11 +424,11 @@ def test_search_starts_a_job_and_passes_the_options_through(srv):
     status, job = srv.post("/api/search", {
         "riot_id": "Other#0002", "days": 3, "mode": "unrated", "watch": False,
     })
-    assert status == 202 and job["state"] == "running"
-    for _ in range(100):
-        if srv.started:
-            break
-        time.sleep(0.02)
+    # Queued or already picked up - which of the two depends on how fast
+    # the worker thread woke, and the page handles both.
+    assert status == 202 and job["state"] in ("queued", "running")
+    assert job["id"]
+    assert srv.wait_started(1)
     riot_id, kwargs = srv.started[0]
     assert riot_id == "Other#0002"
     assert kwargs["days"] == 3 and kwargs["mode"] == "unrated"
@@ -434,8 +467,8 @@ def test_any_mode_means_no_filter(srv):
     assert srv.started[0][1]["mode"] is None
 
 
-def test_a_second_search_is_refused_while_one_runs(srv):
-    """Serialised on purpose: two searches would race for one API quota."""
+def test_one_person_cannot_hold_two_places(srv):
+    """One scan each, which is what stops an impatient refresh filling the line."""
     srv.post("/api/search", {"riot_id": "Other#0002"})
     with pytest.raises(urllib.error.HTTPError) as exc:
         srv.post("/api/search", {"riot_id": "Third#0003"})
@@ -456,9 +489,9 @@ def test_unknown_routes_are_404(srv):
         assert exc.value.code == 404
 
 
-def test_job_endpoint_is_idle_before_anything_runs(srv):
+def test_job_endpoint_knows_nothing_without_a_ticket(srv):
     _, data = srv.get("/api/job")
-    assert data["state"] == "idle"
+    assert data["state"] == "unknown"
 
 
 # ------------------------------------------------------------ job plumbing
@@ -823,3 +856,278 @@ def test_the_ceiling_warning_does_fire_when_the_window_was_truncated(cfg, monkey
     job = web.Job(id="j", riot_id="Busier#NA1", key="")
     web.run_search(cfg, job, days=14, fetch=40, watch=False)
     assert any("ceiling" in note for note in job.notes), job.notes
+
+
+# ------------------------------------------------------------ the queue
+
+# What the queue is for: one HenrikDev key, several people. Running every
+# search on arrival does not make them finish sooner - they share the same
+# requests per minute and all crawl - and refusing the second one, which is
+# what this did when it only ever had one user, tells somebody to come back
+# with no idea when. The tests below are mostly about the thing the old
+# behaviour could not express: a place in line, and who it belongs to.
+
+
+def _until(predicate, timeout=3.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_a_second_person_is_queued_rather_than_refused(srv):
+    srv.post("/api/search", {"riot_id": "First#0001"}, client="10.0.0.1")
+    assert srv.wait_started(1)
+    status, second = srv.post("/api/search", {"riot_id": "Second#0002"}, client="10.0.0.2")
+    assert status == 202
+    assert second["state"] == "queued"
+    assert second["position"] == 1 and second["ahead"] == 0
+
+
+def test_the_line_is_first_come_first_served(srv):
+    srv.post("/api/search", {"riot_id": "First#0001"}, client="10.0.0.1")
+    assert srv.wait_started(1)
+    _, b = srv.post("/api/search", {"riot_id": "Bee#0002"}, client="10.0.0.2")
+    _, c = srv.post("/api/search", {"riot_id": "Cee#0003"}, client="10.0.0.3")
+    assert (b["position"], c["position"]) == (1, 2)
+    assert c["ahead"] == 1 and c["eta"] > b["eta"]
+
+
+def test_a_waiting_scan_is_told_what_is_running_instead(srv):
+    """Otherwise a queue is indistinguishable from a page that has hung."""
+    srv.post("/api/search", {"riot_id": "Loud#0001"}, client="10.0.0.1")
+    assert srv.wait_started(1)
+    _, waiting = srv.post("/api/search", {"riot_id": "Quiet#0002"}, client="10.0.0.2")
+    assert [n["riot_id"] for n in waiting["now"]] == ["Loud#0001"]
+
+
+def test_your_ticket_is_how_you_find_your_own_scan(srv):
+    _, job = srv.post("/api/search", {"riot_id": "Mine#0001"}, client="10.0.0.1")
+    _, mine = srv.get("/api/job?ticket=" + job["id"])
+    assert mine["riot_id"] == "Mine#0001"
+
+
+def test_a_ticket_that_means_nothing_is_not_an_error(srv):
+    """A ticket from before a restart has to put the page back to usable."""
+    _, data = srv.get("/api/job?ticket=nonsense")
+    assert data["state"] == "unknown"
+
+
+def test_leaving_the_queue_gives_up_the_place(srv):
+    srv.post("/api/search", {"riot_id": "First#0001"}, client="10.0.0.1")
+    assert srv.wait_started(1)
+    _, waiting = srv.post("/api/search", {"riot_id": "Leaving#0002"}, client="10.0.0.2")
+    status, after = srv.post("/api/cancel", {"ticket": waiting["id"]}, client="10.0.0.2")
+    assert status == 202 and after["state"] == "cancelled"
+    _, stats = srv.get("/api/queue")
+    assert stats["waiting"] == 0
+
+
+def test_you_cannot_cancel_somebody_elses_scan(srv):
+    """The ticket is unguessable; checking who holds it is what makes that count."""
+    srv.post("/api/search", {"riot_id": "First#0001"}, client="10.0.0.1")
+    assert srv.wait_started(1)
+    _, theirs = srv.post("/api/search", {"riot_id": "Theirs#0002"}, client="10.0.0.2")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        srv.post("/api/cancel", {"ticket": theirs["id"]}, client="10.0.0.9")
+    assert exc.value.code == 403
+
+
+def test_cancelling_nothing_says_so(srv):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        srv.post("/api/cancel", {"ticket": "never-existed"})
+    assert exc.value.code == 404
+
+
+def test_the_queue_endpoint_needs_no_ticket(srv):
+    """The page shows the state of the line to everyone, scanning or not."""
+    srv.post("/api/search", {"riot_id": "Live#0001"}, client="10.0.0.1")
+    assert srv.wait_started(1)
+    _, stats = srv.get("/api/queue")
+    assert [r["riot_id"] for r in stats["running"]] == ["Live#0001"]
+    assert stats["waiting"] == 0 and stats["workers"] == 1
+
+
+def test_the_line_has_an_end(srv, monkeypatch):
+    monkeypatch.setattr(web, "MAX_WAITING", 2)
+    srv.post("/api/search", {"riot_id": "Run#0001"}, client="10.0.0.1")
+    assert srv.wait_started(1)
+    srv.post("/api/search", {"riot_id": "Aay#0002"}, client="10.0.0.2")
+    srv.post("/api/search", {"riot_id": "Bee#0003"}, client="10.0.0.3")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        srv.post("/api/search", {"riot_id": "Cee#0004"}, client="10.0.0.4")
+    assert exc.value.code == 409
+
+
+def test_the_next_scan_starts_when_the_one_ahead_finishes(cfg):
+    """The whole point of a queue, and the one part a handler cannot show."""
+    ran = []
+    hold = threading.Event()
+
+    def runner(_cfg, job, **kwargs):
+        ran.append(job.riot_id)
+        if len(ran) == 1:
+            hold.wait(timeout=3)
+        job.state = "done"
+        job.finished = time.time()
+
+    queue = web.Queue(cfg, runner)
+    try:
+        queue.submit("First#0001", client="a")
+        second = queue.submit("Second#0002", client="b")
+        assert _until(lambda: ran == ["First#0001"])
+        assert queue.snapshot(second.id)["state"] == "queued"
+        hold.set()
+        assert _until(lambda: ran == ["First#0001", "Second#0002"])
+        assert _until(lambda: queue.snapshot(second.id)["state"] == "done")
+        assert queue.stats()["waiting"] == 0
+    finally:
+        hold.set()
+        queue.close()
+
+
+def test_a_scan_cancelled_while_it_waited_never_runs(cfg):
+    ran = []
+    hold = threading.Event()
+
+    def runner(_cfg, job, **kwargs):
+        ran.append(job.riot_id)
+        if len(ran) == 1:
+            hold.wait(timeout=3)
+        job.state = "done"
+        job.finished = time.time()
+
+    queue = web.Queue(cfg, runner)
+    try:
+        queue.submit("First#0001", client="a")
+        skipped = queue.submit("Skipped#0002", client="b")
+        assert _until(lambda: ran == ["First#0001"])
+        queue.cancel(skipped.id, client="b")
+        hold.set()
+        assert _until(lambda: queue.stats()["waiting"] == 0)
+        assert "Skipped#0002" not in ran
+    finally:
+        hold.set()
+        queue.close()
+
+
+def test_a_worker_that_blows_up_still_frees_the_line(cfg):
+    """A dead worker would leave everyone behind it waiting forever."""
+    def runner(_cfg, job, **kwargs):
+        if job.riot_id.startswith("Doomed"):
+            raise RuntimeError("the runner fell over")
+        job.state = "done"
+        job.finished = time.time()
+
+    queue = web.Queue(cfg, runner)
+    try:
+        job = queue.submit("Doomed#0001", client="a")
+        assert _until(lambda: queue.snapshot(job.id)["state"] == "error")
+        assert "the runner fell over" in queue.snapshot(job.id)["error"]
+        later = queue.submit("After#0002", client="b")
+        assert _until(lambda: queue.snapshot(later.id)["state"] == "done")
+    finally:
+        queue.close()
+
+
+# ------------------------------------------------------------ the password
+
+# What the gate is for: bound to localhost the page needs no authentication,
+# because nothing else is on the interface. Deployed, the same page hands
+# anyone who finds the URL a HenrikDev key to spend and the one search slot
+# the whole server has. So the test that matters most here is that POST
+# /api/search - the only route that costs anything - is shut.
+
+
+def _raw_get(port, path, auth=None):
+    """Status, body and headers for one request, 401s included.
+
+    urllib raises on a 4xx, which is the case under test rather than a
+    failure, so both paths come back the same shape.
+    """
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}")
+    if auth is not None:
+        req.add_header("Authorization", auth)
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, r.read(), dict(r.headers)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), dict(exc.headers)
+
+
+def _basic(password, user="anyone"):
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+
+def test_no_password_configured_leaves_the_page_open(srv):
+    """The localhost default stays as it was: nobody types a password to run this."""
+    status, body, _ = _raw_get(srv.port, "/")
+    assert status == 200 and body.startswith(b"<!doctype html>")
+
+
+@pytest.mark.parametrize("path", ["/", "/api/state", "/api/clips", "/api/job"])
+def test_a_password_gates_every_route(srv, monkeypatch, path):
+    monkeypatch.setenv(web.PASSWORD_ENV, "hunter2")
+    status, _, headers = _raw_get(srv.port, path)
+    assert status == 401
+    # Without the challenge the browser never offers to collect one.
+    assert "Basic" in headers.get("WWW-Authenticate", "")
+
+
+def test_the_password_opens_it(srv, monkeypatch):
+    monkeypatch.setenv(web.PASSWORD_ENV, "hunter2")
+    status, body, _ = _raw_get(srv.port, "/", _basic("hunter2"))
+    assert status == 200 and body.startswith(b"<!doctype html>")
+
+
+def test_any_username_works(srv, monkeypatch):
+    """One field is less to mistype on a phone, and there are no accounts to tell apart."""
+    monkeypatch.setenv(web.PASSWORD_ENV, "hunter2")
+    for user in ("", "omer", "root"):
+        status, _, _ = _raw_get(srv.port, "/api/state", _basic("hunter2", user))
+        assert status == 200, user
+
+
+def test_the_wrong_password_is_refused(srv, monkeypatch):
+    monkeypatch.setenv(web.PASSWORD_ENV, "hunter2")
+    status, _, _ = _raw_get(srv.port, "/", _basic("hunter3"))
+    assert status == 401
+
+
+@pytest.mark.parametrize("header", [
+    "",
+    "Bearer hunter2",
+    "Basic",
+    "Basic !!!not-base64!!!",
+    "Basic " + base64.b64encode(b"no-colon-in-here").decode(),
+    "Basic " + base64.b64encode(b"\xff\xfe").decode(),
+])
+def test_a_header_that_is_not_a_password_is_refused(srv, monkeypatch, header):
+    """Every way of being malformed has to end in a 401, not a traceback."""
+    monkeypatch.setenv(web.PASSWORD_ENV, "hunter2")
+    status, _, _ = _raw_get(srv.port, "/", header)
+    assert status == 401
+
+
+def test_searching_is_gated_too(srv, monkeypatch):
+    """The expensive route. An open POST is an open API key."""
+    monkeypatch.setenv(web.PASSWORD_ENV, "hunter2")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{srv.port}/api/search",
+        data=json.dumps({"riot_id": "Other#0002"}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(req)
+    assert caught.value.code == 401
+    assert srv.started == []
+
+
+def test_the_health_check_answers_without_the_password(srv, monkeypatch):
+    """A 401 here reads as a dead machine, and gets it restarted under a running scan."""
+    monkeypatch.setenv(web.PASSWORD_ENV, "hunter2")
+    status, body, _ = _raw_get(srv.port, "/healthz", None)
+    assert status == 200 and body.strip() == b"ok"

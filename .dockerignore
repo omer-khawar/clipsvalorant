@@ -1,0 +1,28 @@
+# The build only needs pyproject.toml and the package. Everything else is
+# either local state or a secret, and the two that matter are .env and data/:
+# the first is credentials, the second holds other players' Riot IDs and
+# PUUIDs from your match history. Neither belongs in an image.
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-journal
+
+.git/
+.gitignore
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+clipsvalorant.egg-info/
+graphify-out/
+
+tests/
+tools/
+PLAN.md
+README.md
+LICENSE
+Dockerfile
+.dockerignore
+fly.toml
