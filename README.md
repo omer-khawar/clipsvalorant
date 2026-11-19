@@ -74,8 +74,9 @@ behind it is one click away under *log*.
 of what Twitch still holds: 7 days of past broadcasts for most channels, 14 for
 Affiliates, Partners and Turbo subscribers. A shorter default would quietly skip
 matches that are still findable; a longer one would spend API calls on broadcasts that
-have already been deleted. A match outside the window is never resolved, and the page
-says why rather than showing an empty result, because *nothing found* and *nothing left
+have already been deleted. A match outside the window is never fetched at all — the
+listing already carries its date, and the detail call is the expensive half — and the
+page says why rather than showing an empty result, because *nothing found* and *nothing left
 to find* look identical and mean very different things.
 
 **Highlights are a suggestion, not the only way in.** The featured list is the few plays
@@ -267,6 +268,44 @@ resolves do it automatically; this is for links found before the module existed.
 Where it cannot be measured — no OCR installed, or a stream that joined too late to
 show a countdown — the 109s median stands in, and the UI says so on the card rather
 than presenting a guess as a measurement.
+
+### Where a scan spends its time
+
+Measured before anything was changed, because every guess about this was wrong.
+
+A frame of a broadcast costs about 2.1s to fetch and another 0.7-5s to read, the
+spread depending entirely on how much text is on screen: a quiet frame returns five
+text boxes, a cluttered one with a chat overlay returns a hundred, and OCR charges per
+box. The comment in `watch.py` claimed roughly three seconds per frame all in. It was
+nearer eleven, and four fifths of that was OCR, not the network.
+
+But frames were never the bulk of it. A lobby needs one Twitch name search per player
+and one broadcast listing per candidate — eighteen round trips for a single match —
+and every one of them was issued on its own while the process sat idle.
+
+| | before | after |
+|---|---|---|
+| A nine-player lobby's lookups, at a 250ms round trip | 4.52s | 1.01s |
+| One pass of eight frames over a broadcast | 35.6s | 25.7s |
+| Match details fetched to resolve a 14-day window | all 40 listed | only those inside it |
+
+The last row was a regression of my own: raising the fetch to cover a fortnight meant
+paying for the detail of every match listed, including the ones the window would throw
+away. HenrikDev charges a point per call plus one per Riot request it triggers behind
+the scenes, and sleeps out the window when it runs dry, so those were not merely wasted
+calls but wasted minutes.
+
+Two things that sound like savings and are not. OCR does not thread — onnxruntime
+already uses every core, so running frames in parallel made a pass *slower* (8.9s to
+12.9s on six frames). And calibrating from frames the confirmation pass already read
+rarely fires, because a streamer confirmed from the screen is usually confirmed on the
+first frame, leaving nothing to reuse. It is kept because it costs nothing when it
+misses, but it is not where the time went.
+
+What is left is the shape of the problem rather than an inefficiency: klips.live is
+fast partly because its alias database is shared across everybody who uses it, so most
+lobbies are a lookup rather than a search. This one starts empty and per-account, and
+only `alias` rows accumulated from previous runs close that gap.
 
 ### How a streamer is confirmed, and the two ways to get it wrong
 
