@@ -66,11 +66,32 @@ page — no copying timestamps into the address bar.
 
 Opening the page costs nothing. The clip list is read straight out of SQLite, so
 everything found on earlier runs is there instantly; only pressing **Search** goes out
-to Riot and Twitch. The log underneath the search box is the live progress of that run,
-match by match, because reading a broadcast takes long enough that a silent minute
-looks like a hang.
+to Riot and Twitch. A progress bar fills match by match while that runs — reading a
+broadcast takes long enough that a silent minute looks like a hang — and the narration
+behind it is one click away under *log*.
 
-Three things on the page are worth knowing about:
+**A search looks back 14 days by default.** That is not a round number, it is the whole
+of what Twitch still holds: 7 days of past broadcasts for most channels, 14 for
+Affiliates, Partners and Turbo subscribers. A shorter default would quietly skip
+matches that are still findable; a longer one would spend API calls on broadcasts that
+have already been deleted. A match outside the window is never resolved, and the page
+says why rather than showing an empty result, because *nothing found* and *nothing left
+to find* look identical and mean very different things.
+
+**Highlights are a suggestion, not the only way in.** The featured list is the few plays
+worth opening with — aces, clutches, multi-kills, best first — but underneath it the
+whole match is reachable: every round under *Rounds*, every one of your kills under
+*Kills*, and a scrubber across the top that you can click anywhere on. Rounds are dated
+the same way calibration dates them, from the two clocks Riot puts on every kill, so
+they are measured rather than guessed. A round in which nobody died at all has no kill
+to carry those clocks and so is absent, rather than interpolated from its neighbours —
+guessing a timestamp is precisely what put every link a round and a half early the
+first time.
+
+The page follows the system light or dark setting and the toggle in the corner
+overrides it, remembered per browser.
+
+Three more things are worth knowing about:
 
 - **Each account gets its own database.** `is_me` is a column, not a query — kills,
   highlights and the whole notion of *your* plays are derived from it when a match is
@@ -89,6 +110,11 @@ Three things on the page are worth knowing about:
   Both say so on the button instead of linking somewhere wrong — Twitch answers an
   over-long offset with the last frame and no error, which looks exactly like a bad
   detection.
+
+A marker sits on the moment itself; playback starts eight seconds earlier. A kill is
+the end of a play rather than the start of one, so landing exactly on the timestamp
+means arriving after the interesting part — but drawing the marker eight seconds early
+would misplace it on the scrubber. The two numbers are kept apart for that reason.
 
 The server binds to localhost only. The page has no authentication, and anything that
 reached it could spend this machine's API quota.

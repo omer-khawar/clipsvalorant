@@ -12,6 +12,7 @@ The second is that a Riot ID typed into a browser becomes a filename. Nothing
 else in this project takes a path from untrusted input.
 """
 
+import dataclasses
 import json
 import sqlite3
 import threading
@@ -26,6 +27,12 @@ from clipsvalorant import calibrate, db, web
 
 MATCH_START = 1_700_000_000
 VOD_START = MATCH_START - 600  # the stream began ten minutes before the match
+
+# For anything that exercises the day window. MATCH_START is a fixed point in
+# the past, which is what makes the clip-building tests reproducible, but it
+# is years outside any retention window - so a search test needs a match that
+# is actually recent.
+RECENT = int(time.time()) - 3600
 
 
 @pytest.fixture()
@@ -382,7 +389,7 @@ def test_clips_for_an_unknown_account_explains_itself(srv):
 
 def test_search_starts_a_job_and_passes_the_options_through(srv):
     status, job = srv.post("/api/search", {
-        "riot_id": "Other#0002", "limit": 3, "mode": "unrated", "watch": False,
+        "riot_id": "Other#0002", "days": 3, "mode": "unrated", "watch": False,
     })
     assert status == 202 and job["state"] == "running"
     for _ in range(100):
@@ -391,17 +398,31 @@ def test_search_starts_a_job_and_passes_the_options_through(srv):
         time.sleep(0.02)
     riot_id, kwargs = srv.started[0]
     assert riot_id == "Other#0002"
-    assert kwargs["limit"] == 3 and kwargs["mode"] == "unrated"
+    assert kwargs["days"] == 3 and kwargs["mode"] == "unrated"
     assert kwargs["watch"] is False
 
 
-def test_search_clamps_an_absurd_limit(srv):
-    srv.post("/api/search", {"riot_id": "Other#0002", "limit": 10_000})
+def test_a_search_looks_back_a_fortnight_by_default(srv):
+    """Fourteen days is the whole of what Twitch still holds.
+
+    A shorter default would quietly skip matches that are still findable; a
+    longer one would spend API calls on broadcasts that have been deleted.
+    """
+    srv.post("/api/search", {"riot_id": "Other#0002"})
     for _ in range(100):
         if srv.started:
             break
         time.sleep(0.02)
-    assert srv.started[0][1]["limit"] == web.MAX_SEARCH_LIMIT
+    assert srv.started[0][1]["days"] == web.DEFAULT_DAYS == 14
+
+
+def test_search_clamps_an_absurd_window(srv):
+    srv.post("/api/search", {"riot_id": "Other#0002", "days": 10_000})
+    for _ in range(100):
+        if srv.started:
+            break
+        time.sleep(0.02)
+    assert srv.started[0][1]["days"] == web.MAX_DAYS
 
 
 def test_any_mode_means_no_filter(srv):
@@ -462,7 +483,7 @@ def test_a_failed_search_leaves_the_job_in_error(cfg, monkeypatch):
 
     monkeypatch.setattr("clipsvalorant.ingest.ingest", boom)
     job = web.Job(id="j", riot_id="Someone#ELSE", key="")
-    web.run_search(cfg, job, limit=1, watch=False)
+    web.run_search(cfg, job, days=1, watch=False)
     assert job.state == "error"
     assert "henrik is down" in job.error
     assert job.finished > 0
@@ -477,11 +498,84 @@ def test_search_stops_politely_without_twitch_credentials(cfg, monkeypatch):
     with db.session(other.db_path) as conn:
         conn.execute(
             "INSERT INTO match (id, started_at, started_at_epoch, ingested_at, "
-            "raw_json) VALUES (?,?,?,?,?)", ("m1", "", MATCH_START, "", "{}"))
+            "raw_json) VALUES (?,?,?,?,?)", ("m1", "", RECENT, "", "{}"))
     job = web.Job(id="j", riot_id="Someone#ELSE", key="")
-    web.run_search(cfg, job, limit=1, watch=False)
+    web.run_search(cfg, job, days=14, watch=False)
     assert job.state == "done"
     assert any("Twitch credentials" in line for line in job.snapshot()["lines"])
+
+
+def test_a_match_older_than_the_window_is_never_resolved(cfg, monkeypatch):
+    """Resolving it would spend API calls on a broadcast Twitch has deleted.
+
+    The user is told why rather than shown an empty result, because "nothing
+    found" and "nothing left to find" look identical and mean very different
+    things.
+    """
+    from clipsvalorant.ingest import IngestReport
+
+    monkeypatch.setattr("clipsvalorant.ingest.ingest",
+                        lambda c, **k: IngestReport(seen=1, stored=1))
+    called = []
+    monkeypatch.setattr("clipsvalorant.resolve.resolve_recent",
+                        lambda *a, **k: called.append(k) or _NoReport())
+    other = web.config_for(cfg, "Someone#ELSE")
+    with db.session(other.db_path) as conn:
+        conn.execute(
+            "INSERT INTO match (id, started_at, started_at_epoch, ingested_at, "
+            "raw_json) VALUES (?,?,?,?,?)",
+            ("old", "", RECENT - 40 * 86400, "", "{}"))
+    job = web.Job(id="j", riot_id="Someone#ELSE", key="")
+    web.run_search(cfg, job, days=14, watch=False)
+    assert job.state == "done"
+    assert called == []  # never asked Twitch about a dead broadcast
+    lines = " ".join(job.snapshot()["lines"])
+    assert "Nothing inside the last 14 days" in lines
+    assert "40 days old" in lines
+
+
+class _NoReport:
+    confirmed: tuple = ()
+    candidates: tuple = ()
+    errors: tuple = ()
+
+    def summary(self) -> str:
+        return "nothing"
+
+
+def test_progress_counts_matches_as_they_are_checked(cfg, monkeypatch):
+    """The bar is driven by a count, not by the log.
+
+    A narration line and a position are different things, and parsing the
+    former to produce the latter is how a progress bar comes to disagree with
+    the work it is reporting.
+    """
+    from clipsvalorant.ingest import IngestReport
+
+    monkeypatch.setattr("clipsvalorant.ingest.ingest",
+                        lambda c, **k: IngestReport(seen=2, stored=2))
+
+    def fake_resolve(acct, *, match_ids, watch_vods, on_match):
+        for mid in match_ids:
+            on_match(mid, _NoReport())
+        return _NoReport()
+
+    monkeypatch.setattr("clipsvalorant.resolve.resolve_recent", fake_resolve)
+    other = web.config_for(cfg, "Someone#ELSE")
+    with db.session(other.db_path) as conn:
+        for n in range(3):
+            conn.execute(
+                "INSERT INTO match (id, started_at, started_at_epoch, "
+                "ingested_at, raw_json) VALUES (?,?,?,?,?)",
+                (f"m{n}", "", RECENT - n * 3600, "", "{}"))
+    cfg = dataclasses.replace(cfg, twitch_client_id="id", twitch_client_secret="s")
+    job = web.Job(id="j", riot_id="Someone#ELSE", key="")
+    web.run_search(cfg, job, days=14, watch=False)
+
+    snap = job.snapshot()
+    assert snap["state"] == "done"
+    assert snap["phase"] == "done"
+    assert snap["total"] == 3 and snap["done"] == 3
 
 
 def test_free_port_falls_back_when_one_is_taken():
@@ -509,3 +603,160 @@ def test_read_only_connection_rejects_writes(tmp_path):
     conn = web._read_only(path)
     with pytest.raises(sqlite3.OperationalError):
         conn.execute("CREATE TABLE x (y)")
+
+
+# ------------------------------------------------------- the match timeline
+
+def add_kills(conn, *, match_id="m1", rounds=(), my_puuid="me"):
+    """Kills for one match. `rounds` is (round, start_ms, [(ms, mine)], died_ms)."""
+    conn.execute(
+        "INSERT OR REPLACE INTO match_player (match_id, puuid, name, tag, is_me) "
+        "VALUES (?,?,?,?,1)", (match_id, my_puuid, "Me", "0001"),
+    )
+    for rnd, start_ms, kills, died_ms in rounds:
+        for ms, mine in kills:
+            # A kill that is not yours is somebody else's, not your death.
+            # Your death is `died_ms`, and conflating the two here hid a real
+            # question: which death counts when there are several.
+            conn.execute(
+                "INSERT INTO kill (match_id, round, time_in_match_ms, "
+                "time_in_round_ms, killer_name, victim_name, victim_puuid, "
+                "weapon, is_mine) VALUES (?,?,?,?,?,?,?,?,?)",
+                (match_id, rnd, ms, ms - start_ms, "Me" if mine else "Them",
+                 "Victim" if mine else "Bystander",
+                 "" if mine else "someone-else", "Vandal", 1 if mine else 0),
+            )
+        if died_ms is not None:
+            conn.execute(
+                "INSERT INTO kill (match_id, round, time_in_match_ms, "
+                "time_in_round_ms, killer_name, victim_name, victim_puuid, "
+                "weapon, is_mine) VALUES (?,?,?,?,?,?,?,?,?)",
+                (match_id, rnd, died_ms, died_ms - start_ms, "Them", "Me",
+                 my_puuid, "Phantom", 0),
+            )
+    conn.commit()
+
+
+def test_timeline_dates_each_round_from_the_two_clocks(conn):
+    """Riot puts both clocks on every kill, so their difference is the round."""
+    add_everything(conn)
+    add_kills(conn, rounds=[
+        (0, 55_000, [(70_000, True)], None),
+        (1, 150_000, [(165_000, True)], 180_000),
+    ])
+    timeline = web.match_timeline(conn, "m1")
+    starts = [r["start_ms"] for r in timeline["rounds"]]
+    assert starts == [55_000, 150_000]
+    assert timeline["last_ms"] == 180_000
+
+
+def test_timeline_separates_your_kills_from_your_death(conn):
+    add_everything(conn)
+    add_kills(conn, rounds=[
+        (0, 55_000, [(70_000, True), (75_000, False), (80_000, True)], 90_000),
+    ])
+    rnd = web.match_timeline(conn, "m1")["rounds"][0]
+    assert [k["ms"] for k in rnd["kills"]] == [70_000, 80_000]
+    assert rnd["died_ms"] == 90_000
+
+
+def test_a_round_nobody_died_in_is_absent_rather_than_guessed(conn):
+    """It has no kill to carry the clocks, and an interpolated timestamp is
+    exactly the thing that made every link wrong the first time."""
+    add_everything(conn)
+    add_kills(conn, rounds=[
+        (0, 55_000, [(70_000, True)], None),
+        (5, 400_000, [(420_000, True)], None),
+    ])
+    assert [r["round"] for r in web.match_timeline(conn, "m1")["rounds"]] == [0, 5]
+
+
+# ------------------------------------------------- every moment is reachable
+
+def test_every_round_reaches_the_page_not_just_the_highlights(conn):
+    """The complaint that started this: a long match showed four things."""
+    add_everything(conn, at_ms=(120_000,), shift_s=100)
+    add_kills(conn, rounds=[
+        (r, 55_000 + r * 90_000, [(60_000 + r * 90_000, True)], None)
+        for r in range(12)
+    ])
+    group = web.clip_groups(conn)[0]
+    assert len(group["clips"]) == 1        # one highlight, as before
+    assert len(group["rounds"]) == 12      # and now the whole match
+    assert group["kill_count"] == 12
+
+
+def test_a_moment_is_drawn_where_it_happens_and_played_before_it(conn):
+    """`at` positions the marker, `offset` starts the video. Collapsing the
+    two would mean every marker sat eight seconds early on the scrubber."""
+    add_everything(conn, at_ms=(120_000,), shift_s=100)
+    add_kills(conn, rounds=[(0, 55_000, [(120_000, True)], None)])
+    clip = web.clip_groups(conn)[0]["clips"][0]
+    assert clip["at"] - clip["offset"] == web.LEAD_S
+    assert clip["stamp"] == calibrate.stamp(clip["offset"])
+
+
+def test_a_round_starts_where_it_starts(conn):
+    """No lead-in on a round, or every one would open in the previous one's
+    aftermath rather than on the barriers dropping."""
+    add_everything(conn, shift_s=100)
+    add_kills(conn, rounds=[(3, 300_000, [(315_000, True)], None)])
+    rnd = next(r for r in web.clip_groups(conn)[0]["rounds"] if r["round"] == 3)
+    assert rnd["at"] == rnd["offset"]
+    assert rnd["at"] == calibrate.moment_offset(
+        match_start_epoch=MATCH_START, vod_created_epoch=VOD_START,
+        time_in_match_ms=300_000, shift_s=100,
+    )
+
+
+def test_the_span_covers_the_whole_match(conn):
+    """The scrubber is laid out from this, so a wrong span puts every marker
+    in the wrong place even when each timestamp is right."""
+    add_everything(conn, shift_s=100)
+    add_kills(conn, rounds=[
+        (0, 55_000, [(70_000, True)], None),
+        (9, 900_000, [(950_000, True)], None),
+    ])
+    span = web.clip_groups(conn)[0]["span"]
+    assert span["start"] < span["end"]
+    assert span["start"] == web.clip_groups(conn)[0]["rounds"][0]["at"]
+
+
+def test_highlights_are_ranked_best_first(conn):
+    """The featured list opens with the best play, not the earliest one."""
+    add_everything(conn, at_ms=())
+    for rnd, kind, label, kills in [
+        (1, "triple", "3K", 3), (2, "ace", "Ace", 5), (3, "clutch", "1v3", 3),
+    ]:
+        conn.execute(
+            "INSERT INTO highlight (match_id, round, kind, label, kill_count, "
+            "time_in_match_ms, end_time_in_match_ms, round_won) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            ("m1", rnd, kind, label, kills, rnd * 100_000, rnd * 100_000 + 5000, 1),
+        )
+    conn.commit()
+    assert [c["kind"] for c in web.clip_groups(conn)[0]["clips"]] == [
+        "ace", "clutch", "triple",
+    ]
+
+
+def test_a_kill_outside_the_broadcast_is_marked_not_dropped(conn):
+    """A streamer who joined late is a real find, and hiding their early
+    rounds looks identical to a detector that missed them."""
+    add_everything(conn, vod_start=MATCH_START + 400, shift_s=100)
+    add_kills(conn, rounds=[
+        (0, 55_000, [(60_000, True)], None),
+        (8, 800_000, [(820_000, True)], None),
+    ])
+    rounds = web.clip_groups(conn)[0]["rounds"]
+    assert rounds[0]["playable"] is False and rounds[0]["why_not"]
+    assert rounds[1]["playable"] is True
+
+
+def test_group_ids_are_stable_across_reloads(conn):
+    """The page keeps your selection through a refresh by matching on this."""
+    add_everything(conn, channel="one")
+    add_everything(conn, channel="two", match_id="m2")
+    ids = [g["id"] for g in web.clip_groups(conn)]
+    assert ids == [g["id"] for g in web.clip_groups(conn)]
+    assert len(set(ids)) == 2
