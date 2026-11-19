@@ -269,6 +269,40 @@ Where it cannot be measured — no OCR installed, or a stream that joined too la
 show a countdown — the 109s median stands in, and the UI says so on the card rather
 than presenting a guess as a measurement.
 
+### Stopping a scan, and the region that was never checked
+
+A scan is mostly waiting - for HenrikDev's rate-limit window, for Twitch, for
+ffmpeg, for OCR - and none of that waiting could be interrupted. Start one on the
+wrong region and the only way out was killing the server.
+
+Two things fix it. Every `time.sleep` on a waiting path became
+`threading.Event.wait(timeout)`, which is a sleep that can be woken: a two-minute
+quota pause now ends on the press rather than two minutes later. And the scan checks
+a flag between matches and between candidates, so what it stops on is a whole match,
+never a half-judged one. Everything already written stays written - a scan that
+checked thirty matches really did check them, and throwing that away would make
+stopping expensive enough that nobody would do it. Measured: a running scan stopped
+6.6s after the request, which is one in-flight match finishing.
+
+The deeper bug was why a wrong region ran at all. A Riot ID is global; matches are
+not. The stored-matches endpoint does **not** object when you ask the wrong shard
+about somebody - it answers, with their real matches. A search for a European player
+on NA ran for seven minutes and filed forty matches, fifteen of which recorded their
+cluster as *Frankfurt*, while the `region` column said `na` because we had stamped
+the requested region onto them.
+
+So a scan now asks `/valorant/v1/account/{name}/{tag}` first, which knows where an
+account actually plays, and believes that over the dropdown:
+
+```
+Looking up aliii#2008 in NA...
+aliii#2008 plays on EU, not NA - searching EU instead.
+```
+
+One call, and it saves the whole run. If the lookup fails or returns something
+unfamiliar, the requested region is kept: a scan on the region you picked is a
+normal outcome, one silently moved somewhere nobody asked for is a surprise.
+
 ### The detail we were throwing away
 
 `raw_json` is stored as the source of truth so that detection logic can change

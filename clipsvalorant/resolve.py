@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from clipsvalorant import calibrate, db
+from clipsvalorant.cancel import CancelToken, NullToken
 from clipsvalorant.config import Config
 from clipsvalorant.models import Match, Player
 from clipsvalorant.twitch import TwitchClient, Vod
@@ -790,6 +791,7 @@ def resolve_match(
     report: ResolveReport,
     game_id: str | None = None,
     watcher: "Watcher | None" = None,
+    cancel: CancelToken | None = None,
 ) -> None:
     started = match.metadata.started_at
     start = int(
@@ -894,6 +896,8 @@ def resolve_match(
 
     def settle(cand: Candidate) -> None:
         """Everything after the evidence is in: look, judge, write it down."""
+        # The costly half: one broadcast opened and read per candidate.
+        cancel.check()
         inspect(cand)
         _remember_encounter(conn, match.id, cand, cand.player.team == my_team)
         if cand.verdict == "confirmed":
@@ -917,6 +921,9 @@ def resolve_match(
         watcher.frames.prefetch_playlists(
             c.vod.id for c in cands if c.vod is not None
         )
+
+    cancel = cancel or NullToken()
+    cancel.check()
 
     others = [p for p in match.players if p.puuid != my_puuid]
 
@@ -1173,6 +1180,7 @@ def resolve_recent(
     match_ids: list[str] | None = None,
     watch_vods: bool = True,
     on_match: Callable[[str, "ResolveReport"], None] | None = None,
+    cancel: CancelToken | None = None,
 ) -> ResolveReport:
     """Resolve recent matches, optionally reporting after each one.
 
@@ -1183,6 +1191,7 @@ def resolve_recent(
     never a reason to lose a resolve that already happened.
     """
     report = ResolveReport()
+    cancel = cancel or NullToken()
     with db.session(cfg.db_path) as conn:
         if match_ids is not None:
             if not match_ids:
@@ -1213,20 +1222,29 @@ def resolve_recent(
             if watcher is None:
                 report.errors.append(f"not reading VODs: {why}")
 
-        with TwitchClient(cfg.twitch_client_id, cfg.twitch_client_secret) as client:
+        with TwitchClient(cfg.twitch_client_id, cfg.twitch_client_secret,
+                          cancel=cancel) as client:
             try:
                 game_id = client.game_id("VALORANT")
             except Exception as exc:
                 report.errors.append(f"game id lookup failed: {exc}")
                 game_id = None
             for row in rows:
+                # Checked per match rather than per candidate here, so a
+                # stopped scan leaves whole matches behind it rather than
+                # one half-judged.
+                if cancel.cancelled:
+                    report.errors.append(
+                        f"stopped after {report.matches_checked} of {len(rows)} matches"
+                    )
+                    break
                 match = Match.model_validate(json.loads(row["raw_json"]))
                 me = match.find_me(cfg.riot_name, cfg.riot_tag)
                 if me is None:
                     continue
                 report.matches_checked += 1
                 resolve_match(conn, client, match, my_puuid=me.puuid, report=report,
-                              game_id=game_id, watcher=watcher)
+                              game_id=game_id, watcher=watcher, cancel=cancel)
                 conn.execute(
                     "UPDATE match SET last_resolved_at = ?, "
                     "resolve_attempts = resolve_attempts + 1 WHERE id = ?",

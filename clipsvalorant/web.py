@@ -40,6 +40,7 @@ from urllib.parse import parse_qs, urlparse
 
 from clipsvalorant import calibrate, db
 from clipsvalorant.assets import Assets
+from clipsvalorant.cancel import Cancelled, CancelToken
 from clipsvalorant.config import Config
 
 log = logging.getLogger(__name__)
@@ -635,7 +636,7 @@ class Job:
     id: str
     riot_id: str
     key: str
-    state: str = "running"  # running | done | error
+    state: str = "running"  # running | done | error | cancelled
     phase: str = "starting"  # starting | ingest | resolve | done
     done: int = 0
     total: int = 0
@@ -643,7 +644,17 @@ class Job:
     finished: float = 0.0
     error: str = ""
     lines: list[str] = field(default_factory=list)
+    token: CancelToken = field(default_factory=CancelToken, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def stop(self) -> None:
+        """Ask this scan to stop, from whichever thread is asking.
+
+        Only sets a flag. The scan notices between matches and inside every
+        wait, and what it has already written to the database stays written.
+        """
+        self.token.cancel()
+        self.say("Stopping...")
 
     def say(self, line: str) -> None:
         with self._lock:
@@ -677,6 +688,7 @@ class Job:
             "riot_id": self.riot_id,
             "key": self.key,
             "state": self.state,
+            "stopping": self.token.cancelled and self.state == "running",
             "phase": phase,
             "done": done,
             "total": total,
@@ -706,6 +718,38 @@ class _JobLog(logging.Handler):
             pass
 
 
+def _correct_region(acct: Config, job: Job) -> Config:
+    """Ask HenrikDev which shard this Riot ID actually plays on.
+
+    Returns the config to use. On any doubt - the lookup failing, an
+    unfamiliar answer - the requested region is kept: a scan that runs on
+    the region you picked is a normal outcome, while one silently moved to
+    a region nobody asked for is a surprise.
+    """
+    from clipsvalorant.henrik import HenrikClient
+
+    if not acct.henrik_api_key:
+        return acct  # nothing to ask with; the dropdown is all we have
+
+    try:
+        with HenrikClient(acct.henrik_api_key, cancel=job.token) as client:
+            info = client.account(acct.riot_name, acct.riot_tag)
+    except Cancelled:
+        raise
+    except Exception as exc:
+        job.say(f"Could not confirm which region this account plays on ({exc}).")
+        return acct
+
+    real = str(info.get("region") or "").strip().lower()
+    if not real or real == acct.region.lower():
+        return acct
+    job.say(
+        f"{acct.riot_id} plays on {real.upper()}, not {acct.region.upper()} - "
+        f"searching {real.upper()} instead."
+    )
+    return config_for(acct, acct.riot_id, region=real)
+
+
 def run_search(
     cfg: Config,
     job: Job,
@@ -725,6 +769,7 @@ def run_search(
     """
     from clipsvalorant.ingest import ingest
     from clipsvalorant.resolve import resolve_recent
+    from clipsvalorant.henrik import HenrikClient, HenrikError
 
     days = max(1, min(MAX_DAYS, int(days)))
     fetch = max(1, min(MAX_FETCH, int(fetch)))
@@ -741,10 +786,20 @@ def run_search(
 
         job.step("ingest")
         job.say(f"Looking up {acct.riot_id} in {acct.region.upper()}...")
+
+        # One cheap call, and it is what stops a whole scan being wasted.
+        # A Riot ID is global but matches are not, and the stored-matches
+        # endpoint does not object when you ask the wrong shard about
+        # somebody - it answers, with their real matches, which is how a
+        # European player searched on NA runs for seven minutes and files
+        # forty matches played in Frankfurt. So we ask who they are first
+        # and believe that over the dropdown.
+        acct = _correct_region(acct, job)
         # The window is handed to ingest, not applied after it. A match
         # outside it is never going to be resolved, and its detail call is
         # the most expensive thing in the whole run.
-        report = ingest(acct, limit=fetch, mode=mode, since_epoch=cutoff)
+        report = ingest(acct, limit=fetch, mode=mode, since_epoch=cutoff,
+                        cancel=job.token)
         job.say(report.summary())
         for err in report.errors[:5]:
             job.say(f"! {err}")
@@ -814,13 +869,20 @@ def run_search(
             )
 
         found = resolve_recent(
-            acct, match_ids=ids, watch_vods=watch, on_match=tick
+            acct, match_ids=ids, watch_vods=watch, on_match=tick,
+            cancel=job.token,
         )
         job.say(found.summary())
         for err in found.errors[:5]:
             job.say(f"! {err}")
         job.step("done", done=len(ids), total=len(ids))
         job.state = "done"
+    except Cancelled:
+        # Not a failure. Everything already written stays written, and the
+        # page reloads what was found before the stop.
+        job.state = "cancelled"
+        job.step("done")
+        job.say("Stopped. Anything already found has been kept.")
     except Exception as exc:  # the thread is the only place this can be caught
         job.state = "error"
         job.error = f"{type(exc).__name__}: {exc}"
@@ -943,6 +1005,14 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             route = urlparse(self.path).path.rstrip("/") or "/"
+            if route == "/api/cancel":
+                job = state.job
+                if job is None or job.state != "running":
+                    self._json({"error": "nothing is running"}, 409)
+                    return
+                job.stop()
+                self._json(job.snapshot(), 202)
+                return
             if route != "/api/search":
                 self._json({"error": "no such endpoint"}, 404)
                 return
@@ -1235,6 +1305,10 @@ body{
   display:inline-flex;align-items:center;gap:8px;transition:transform .2s,filter .2s}
 .go:hover:not(:disabled){filter:brightness(1.08);transform:translateY(-1px)}
 .go:disabled{opacity:.5;cursor:default}
+.actions{display:flex;gap:8px;align-items:end}
+.go.stop{background:none;color:var(--ink);box-shadow:inset 0 0 0 1px var(--line)}
+.go.stop:hover:not(:disabled){background:var(--hair);filter:none}
+.go.stop[hidden]{display:none}
 .go svg{width:15px;height:15px}
 
 /* ---- progress: educalvolpz/animated-progress-bar ---- */
@@ -1500,10 +1574,16 @@ body{
           <button type="button" role="radio" data-days="30" aria-checked="false">30d</button>
         </div>
       </div>
-      <button class="go" id="go" type="submit">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-        Scan
-      </button>
+      <div class="actions">
+        <button class="go" id="go" type="submit">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          Scan
+        </button>
+        <button class="go stop" id="stop" type="button" hidden>
+          <svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
+          Stop
+        </button>
+      </div>
     </form>
 
     <div class="prog" id="prog" hidden>
@@ -2108,7 +2188,10 @@ function boot(){
 var PHASES = {starting:"Starting", ingest:"Reading match history",
               resolve:"Checking the lobby", done:"Done"};
 function watch(){
-  $("#prog").hidden = false; $("#go").disabled = true;
+  $("#prog").hidden = false;
+  $("#go").disabled = true;
+  $("#stop").hidden = false;
+  $("#stop").disabled = false;
   if (S.poll) { clearInterval(S.poll); }
   S.poll = setInterval(poll, 700);
   poll();
@@ -2129,12 +2212,16 @@ function poll(){
     var log = $("#log");
     log.textContent = (j.lines || []).join("\n");
     log.scrollTop = log.scrollHeight;
+    if (j.stopping) { $("#pphase").textContent = "Stopping"; }
     if (j.state !== "running") {
       clearInterval(S.poll); S.poll = null;
       $("#go").disabled = false;
-      fill.classList.remove("indet"); fill.style.width = "100%";
-      $("#pphase").textContent = j.state === "error" ? "Failed" : "Done";
-      if (j.error) { fail(j.error); }
+      $("#stop").hidden = true;
+      fill.classList.remove("indet");
+      fill.style.width = j.state === "cancelled" ? fill.style.width : "100%";
+      $("#pphase").textContent = j.state === "error" ? "Failed"
+                              : j.state === "cancelled" ? "Stopped" : "Done";
+      if (j.error && j.state === "error") { fail(j.error); }
       loadClips(j.key || S.key).catch(function(e){ fail(String(e.message || e)); });
     }
   }).catch(function(){});
@@ -2150,6 +2237,16 @@ $("#scanform").addEventListener("submit", function(ev){
     body: JSON.stringify({riot_id: riot, days: S.days, watch: true})
   }).then(function(){ $("#log").textContent = ""; watch(); })
     .catch(function(e){ fail(String(e.message || e)); });
+});
+
+$("#stop").addEventListener("click", function(){
+  var btn = this;
+  btn.disabled = true;
+  $("#pphase").textContent = "Stopping";
+  api("/api/cancel", {method: "POST"}).catch(function(e){
+    btn.disabled = false;
+    fail(String(e.message || e));
+  });
 });
 
 $("#logbtn").addEventListener("click", function(){

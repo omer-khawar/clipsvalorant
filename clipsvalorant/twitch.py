@@ -22,6 +22,8 @@ from typing import Any, Iterator
 
 import httpx
 
+from clipsvalorant.cancel import CancelToken, NullToken
+
 log = logging.getLogger(__name__)
 
 HELIX = "https://api.twitch.tv/helix"
@@ -96,7 +98,11 @@ class TwitchClient:
         *,
         timeout: float = 30.0,
         client: httpx.Client | None = None,
+        cancel: CancelToken | None = None,
     ) -> None:
+        # Twitch is politer about quota than HenrikDev, but a scan still
+        # waits on it, and a wait nobody can stop is the thing being fixed.
+        self._cancel = cancel or NullToken()
         if not client_id or not client_secret:
             raise TwitchError(
                 "Twitch credentials missing. Register an app at "
@@ -157,7 +163,7 @@ class TwitchClient:
             if self._remaining is not None and self._remaining <= 1:
                 wait = max(self._reset_at - time.time(), 1.0)
                 log.info("Twitch quota nearly spent, pausing %.0fs", wait)
-                time.sleep(min(wait, 70))
+                self._cancel.nap(min(wait, 70))
                 self._remaining = None
 
             resp = self._client.get(f"{HELIX}{path}", params=params, headers=self._headers())
@@ -181,10 +187,10 @@ class TwitchClient:
                 continue
             if resp.status_code == 429:
                 wait = max(self._reset_at - time.time(), 5.0)
-                time.sleep(min(wait, 70))
+                self._cancel.nap(min(wait, 70))
                 continue
             if resp.status_code >= 500:
-                time.sleep(2**attempt)
+                self._cancel.nap(2**attempt)
                 continue
             if resp.status_code >= 400:
                 raise TwitchError(f"{resp.status_code} on {path}: {resp.text[:300]}")

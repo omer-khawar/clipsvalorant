@@ -555,7 +555,7 @@ def test_progress_counts_matches_as_they_are_checked(cfg, monkeypatch):
     monkeypatch.setattr("clipsvalorant.ingest.ingest",
                         lambda c, **k: IngestReport(seen=2, stored=2))
 
-    def fake_resolve(acct, *, match_ids, watch_vods, on_match):
+    def fake_resolve(acct, *, match_ids, watch_vods, on_match, **_):
         for mid in match_ids:
             on_match(mid, _NoReport())
         return _NoReport()

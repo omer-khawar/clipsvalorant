@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import timezone
 
 from clipsvalorant import db
+from clipsvalorant.cancel import CancelToken, NullToken
 from clipsvalorant.config import Config
 from clipsvalorant.henrik import HenrikClient, HenrikError
 from clipsvalorant.kills import find_highlights, is_player
@@ -277,6 +278,7 @@ def ingest(
     mode: str | None = "competitive",
     refetch: bool = False,
     since_epoch: int | None = None,
+    cancel: CancelToken | None = None,
 ) -> IngestReport:
     """Fetch the most recent `limit` matches and store any we do not already have.
 
@@ -289,17 +291,21 @@ def ingest(
     wasteful, it is most of the wall clock.
     """
     report = IngestReport()
+    cancel = cancel or NullToken()
 
     with db.session(cfg.db_path) as conn:
         already = db.known_match_ids(conn)
 
-        with HenrikClient(cfg.henrik_api_key) as client:
+        with HenrikClient(cfg.henrik_api_key, cancel=cancel) as client:
             listed = client.stored_matches(
                 cfg.riot_name, cfg.riot_tag, cfg.region, mode=mode, size=limit
             )
             report.seen = len(listed)
 
             for entry in listed:
+                # Between matches, not inside one: a half-written match is
+                # worse than one more fetch.
+                cancel.check()
                 match_id = entry.meta.id
                 if match_id in already and not refetch:
                     report.skipped += 1

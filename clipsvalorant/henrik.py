@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from clipsvalorant.cancel import CancelToken, NullToken
 from clipsvalorant.models import Match, StoredMatch
 
 log = logging.getLogger(__name__)
@@ -38,7 +39,11 @@ class HenrikClient:
         timeout: float = 30.0,
         max_retries: int = 4,
         client: httpx.Client | None = None,
+        cancel: CancelToken | None = None,
     ) -> None:
+        # Every wait below goes through this, so a scan stops the moment it
+        # is asked to rather than at the end of a two-minute quota pause.
+        self._cancel = cancel or NullToken()
         self._max_retries = max_retries
         self._owns_client = client is None
         # Quota state from the last response, so we can pace instead of absorbing 429s.
@@ -66,6 +71,7 @@ class HenrikClient:
         last_error: Exception | None = None
 
         for attempt in range(self._max_retries):
+            self._cancel.check()
             self._wait_for_quota()
             try:
                 resp = self._client.get(path, params=params)
@@ -79,7 +85,7 @@ class HenrikClient:
             if resp.status_code == 429:
                 wait = self._retry_after(resp)
                 log.warning("Rate limited on %s, waiting %.1fs", path, wait)
-                time.sleep(wait)
+                self._cancel.nap(wait)
                 last_error = RateLimited(f"429 on {path}")
                 continue
 
@@ -132,7 +138,7 @@ class HenrikClient:
         if self._remaining is not None and self._remaining <= 1:
             log.info("Quota nearly spent, pausing %.0fs for the window to reset",
                      self._reset_in)
-            time.sleep(self._reset_in)
+            self._cancel.nap(self._reset_in)
             self._remaining = None  # unknown again until the next response
 
     @staticmethod
@@ -146,11 +152,23 @@ class HenrikClient:
                     pass
         return 15.0
 
-    @staticmethod
-    def _sleep_backoff(attempt: int) -> None:
-        time.sleep(min(2**attempt, 30))
+    def _sleep_backoff(self, attempt: int) -> None:
+        self._cancel.nap(min(2**attempt, 30))
 
     # ---- endpoints -----------------------------------------------------
+
+    def account(self, name: str, tag: str) -> dict[str, Any]:
+        """GET /valorant/v1/account/{name}/{tag}
+
+        Worth one call at the start of a scan. A Riot ID is global but
+        matches are not, and the stored-matches endpoint does not complain
+        when you ask the wrong shard about somebody - it answers, which is
+        how a scan for a European player on NA can run for seven minutes and
+        file forty matches that were played in Frankfurt.
+        """
+        payload = self._get(f"/valorant/v1/account/{name}/{tag}")
+        data = payload.get("data")
+        return data if isinstance(data, dict) else {}
 
     def stored_matches(
         self,
