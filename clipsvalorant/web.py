@@ -296,12 +296,18 @@ FROM encounter e
 JOIN match m      ON m.id = e.match_id
 JOIN twitch_vod v ON v.id = e.vod_id
 LEFT JOIN twitch_channel c ON c.id = e.channel_id
-JOIN highlight h  ON h.match_id = e.match_id
+LEFT JOIN highlight h  ON h.match_id = e.match_id
 LEFT JOIN match_vod_offset o
        ON o.match_id = e.match_id AND o.vod_id = e.vod_id
 WHERE e.vod_id IS NOT NULL AND e.verdict IN ('confirmed', 'likely')
 ORDER BY m.started_at_epoch DESC, h.time_in_match_ms ASC
 """
+# That join is LEFT for a reason worth keeping. As an inner join, a match
+# containing no highlight produced no rows at all, so the streamer vanished
+# from the page entirely - not "a confirmed broadcast with nothing starred
+# in it", but nothing. A 40-minute match where you took nine kills and no
+# multi-kill is an ordinary match, and the round-by-round timeline attached
+# below is exactly what you would want to watch of it.
 
 
 
@@ -513,6 +519,11 @@ def clip_groups(
                 "clips": [],
                 "rounds": [],
             }
+
+        # No highlight in this match: the group still exists, and gets its
+        # rounds and kills from the timeline attached further down.
+        if row["time_in_match_ms"] is None:
+            continue
 
         moment = _moment(
             match_start=row["started_at_epoch"], vod_created=row["created_epoch"],
@@ -916,7 +927,8 @@ def run_search(
             job.step("resolve", done=done)
             job.say(
                 f"match {done}/{len(ids)} checked - "
-                f"{len(report.confirmed)} confirmed, {len(report.candidates)} unverified"
+                f"{len(report.confirmed)} confirmed, {len(report.likely)} likely, "
+                f"{len(report.unverified)} unverified"
             )
 
         found = resolve_recent(

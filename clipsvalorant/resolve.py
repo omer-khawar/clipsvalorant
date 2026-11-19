@@ -408,14 +408,29 @@ class ResolveReport:
         {"confirmed": self.confirmed, "likely": self.candidates,
          "unconfirmed": self.candidates, "rejected": self.rejected}[cand.verdict].append(cand)
 
+    @property
+    def likely(self) -> list[Candidate]:
+        """The candidates that reach the page. `candidates` also holds the rest."""
+        return [c for c in self.candidates if c.verdict == "likely"]
+
+    @property
+    def unverified(self) -> list[Candidate]:
+        return [c for c in self.candidates if c.verdict != "likely"]
+
     def summary(self) -> str:
+        # Likely and unverified are counted apart on purpose. `candidates`
+        # holds both, but only confirmed and likely are ever shown, so one
+        # combined "unverified" number reads as a count of things to go and
+        # look at - and then most of them are nowhere on the page, which
+        # looks exactly like the page losing them.
         return (
             f"{self.matches_checked} match(es), {self.players_checked} player(s) checked, "
             f"{self.name_candidates} name candidate(s), "
             f"{self.clips_seen} clip(s) from {self.clip_channels} channel(s), "
             f"{self.bios_read} bio(s) read, "
             + (f"{self.frames_read} VOD frame(s) read, " if self.frames_read else "")
-            + f"{len(self.confirmed)} confirmed, {len(self.candidates)} unverified, "
+            + f"{len(self.confirmed)} confirmed, {len(self.likely)} likely, "
+            f"{len(self.unverified)} unverified (not shown), "
             f"{len(self.rejected)} ruled out"
         )
 

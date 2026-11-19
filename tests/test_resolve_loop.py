@@ -291,3 +291,29 @@ def test_a_lobby_with_no_broadcasts_opens_nothing(resolved):
     resolved(FakeTwitch(), watcher=watcher)
     assert all(batch == [] for batch in watcher.frames.prefetched)
     assert not any(s.startswith("look:") for s in watcher.frames.order)
+
+
+def test_the_summary_counts_likely_apart_from_unverified():
+    """`candidates` holds two different things, and only one of them is shown.
+
+    Reported from a real scan: the line said five confirmed and five
+    unverified, so ten were expected on a page that only ever shows
+    confirmed and likely. Counting them together turns "we could not judge
+    this one" into a promise of something to watch.
+    """
+    from types import SimpleNamespace
+
+    from clipsvalorant.resolve import ResolveReport
+
+    report = ResolveReport()
+    for verdict in ("confirmed", "likely", "unconfirmed", "unconfirmed", "rejected"):
+        report.file(SimpleNamespace(verdict=verdict))
+
+    assert len(report.confirmed) == 1
+    assert len(report.likely) == 1
+    assert len(report.unverified) == 2
+    assert len(report.candidates) == 3  # likely and unconfirmed, as before
+
+    line = report.summary()
+    assert "1 confirmed" in line and "1 likely" in line
+    assert "2 unverified" in line

@@ -254,6 +254,31 @@ def test_unconfirmed_never_reaches_the_page(conn):
     assert web.clip_groups(conn) == []
 
 
+def test_a_match_with_nothing_starred_in_it_is_still_a_find(conn):
+    """Found by counting: the log said five confirmed, the page showed four.
+
+    `highlight` used to be an inner join, so a match containing no ace, no
+    clutch and no multi-kill produced no rows at all and the streamer
+    vanished from the page entirely. Not "a confirmed broadcast with nothing
+    starred in it" - nothing, which looks exactly like the scan having
+    missed them. An ordinary forty-minute match where you took nine kills
+    and no multi-kill still has every round and every one of those kills to
+    watch, and that is what the timeline below the player is for.
+    """
+    add_everything(conn, at_ms=())
+    groups = web.clip_groups(conn)
+    assert len(groups) == 1
+    assert groups[0]["verdict"] == "confirmed"
+    assert groups[0]["clips"] == []  # nothing starred, and that is fine
+
+
+def test_a_starred_match_still_lists_its_moments(conn):
+    """The other half of the same join: LEFT must not cost us the moments."""
+    add_everything(conn, at_ms=(1000, 2000, 3000))
+    groups = web.clip_groups(conn)
+    assert len(groups) == 1 and len(groups[0]["clips"]) == 3
+
+
 def test_one_group_per_streamer_per_match(conn):
     add_everything(conn, channel="one", match_id="m1", at_ms=(1000, 2000))
     add_everything(conn, channel="two", match_id="m2", at_ms=(1000,))
@@ -579,6 +604,10 @@ def _store_match(conn, match_id, when):
 class _NoReport:
     confirmed: tuple = ()
     candidates: tuple = ()
+    # The real report splits these out of `candidates`, and the progress
+    # line reads them both.
+    likely: tuple = ()
+    unverified: tuple = ()
     errors: tuple = ()
 
     def summary(self) -> str:
