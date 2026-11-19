@@ -269,6 +269,67 @@ Where it cannot be measured — no OCR installed, or a stream that joined too la
 show a countdown — the 109s median stands in, and the UI says so on the card rather
 than presenting a guess as a measurement.
 
+### The detail we were throwing away
+
+`raw_json` is stored as the source of truth so that detection logic can change
+without re-fetching. For a long while what actually reached the disk was this
+project's own Pydantic dump — and the model is declared `extra="ignore"`, so every
+field it had not yet learned about was dropped on the way in.
+
+The v4 match endpoint had been sending all of this the whole time:
+
+| | what it carries |
+|---|---|
+| `kills[].location` | where the victim fell, in world coordinates |
+| `kills[].player_locations` | where all nine others were standing, and facing |
+| `rounds[].plant` / `.defuse` | site, time into the round, position |
+| `rounds[].winning_team_role` | attacker or defender, which the team alone cannot say |
+| `players[].stats.damage` | dealt and received |
+| `players[].stats.headshots` | with body and leg, so accuracy is derivable |
+| `players[].tier` | the rank they played at |
+| `metadata.map.id`, `players[].agent.id` | the uuids the asset service is keyed on |
+
+Sixty-seven matches had been stored without any of it. Nothing local could recover
+them, so `clipsvalorant backfill` re-fetches a trimmed match from the API — one call
+each, which is why it is a command of its own rather than something a scan does
+quietly. A `Match` now carries the payload it was parsed from, so "source of truth"
+is true.
+
+### Putting a kill on a map
+
+Riot's asset service publishes, per map, a top-down minimap and four numbers that
+convert world coordinates into a point on it. The conversion has one trap: the
+game's **y** drives the image's **x**.
+
+```
+image_x = game_y * xMultiplier + xScalarToAdd
+image_y = game_x * yMultiplier + yScalarToAdd
+```
+
+Get that the wrong way round and you still get a map covered in plausible dots,
+every one of them mirrored into a wrong room — which is the worst kind of bug this
+project can ship, since the whole claim is that its positions and timestamps are
+true. It is pinned by a test that moves along one axis at a time.
+
+Checked against a real Abyss match: 150 of 150 kills land inside the image. On the
+Corrode match in the UI, the map draws 127 dots, of which 17 are the account's kills
+and 7 its deaths — matching that scoreboard's 17/7 exactly.
+
+Every dot carries its own VOD offset, so clicking a kill on the map opens the
+broadcast at the moment it happened. The positions belong to the match, but where
+they land inside a broadcast differs per streamer, so each find gets its own copy.
+
+Artwork is fetched once and served from `data/assets/` rather than linked. A page
+embedding `media.valorant-api.com` directly would hand that CDN the viewer's address
+and the list of maps and agents they play, every time it was opened, for a tool that
+otherwise speaks only to localhost and Twitch. Ids coming back from the page are
+matched against a UUID pattern before they touch the filesystem, and a miss is never
+an error: no artwork, no catalogue, no internet all end as "draw the name instead".
+
+Rounds are numbered from zero by Riot and from one by people. Everything shown to a
+reader goes through a single helper, so the round strip, the tooltips, the map and
+the moment list cannot disagree with each other.
+
 ### Where the page came from
 
 The page is one file — `PAGE` in `clipsvalorant/web.py` — with no build step, no
@@ -291,6 +352,7 @@ impressions. Those were read off and reimplemented in plain CSS.
 | Three-way theme control | `ncdai/theme-switcher-1` |
 | Window and filter controls | `ruixenui/segmented-button-group` |
 | Scrubber ticks and round-jump buttons | `ruixenui/audio-timeline-with-chapters` |
+| Match cards, round strip, map and scoreboard panels | `reapollo/bento-monochrome` (its spans and card rules) |
 | Riot ID field | `kokonutd/action-search-bar` |
 | Scan progress | `educalvolpz/animated-progress-bar` |
 

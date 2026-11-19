@@ -82,6 +82,31 @@ CREATE TABLE IF NOT EXISTS kill (
 
 CREATE INDEX IF NOT EXISTS idx_kill_mine ON kill (match_id, is_mine);
 
+-- What happened in each round, which is what the timeline draws.
+--
+-- Derivable from `match.raw_json` on demand, and was for a while, but the
+-- page asks for it once per match per request and re-parsing a 400KB payload
+-- to answer "who won round 7" is work nobody needs doing twice.
+CREATE TABLE IF NOT EXISTS round (
+    match_id        TEXT NOT NULL REFERENCES match(id) ON DELETE CASCADE,
+    round           INTEGER NOT NULL,
+    result          TEXT,                 -- Elimination|Defuse|Bomb|Time
+    winning_team    TEXT,
+    -- Attacker or Defender. Sides swap at half time, so the team alone does
+    -- not say how a round was played.
+    winning_role    TEXT,
+    ceremony        TEXT,
+    plant_ms        INTEGER,              -- into the round, not the match
+    plant_site      TEXT,
+    plant_x         REAL,
+    plant_y         REAL,
+    defuse_ms       INTEGER,
+    PRIMARY KEY (match_id, round)
+);
+
+CREATE INDEX IF NOT EXISTS idx_round_match ON round (match_id);
+
+
 -- One row per notable thing you did, which is what Phase 2 turns into VOD links.
 CREATE TABLE IF NOT EXISTS highlight (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,

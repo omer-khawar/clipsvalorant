@@ -46,6 +46,21 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("encounter", "evidence", "TEXT"),
     ("match", "last_resolved_at", "TEXT"),
     ("match", "resolve_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    # Everything below arrived with the map view. The v4 endpoint was always
+    # sending it; the model was quietly dropping it on the way in, so these
+    # are empty for anything ingested before and `backfill` exists to fill
+    # them in from the API rather than pretend they are zero.
+    ("match", "map_id", "TEXT"),
+    ("match_player", "agent_id", "TEXT"),
+    ("match_player", "tier", "TEXT"),
+    ("match_player", "headshots", "INTEGER"),
+    ("match_player", "bodyshots", "INTEGER"),
+    ("match_player", "legshots", "INTEGER"),
+    ("match_player", "damage_dealt", "INTEGER"),
+    ("match_player", "damage_received", "INTEGER"),
+    ("kill", "x", "REAL"),
+    ("kill", "y", "REAL"),
+    ("twitch_channel", "profile_image_url", "TEXT"),
 )
 
 

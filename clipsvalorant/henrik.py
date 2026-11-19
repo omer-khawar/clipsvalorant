@@ -193,4 +193,6 @@ class HenrikClient:
         data = payload.get("data")
         if not isinstance(data, dict):
             raise HenrikError(f"Unexpected match payload for {match_id}: no 'data' object")
-        return Match.model_validate(data)
+        # The payload travels with the parse, so whatever stores this keeps
+        # what the API actually said and not merely the fields we parse today.
+        return Match.model_validate(data).with_raw(data)

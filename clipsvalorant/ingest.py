@@ -85,12 +85,13 @@ def persist_match(
     conn.execute(
         """
         INSERT INTO match (id, started_at, started_at_epoch, game_length_ms, ended_at_epoch,
-                           map, mode, queue, region, cluster, my_team, my_team_won,
-                           rounds_won, rounds_lost, ingested_at, raw_json)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           map, map_id, mode, queue, region, cluster, my_team,
+                           my_team_won, rounds_won, rounds_lost, ingested_at, raw_json)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
             ingested_at = excluded.ingested_at,
-            raw_json    = excluded.raw_json
+            raw_json    = excluded.raw_json,
+            map_id      = excluded.map_id
         """,
         (
             match.id,
@@ -99,6 +100,7 @@ def persist_match(
             length_ms,
             ended,
             meta.map_name,
+            meta.map_id,
             meta.mode,
             meta.queue,
             meta.region or region,
@@ -118,13 +120,19 @@ def persist_match(
         conn.execute(
             """
             INSERT INTO match_player (match_id, puuid, name, tag, team, agent,
-                                      kills, deaths, assists, score, is_me)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                                      agent_id, tier, kills, deaths, assists, score,
+                                      headshots, bodyshots, legshots,
+                                      damage_dealt, damage_received, is_me)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(match_id, puuid) DO UPDATE SET
                 name = excluded.name, tag = excluded.tag, team = excluded.team,
-                agent = excluded.agent, kills = excluded.kills,
+                agent = excluded.agent, agent_id = excluded.agent_id,
+                tier = excluded.tier, kills = excluded.kills,
                 deaths = excluded.deaths, assists = excluded.assists,
-                score = excluded.score
+                score = excluded.score, headshots = excluded.headshots,
+                bodyshots = excluded.bodyshots, legshots = excluded.legshots,
+                damage_dealt = excluded.damage_dealt,
+                damage_received = excluded.damage_received
             """,
             (
                 match.id,
@@ -133,10 +141,17 @@ def persist_match(
                 player.tag,
                 player.team,
                 player.agent,
+                player.agent_id,
+                player.tier,
                 player.stats.kills,
                 player.stats.deaths,
                 player.stats.assists,
                 player.stats.score,
+                player.stats.headshots,
+                player.stats.bodyshots,
+                player.stats.legshots,
+                player.stats.damage.dealt,
+                player.stats.damage.received,
                 int(mine),
             ),
         )
@@ -149,14 +164,49 @@ def persist_match(
             is_me=mine,
         )
 
+    # Rounds, for the timeline. Everything here is also in raw_json; it is
+    # written out so the page does not have to re-parse 400KB to find out who
+    # won round seven.
+    for entry in match.rounds:
+        if entry.id is None:
+            continue
+        plant = entry.plant
+        conn.execute(
+            """
+            INSERT INTO round (match_id, round, result, winning_team, winning_role,
+                               ceremony, plant_ms, plant_site, plant_x, plant_y,
+                               defuse_ms)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(match_id, round) DO UPDATE SET
+                result = excluded.result, winning_team = excluded.winning_team,
+                winning_role = excluded.winning_role, ceremony = excluded.ceremony,
+                plant_ms = excluded.plant_ms, plant_site = excluded.plant_site,
+                plant_x = excluded.plant_x, plant_y = excluded.plant_y,
+                defuse_ms = excluded.defuse_ms
+            """,
+            (
+                match.id,
+                entry.id,
+                entry.result,
+                entry.winning_team,
+                entry.winning_team_role,
+                entry.ceremony,
+                plant.round_time_in_ms if plant else None,
+                plant.site if plant else None,
+                plant.location.x if plant else None,
+                plant.location.y if plant else None,
+                entry.defuse.round_time_in_ms if entry.defuse else None,
+            ),
+        )
+
     # Kills. time_in_match_ms is the number every VOD timestamp is derived from.
     for kill in match.kills:
         conn.execute(
             """
             INSERT OR IGNORE INTO kill (match_id, round, time_in_match_ms, time_in_round_ms,
                                         killer_puuid, killer_name, victim_puuid, victim_name,
-                                        weapon, assist_count, is_mine)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                                        weapon, assist_count, is_mine, x, y)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 match.id,
@@ -170,8 +220,22 @@ def persist_match(
                 kill.weapon,
                 len(kill.assistants),
                 int(is_player(kill.killer, me.puuid, me.name, me.tag)),
+                kill.location.x,
+                kill.location.y,
             ),
         )
+        # A row that predates coordinates is updated in place rather than
+        # ignored, so a backfill actually lands on the rows already there.
+        if kill.location.known:
+            conn.execute(
+                """
+                UPDATE kill SET x = ?, y = ?
+                 WHERE match_id = ? AND round = ? AND time_in_match_ms = ?
+                   AND x IS NULL
+                """,
+                (kill.location.x, kill.location.y, match.id, kill.round,
+                 kill.time_in_match_in_ms),
+            )
 
     highlights = find_highlights(match, me.puuid)
     for h in highlights:
@@ -257,6 +321,7 @@ def ingest(
                         my_name=cfg.riot_name,
                         my_tag=cfg.riot_tag,
                         region=cfg.region,
+                        raw=match.raw or None,
                     )
                 except (HenrikError, LookupError, ValueError) as exc:
                     report.failed += 1
@@ -268,6 +333,62 @@ def ingest(
                 report.stored += 1
                 report.highlights += found
 
+    return report
+
+
+def needs_backfill(conn) -> list[str]:
+    """Matches stored before the payload was kept whole, newest first.
+
+    Identified by the map's uuid being absent, because that arrives in the
+    same payload as the kill coordinates and the per-player damage: if one
+    is missing they all are.
+    """
+    rows = conn.execute(
+        "SELECT id FROM match WHERE map_id IS NULL ORDER BY started_at_epoch DESC"
+    ).fetchall()
+    return [r["id"] for r in rows]
+
+
+def backfill(cfg: Config, *, limit: int = 25) -> IngestReport:
+    """Re-fetch matches whose stored payload was trimmed on the way in.
+
+    This costs real API calls - one per match, plus whatever Riot requests
+    HenrikDev makes behind each one - which is why it is a command of its own
+    and not something a scan does quietly. For a long while `raw_json` held
+    this model's own dump rather than the payload, and the model is declared
+    to ignore fields it does not know, so kill coordinates, per-player damage
+    and the map's uuid never reached the disk at all. Nothing can recover
+    them locally; they have to be asked for again.
+
+    Newest first, because Twitch's retention means a two-week-old match is
+    the oldest one whose broadcast could still exist to put the map beside.
+    """
+    report = IngestReport()
+    with db.session(cfg.db_path) as conn:
+        pending = needs_backfill(conn)
+        report.seen = len(pending)
+        if not pending:
+            return report
+        with HenrikClient(cfg.henrik_api_key) as client:
+            for match_id in pending[:limit]:
+                try:
+                    match = client.match_detail(match_id, cfg.region)
+                    found = persist_match(
+                        conn,
+                        match,
+                        my_name=cfg.riot_name,
+                        my_tag=cfg.riot_tag,
+                        region=cfg.region,
+                        raw=match.raw or None,
+                    )
+                except (HenrikError, LookupError, ValueError) as exc:
+                    report.failed += 1
+                    report.errors.append(f"{match_id}: {exc}")
+                    continue
+                report.stored += 1
+                report.highlights += found
+                conn.commit()
+        report.skipped = max(0, len(pending) - limit)
     return report
 
 

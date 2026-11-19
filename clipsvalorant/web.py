@@ -39,6 +39,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from clipsvalorant import calibrate, db
+from clipsvalorant.assets import Assets
 from clipsvalorant.config import Config
 
 log = logging.getLogger(__name__)
@@ -265,20 +266,145 @@ def match_timeline(conn: sqlite3.Connection, match_id: str) -> dict[str, Any]:
 _CLIP_SQL = """
 SELECT e.match_id, e.riot_id, e.channel_login, e.vod_id, e.verdict,
        e.same_team, e.evidence, e.verified_how,
-       m.started_at_epoch, m.map, m.mode, m.queue,
+       m.started_at_epoch, m.map, m.map_id, m.mode, m.queue,
        m.rounds_won, m.rounds_lost, m.my_team_won,
+       c.profile_image_url, c.display_name AS channel_display,
        v.created_epoch, v.duration_s, v.title,
        h.round, h.label, h.kind, h.kill_count, h.time_in_match_ms, h.round_won,
        o.shift_s, o.method
 FROM encounter e
 JOIN match m      ON m.id = e.match_id
 JOIN twitch_vod v ON v.id = e.vod_id
+LEFT JOIN twitch_channel c ON c.id = e.channel_id
 JOIN highlight h  ON h.match_id = e.match_id
 LEFT JOIN match_vod_offset o
        ON o.match_id = e.match_id AND o.vod_id = e.vod_id
 WHERE e.vod_id IS NOT NULL AND e.verdict IN ('confirmed', 'likely')
 ORDER BY m.started_at_epoch DESC, h.time_in_match_ms ASC
 """
+
+
+
+def match_scoreboard(conn: sqlite3.Connection, match_id: str) -> list[dict[str, Any]]:
+    """Both teams, best first, with enough to judge how the match went.
+
+    Ordered by score within a team rather than by kills, because score is
+    what Valorant's own scoreboard sorts on and a player who did the work
+    without the frags should not drop to the bottom.
+    """
+    rows = conn.execute(
+        """
+        SELECT puuid, name, tag, team, agent, agent_id, tier, kills, deaths,
+               assists, score, headshots, bodyshots, legshots,
+               damage_dealt, damage_received, is_me
+          FROM match_player
+         WHERE match_id = ?
+         ORDER BY is_me DESC, score DESC
+        """,
+        (match_id,),
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        shots = (row["headshots"] or 0) + (row["bodyshots"] or 0) + (row["legshots"] or 0)
+        out.append({
+            "puuid": row["puuid"],
+            "name": row["name"],
+            "tag": row["tag"],
+            "team": row["team"] or "",
+            "agent": row["agent"] or "",
+            "agent_id": row["agent_id"] or "",
+            "tier": row["tier"] or "",
+            "kills": row["kills"] or 0,
+            "deaths": row["deaths"] or 0,
+            "assists": row["assists"] or 0,
+            "score": row["score"] or 0,
+            "damage": row["damage_dealt"] or 0,
+            "hs": round((row["headshots"] or 0) / shots * 100) if shots else None,
+            "mine": bool(row["is_me"]),
+        })
+    return out
+
+
+def match_rounds(conn: sqlite3.Connection, match_id: str) -> dict[int, dict[str, Any]]:
+    """How each round ended, keyed by round number.
+
+    Separate from `match_timeline`, which dates rounds off the kill clock and
+    therefore cannot see a round nobody died in. This one comes from Riot's
+    own round list, so it has every round - including the quiet ones - and is
+    what the timeline strip draws.
+    """
+    out: dict[int, dict[str, Any]] = {}
+    me = conn.execute(
+        "SELECT team FROM match_player WHERE match_id = ? AND is_me = 1 LIMIT 1",
+        (match_id,),
+    ).fetchone()
+    my_team = (me["team"] if me else "") or ""
+    for row in conn.execute(
+        """
+        SELECT round, result, winning_team, winning_role, ceremony,
+               plant_ms, plant_site
+          FROM round WHERE match_id = ? ORDER BY round
+        """,
+        (match_id,),
+    ):
+        winner = row["winning_team"] or ""
+        out[int(row["round"])] = {
+            "result": row["result"] or "",
+            "winner": winner,
+            "won": bool(my_team and winner and winner == my_team),
+            "role": row["winning_role"] or "",
+            "ceremony": row["ceremony"] or "",
+            "planted": row["plant_ms"] is not None,
+            "site": row["plant_site"] or "",
+        }
+    return out
+
+
+def match_positions(
+    conn: sqlite3.Connection, match_id: str, info: Any
+) -> list[dict[str, Any]]:
+    """Every kill of the match as a point on the minimap.
+
+    `info` is an `assets.MapInfo`, which owns the conversion; a match whose
+    map is unknown, or which was stored before coordinates were kept, simply
+    returns nothing and the page draws no map rather than a wrong one.
+    """
+    if info is None or not info.usable:
+        return []
+    me = conn.execute(
+        "SELECT puuid FROM match_player WHERE match_id = ? AND is_me = 1 LIMIT 1",
+        (match_id,),
+    ).fetchone()
+    mine = me["puuid"] if me else ""
+    out: list[dict[str, Any]] = []
+    for row in conn.execute(
+        """
+        SELECT round, time_in_match_ms, killer_name, victim_name, victim_puuid,
+               weapon, is_mine, x, y
+          FROM kill
+         WHERE match_id = ? AND x IS NOT NULL AND y IS NOT NULL
+         ORDER BY time_in_match_ms
+        """,
+        (match_id,),
+    ):
+        point = info.point(row["x"], row["y"])
+        if point is None:
+            continue
+        died = bool(mine and row["victim_puuid"] == mine)
+        out.append({
+            "round": int(row["round"]),
+            "ms": int(row["time_in_match_ms"]),
+            "mx": round(point[0], 5),
+            "my": round(point[1], 5),
+            # Three kinds, because they are read differently: the ones you
+            # got, the one that got you, and everyone else's, which are there
+            # for context and drawn faintly.
+            "kind": "mine" if row["is_mine"] else ("death" if died else "other"),
+            "killer": row["killer_name"] or "",
+            "victim": row["victim_name"] or "",
+            "weapon": row["weapon"] or "",
+        })
+    return out
 
 
 def _why_unplayable(at: int, duration: int) -> str:
@@ -316,7 +442,9 @@ def _moment(
     }
 
 
-def clip_groups(conn: sqlite3.Connection, *, lead: int = LEAD_S) -> list[dict[str, Any]]:
+def clip_groups(
+    conn: sqlite3.Connection, *, lead: int = LEAD_S, assets: Any = None,
+) -> list[dict[str, Any]]:
     """One group per (match, streamer), holding everything playable in it.
 
     A moment is only playable if the broadcast actually contains it. Two
@@ -343,6 +471,9 @@ def clip_groups(conn: sqlite3.Connection, *, lead: int = LEAD_S) -> list[dict[st
                 "same_team": bool(row["same_team"]),
                 "source": row["verified_how"] or "",
                 "map": row["map"] or "?",
+                "map_id": row["map_id"] or "",
+                "avatar": row["profile_image_url"] or "",
+                "channel_name": row["channel_display"] or row["channel_login"],
                 "mode": row["mode"] or row["queue"] or "?",
                 "started": row["started_at_epoch"],
                 "started_text": datetime.fromtimestamp(
@@ -382,6 +513,7 @@ def clip_groups(conn: sqlite3.Connection, *, lead: int = LEAD_S) -> list[dict[st
     # broadcasting it, so it is read once per match and shared by every
     # streamer in that lobby.
     timelines: dict[str, dict[str, Any]] = {}
+    detail: dict[str, dict[str, Any]] = {}
     for group in groups.values():
         match_id = group["match_id"]
         if match_id not in timelines:
@@ -389,6 +521,39 @@ def clip_groups(conn: sqlite3.Connection, *, lead: int = LEAD_S) -> list[dict[st
         _attach_timeline(
             group, timelines[match_id], created.get(group["vod_id"], 0), lead=lead
         )
+        # The scoreboard, the round outcomes and the kill positions belong to
+        # the match, not to whoever was broadcasting it, so each is read once
+        # however many streamers were in that lobby.
+        if match_id not in detail:
+            info = assets.map_for(group["map_id"], group["map"]) if assets else None
+            detail[match_id] = {
+                "scoreboard": match_scoreboard(conn, match_id),
+                "outcomes": match_rounds(conn, match_id),
+                "positions": match_positions(conn, match_id, info),
+                "minimap": bool(info and info.usable),
+            }
+        got = detail[match_id]
+        group["scoreboard"] = got["scoreboard"]
+        group["minimap"] = got["minimap"]
+        # Each dot carries its own seek point, so a kill on the map is a
+        # click away from the moment it happened. The positions themselves
+        # belong to the match, but where they land inside a broadcast is
+        # different for every streamer in that lobby, so each gets a copy.
+        group["positions"] = [
+            dict(pos, **_moment(
+                match_start=group["started"],
+                vod_created=created.get(group["vod_id"], 0),
+                ms=pos["ms"], shift=group["shift_s"],
+                duration=group["vod_duration"], lead=lead,
+            ))
+            for pos in got["positions"]
+        ]
+        me = next((p for p in got["scoreboard"] if p["mine"]), None)
+        group["me"] = me or {}
+        for entry in group["rounds"]:
+            outcome = got["outcomes"].get(entry["round"])
+            if outcome:
+                entry.update(outcome)
 
     out = list(groups.values())
     out.sort(key=lambda g: (VERDICT_ORDER.get(g["verdict"], 9), -g["started"]))
@@ -675,6 +840,13 @@ class State:
     job: Job | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     runner: Callable[..., None] = run_search
+    _assets: Any = None
+
+    @property
+    def assets(self) -> Assets:
+        if self._assets is None:
+            self._assets = Assets(self.cfg.db_path.parent / "assets")
+        return self._assets
 
     @property
     def data_dir(self) -> Path:
@@ -756,6 +928,8 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                     self._json(self._state_payload())
                 elif route == "/api/clips":
                     self._json(self._clips_payload(query.get("key", [""])[0]))
+                elif route.startswith("/api/icon/"):
+                    self._icon(route)
                 elif route == "/api/job":
                     job = state.job
                     self._json(job.snapshot() if job else {"state": "idle"})
@@ -821,6 +995,39 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
                 "job": job.snapshot() if job else None,
             }
 
+        def _icon(self, route: str) -> None:
+            """Map and agent artwork, served from our own cache.
+
+            Deliberately proxied rather than linked. Pointing the page at
+            media.valorant-api.com would hand that CDN the viewer's address
+            and the list of maps and agents they play, every time the page is
+            opened, for a tool that otherwise speaks only to localhost and
+            Twitch. Cached copies also mean the page still draws with no
+            network at all.
+            """
+            parts = route[len("/api/icon/"):].split("/")
+            if len(parts) != 2:
+                self._json({"error": "no such icon"}, 404)
+                return
+            kind, name = parts
+            path = state.assets.image(kind, name.removesuffix(".png"))
+            if path is None:
+                self._json({"error": "no artwork"}, 404)
+                return
+            try:
+                body = path.read_bytes()
+            except OSError:
+                self._json({"error": "no artwork"}, 404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(body)))
+            # Immutable by nature: these are keyed by Riot's own asset uuid.
+            self.send_header("Cache-Control", "public, max-age=604800")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
         def _clips_payload(self, key: str) -> dict[str, Any]:
             key = key or state.cfg.db_path.stem
             path = path_for_key(state.data_dir, key)
@@ -830,7 +1037,7 @@ def make_handler(state: State) -> type[BaseHTTPRequestHandler]:
             with _read_only(path) as conn:
                 return {
                     "key": key,
-                    "groups": clip_groups(conn),
+                    "groups": clip_groups(conn, assets=state.assets),
                     "summary": account_summary(conn),
                 }
 
@@ -906,18 +1113,19 @@ PAGE = r"""<!doctype html>
 <title>clipsvalorant</title>
 <style>
 /* ===========================================================================
-   Pulled from github.com/wundercorp/awesome-components. That catalogue ships
-   rendered DOM snapshots rather than source, so what is taken here is the
-   measured thing: exact spacing, radii, border alphas, type scale and motion
-   timing, reimplemented in plain CSS.
+   Design read off github.com/wundercorp/awesome-components. That catalogue
+   ships rendered DOM snapshots rather than source, so what is taken is the
+   measured thing - spacing, radii, border alphas, type scale, motion timing -
+   reimplemented here in plain CSS.
 
      shell, dot-grid, rules, card system   reapollo / bento-monochrome
-     metric tiles                          reapollo / glassmorphism-minimal-metrics-block
+     metric strip                          reapollo / glassmorphism-minimal-metrics-block
      theme control                         ncdai   / theme-switcher-1
      segmented controls                    ruixenui/ segmented-button-group
-     scrubber ticks + chapter jumps        ruixenui/ audio-timeline-with-chapters
+     scrubber ticks + round jumps          ruixenui/ audio-timeline-with-chapters
      search field                          kokonutd/ action-search-bar
      scan progress                         educalvolpz / animated-progress-bar
+     match cards                           reapollo / bento-monochrome (spans)
 
    The background shader is written here - the catalogue has no shader source
    anywhere in it - and follows the monochrome silk of reuno-ui's
@@ -926,61 +1134,43 @@ PAGE = r"""<!doctype html>
 
 :root{
   color-scheme:light;
-  --bg:#ffffff;
-  --ink:#0a0a0a;
-  --muted:rgba(10,10,10,.58);
-  --faint:rgba(10,10,10,.36);
-  --line:rgba(10,10,10,.10);
-  --hair:rgba(10,10,10,.06);
-  --panel:rgba(255,255,255,.72);
-  --solid:#ffffff;
-  --grid:rgba(17,17,17,.075);
-  --edge:#ffffff;
-  --accent:#6b2fd4;
-  --on-accent:#ffffff;
-  --win:#0a0a0a;
-  --shadow:0 10px 40px rgba(0,0,0,.045);
-  --shadow-h:0 20px 60px rgba(0,0,0,.085);
-  --shader:.5;
+  --bg:#ffffff; --ink:#0a0a0a;
+  --muted:rgba(10,10,10,.58); --faint:rgba(10,10,10,.36);
+  --line:rgba(10,10,10,.10); --hair:rgba(10,10,10,.06);
+  --panel:rgba(255,255,255,.72); --solid:#ffffff;
+  --grid:rgba(17,17,17,.075); --edge:#ffffff;
+  --accent:#6b2fd4; --on-accent:#ffffff;
+  --win:#1f7a4d; --loss:#b3331f;
+  --shadow:0 10px 40px rgba(0,0,0,.045); --shadow-h:0 20px 60px rgba(0,0,0,.085);
+  --shader:.5; --mapinvert:0;
 }
 :root[data-theme="dark"]{
   color-scheme:dark;
-  --bg:#050505;
-  --ink:#fafafa;
-  --muted:rgba(255,255,255,.58);
-  --faint:rgba(255,255,255,.36);
-  --line:rgba(255,255,255,.11);
-  --hair:rgba(255,255,255,.06);
-  --panel:rgba(255,255,255,.045);
-  --solid:#0d0d0d;
-  --grid:rgba(255,255,255,.06);
-  --edge:#000000;
-  --accent:#a97bff;
-  --on-accent:#0a0a0a;
-  --win:#fafafa;
-  --shadow:0 18px 40px rgba(0,0,0,.35);
-  --shadow-h:0 28px 70px rgba(0,0,0,.55);
-  --shader:.72;
+  --bg:#050505; --ink:#fafafa;
+  --muted:rgba(255,255,255,.58); --faint:rgba(255,255,255,.36);
+  --line:rgba(255,255,255,.11); --hair:rgba(255,255,255,.06);
+  --panel:rgba(255,255,255,.045); --solid:#0d0d0d;
+  --grid:rgba(255,255,255,.06); --edge:#000000;
+  --accent:#a97bff; --on-accent:#0a0a0a;
+  --win:#43c98a; --loss:#ff6f57;
+  --shadow:0 18px 40px rgba(0,0,0,.35); --shadow-h:0 28px 70px rgba(0,0,0,.55);
+  --shader:.72; --mapinvert:0;
 }
 
 *,*::before,*::after{box-sizing:border-box}
 html,body{height:100%}
 body{
-  margin:0;
-  background:var(--bg);
-  color:var(--ink);
+  margin:0; background:var(--bg); color:var(--ink);
   font:400 15px/1.5 ui-sans-serif,-apple-system,"Segoe UI Variable Text","Segoe UI",Inter,system-ui,sans-serif;
-  -webkit-font-smoothing:antialiased;
-  font-variant-numeric:tabular-nums;
-  overflow-x:hidden;
+  -webkit-font-smoothing:antialiased; font-variant-numeric:tabular-nums; overflow-x:hidden;
 }
-.mono{font-family:ui-monospace,"Cascadia Mono","SF Mono",Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+.mono{font-family:ui-monospace,"Cascadia Mono","SF Mono",Menlo,Consolas,monospace;
+  font-variant-numeric:tabular-nums}
 
-/* ---- background: shader, then the 20px dot-grid, then an edge vignette ---- */
+/* ---- background ---- */
 #shader{position:fixed;inset:0;width:100%;height:100%;z-index:-30;opacity:var(--shader);
   transition:opacity .5s ease;display:block}
-.dotgrid{
-  position:fixed;inset:0;z-index:-20;pointer-events:none;opacity:.9;
+.dotgrid{position:fixed;inset:0;z-index:-20;pointer-events:none;opacity:.9;
   background-image:linear-gradient(to right,var(--grid) 1px,transparent 1px),
                    linear-gradient(to bottom,var(--grid) 1px,transparent 1px);
   background-size:20px 20px;
@@ -988,42 +1178,38 @@ body{
         repeating-linear-gradient(#000 0 3px,transparent 3px 8px);
   mask-image:repeating-linear-gradient(to right,#000 0 3px,transparent 3px 8px),
         repeating-linear-gradient(#000 0 3px,transparent 3px 8px);
-  -webkit-mask-composite:source-in;mask-composite:intersect;
-}
+  -webkit-mask-composite:source-in;mask-composite:intersect}
 .vignette{position:fixed;inset:0;z-index:-10;pointer-events:none;opacity:.75;filter:blur(40px);
   background:radial-gradient(circle at center,rgba(0,0,0,0) 55%,var(--edge) 100%)}
 
 /* ---- shell ---- */
-.wrap{max-width:1152px;margin:0 auto;padding:56px 24px 72px;position:relative}
+.wrap{max-width:1152px;margin:0 auto;padding:48px 24px 72px;position:relative}
 .eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.35em;color:var(--faint);
   display:block;line-height:1}
-.rule{height:1px;background:var(--line);border:0;margin:0}
+.lbl{font-size:10px;text-transform:uppercase;letter-spacing:.28em;color:var(--faint);line-height:1}
 
 .top{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;
-  padding-bottom:24px;border-bottom:1px solid var(--line);margin-bottom:28px}
-.brand h1{margin:10px 0 0;font-size:40px;line-height:1.02;letter-spacing:-.03em;font-weight:800}
+  padding-bottom:20px;border-bottom:1px solid var(--line);margin-bottom:22px}
+.brand h1{margin:10px 0 0;font-size:38px;line-height:1.02;letter-spacing:-.03em;font-weight:800}
 .brand h1 .tag{color:var(--faint);font-weight:500}
 .topright{display:flex;align-items:center;gap:10px}
 .chip{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border-radius:999px;
   border:1px solid var(--line);color:var(--muted);font-size:10px;text-transform:uppercase;
   letter-spacing:.28em;background:var(--panel);backdrop-filter:blur(12px)}
 
-/* ---- theme switcher: ncdai/theme-switcher-1 ---- */
+/* theme: ncdai/theme-switcher-1 */
 .themer{display:inline-flex;align-items:center;border-radius:999px;background:var(--panel);
   box-shadow:inset 0 0 0 1px var(--line);backdrop-filter:blur(12px);overflow:hidden}
 .themer button{position:relative;width:32px;height:32px;display:grid;place-items:center;border:0;
   background:none;color:var(--faint);cursor:pointer;transition:color .2s}
-.themer button:hover{color:var(--ink)}
-.themer button[aria-checked="true"]{color:var(--ink)}
+.themer button:hover,.themer button[aria-checked="true"]{color:var(--ink)}
 .themer button[aria-checked="true"]::after{content:"";position:absolute;inset:0;border-radius:999px;
   border:1px solid var(--line)}
 .themer svg{width:15px;height:15px}
 
 /* ---- search: kokonutd/action-search-bar ---- */
-.scan{margin-bottom:28px}
 .scanrow{display:grid;grid-template-columns:1fr auto auto;gap:12px;align-items:end}
 .field{display:flex;flex-direction:column;gap:8px;min-width:0}
-.lbl{font-size:10px;text-transform:uppercase;letter-spacing:.28em;color:var(--faint);line-height:1}
 .inputwrap{position:relative}
 .inputwrap input{width:100%;height:44px;padding:0 40px 0 14px;border-radius:12px;
   border:1px solid var(--line);background:var(--panel);color:var(--ink);font-size:15px;
@@ -1040,10 +1226,9 @@ body{
 .seg button{border:0;background:none;color:var(--muted);cursor:pointer;font:inherit;font-size:13px;
   padding:0 16px;border-radius:999px;transition:background .2s,color .2s;white-space:nowrap}
 .seg button:hover{color:var(--ink)}
-.seg button[aria-checked="true"],.seg button[aria-selected="true"]{
-  background:var(--ink);color:var(--bg)}
-.seg.sm{height:32px;padding:3px}
-.seg.sm button{font-size:11px;padding:0 12px;text-transform:uppercase;letter-spacing:.1em}
+.seg button[aria-checked="true"],.seg button[aria-selected="true"]{background:var(--ink);color:var(--bg)}
+.seg.sm{height:30px;padding:3px}
+.seg.sm button{font-size:11px;padding:0 11px;text-transform:uppercase;letter-spacing:.1em}
 
 .go{height:44px;padding:0 22px;border-radius:999px;border:0;background:var(--accent);
   color:var(--on-accent);font:inherit;font-weight:600;font-size:14px;cursor:pointer;
@@ -1053,74 +1238,99 @@ body{
 .go svg{width:15px;height:15px}
 
 /* ---- progress: educalvolpz/animated-progress-bar ---- */
-.prog{margin-top:16px}
+.prog{margin-top:14px}
 .prog[hidden]{display:none}
 .pmeta{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;
   font-size:11px;text-transform:uppercase;letter-spacing:.24em;color:var(--muted)}
 .ptrack{position:relative;height:6px;border-radius:999px;overflow:hidden;background:var(--hair);
   box-shadow:inset 0 0 0 1px var(--line)}
-.pfill{height:100%;width:0;border-radius:999px;background:var(--ink);transition:width .45s cubic-bezier(.22,1,.36,1)}
+.pfill{height:100%;width:0;border-radius:999px;background:var(--ink);
+  transition:width .45s cubic-bezier(.22,1,.36,1)}
 .pfill.indet{width:35%;animation:slide 1.4s ease-in-out infinite}
 @keyframes slide{0%{transform:translateX(-110%)}100%{transform:translateX(330%)}}
 .logbtn{margin-top:10px;border:0;background:none;color:var(--faint);font:inherit;font-size:11px;
   text-transform:uppercase;letter-spacing:.24em;cursor:pointer;padding:0}
 .logbtn:hover{color:var(--ink)}
-.log{margin:10px 0 0;max-height:190px;overflow:auto;font-family:ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;
+.log{margin:10px 0 0;max-height:180px;overflow:auto;font-family:ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;
   font-size:11.5px;line-height:1.7;color:var(--muted);white-space:pre-wrap;
   border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--panel)}
+.err{margin-top:12px;border:1px solid color-mix(in srgb,#e5484d 45%,transparent);border-radius:12px;
+  padding:11px 14px;font-size:13px;color:#e5484d;background:color-mix(in srgb,#e5484d 7%,transparent)}
+.err[hidden]{display:none}
 
-/* ---- cards: reapollo/bento-monochrome ---- */
+/* ---- the quiet line of totals (was four big tiles) ---- */
+.totals{display:flex;flex-wrap:wrap;gap:0 28px;align-items:baseline;margin:20px 0 6px;
+  padding-bottom:14px;border-bottom:1px solid var(--hair)}
+.totals span{font-size:11px;text-transform:uppercase;letter-spacing:.22em;color:var(--faint)}
+.totals b{font-weight:650;color:var(--ink);font-size:13px;letter-spacing:0;margin-right:6px}
+
+/* ---- cards ---- */
 .card{position:relative;border:1px solid var(--line);border-radius:16px;background:var(--panel);
   backdrop-filter:blur(16px);box-shadow:var(--shadow)}
 .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
-.rise{opacity:0;animation:rise .8s cubic-bezier(.22,1,.36,1) forwards}
-@keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
-
-/* ---- metric tiles: reapollo/glassmorphism-minimal-metrics-block ---- */
-.stats{margin-bottom:12px}
-.tile{grid-column:span 3;border-radius:16px;border:1px solid var(--line);background:var(--panel);
-  backdrop-filter:blur(16px);padding:20px;box-shadow:var(--shadow);
-  transition:transform .3s ease,box-shadow .3s ease}
-.tile:hover{transform:translateY(-3px);box-shadow:var(--shadow-h)}
-.tile .k{font-size:10px;text-transform:uppercase;letter-spacing:.25em;color:var(--faint)}
-.tile .v{margin-top:14px;font-size:38px;line-height:1;letter-spacing:-.035em;font-weight:700}
-.tile .v small{font-size:15px;font-weight:500;color:var(--faint);letter-spacing:0;margin-left:3px}
-.tile .s{margin-top:8px;font-size:12.5px;color:var(--muted)}
-
-/* ---- bento body ---- */
-.body{margin-top:12px}
-.finds{grid-column:span 4;display:flex;flex-direction:column;min-height:420px;overflow:hidden}
-.stage{grid-column:span 8;display:flex;flex-direction:column;overflow:hidden}
+.rise{opacity:0;animation:rise .7s cubic-bezier(.22,1,.36,1) forwards}
+@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
 .head{display:flex;align-items:center;justify-content:space-between;gap:12px;
-  padding:14px 16px;border-bottom:1px solid var(--hair);min-height:58px}
+  padding:12px 16px;border-bottom:1px solid var(--hair);min-height:52px}
 .head .t{font-size:11px;text-transform:uppercase;letter-spacing:.28em;color:var(--faint)}
 
-.findlist{list-style:none;margin:0;padding:6px;overflow:auto;flex:1}
-.find{width:100%;text-align:left;border:1px solid transparent;background:none;cursor:pointer;
-  border-radius:12px;padding:11px 12px;display:grid;gap:5px;color:inherit;font:inherit;
-  transition:background .18s,border-color .18s}
-.find:hover{background:var(--hair)}
-.find[aria-current="true"]{background:var(--hair);border-color:var(--line)}
-.find .r1{display:flex;align-items:center;gap:8px}
-.find .ch{font-weight:650;font-size:14px;letter-spacing:-.01em;overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap}
-.find .r2{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--muted)}
-.find .dot{width:4px;height:4px;border-radius:50%;background:var(--faint);flex:none}
-.badge{flex:none;font-size:9px;text-transform:uppercase;letter-spacing:.2em;padding:3px 7px;
+/* ================= THE MATCH PICKER - the hero of the page ================ */
+.pick{margin:18px 0 6px}
+.pickhead{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin-bottom:12px}
+.pickhead h2{margin:0;font-size:22px;letter-spacing:-.02em;font-weight:700}
+.matches{display:grid;grid-template-columns:repeat(auto-fill,minmax(336px,1fr));gap:12px}
+.match{position:relative;overflow:hidden;text-align:left;cursor:pointer;color:inherit;font:inherit;
+  border:1px solid var(--line);border-radius:16px;background:var(--panel);backdrop-filter:blur(16px);
+  padding:0;box-shadow:var(--shadow);transition:transform .25s cubic-bezier(.22,1,.36,1),
+  box-shadow .25s ease,border-color .25s ease}
+.match:hover{transform:translateY(-3px);box-shadow:var(--shadow-h)}
+.match[aria-current="true"]{border-color:var(--accent);
+  box-shadow:var(--shadow-h),0 0 0 1px var(--accent) inset}
+/* the map's own splash, kept far back so it reads as texture not decoration */
+.match .splash{position:absolute;inset:0;background-size:cover;background-position:center;
+  opacity:.14;filter:grayscale(1) contrast(1.1);transition:opacity .3s ease}
+.match:hover .splash,.match[aria-current="true"] .splash{opacity:.26}
+.match .veil{position:absolute;inset:0;background:
+  linear-gradient(90deg,var(--solid) 18%,color-mix(in srgb,var(--solid) 55%,transparent) 70%,
+  color-mix(in srgb,var(--solid) 15%,transparent))}
+.match .inner{position:relative;padding:14px 16px;display:grid;gap:11px}
+.mrow1{display:flex;align-items:center;gap:10px}
+.av{width:36px;height:36px;border-radius:50%;flex:none;object-fit:cover;
+  border:1px solid var(--line);background:var(--hair)}
+.av.ph{display:grid;place-items:center;font-size:13px;font-weight:700;color:var(--faint)}
+.mwho{min-width:0;flex:1}
+.mwho .ch{display:block;font-size:16px;font-weight:700;letter-spacing:-.015em;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mwho .sub{display:block;font-size:11px;color:var(--muted);margin-top:2px}
+.badge{flex:none;font-size:9px;text-transform:uppercase;letter-spacing:.18em;padding:3px 7px;
   border-radius:999px;border:1px solid var(--line);color:var(--muted);line-height:1}
-.badge.confirmed{border-color:color-mix(in srgb,var(--accent) 50%,transparent);
-  color:var(--accent)}
-.count{margin-left:auto;flex:none;font-size:11px;color:var(--faint)}
+.badge.confirmed{border-color:color-mix(in srgb,var(--accent) 55%,transparent);color:var(--accent)}
 
-/* ---- player + scrubber ---- */
+.mrow2{display:flex;align-items:center;gap:9px}
+.agent{width:30px;height:30px;border-radius:9px;flex:none;object-fit:cover;
+  border:1px solid var(--line);background:var(--hair)}
+.mscore{font-size:19px;font-weight:750;letter-spacing:-.02em;line-height:1}
+.mscore .w{color:var(--win)} .mscore .l{color:var(--loss)}
+.mmap{font-size:12px;color:var(--muted)}
+.mkda{margin-left:auto;text-align:right;font-size:12px;color:var(--muted);line-height:1.35}
+.mkda b{color:var(--ink);font-weight:650}
+
+.mrow3{display:flex;align-items:center;gap:8px;padding-top:10px;border-top:1px solid var(--hair)}
+.pips{display:flex;gap:2px;flex:1;min-width:0;flex-wrap:nowrap;overflow:hidden}
+.pip{height:12px;flex:1 1 0;min-width:2px;border-radius:1px;background:var(--line)}
+.pip.w{background:var(--win)} .pip.l{background:var(--loss)}
+.mcount{flex:none;font-size:11px;color:var(--faint);letter-spacing:.06em}
+.mcount b{color:var(--ink);font-weight:650;font-size:12.5px}
+
+/* ======================= the opened match ================================ */
+.stageWrap{margin-top:12px}
+.left{grid-column:span 7;display:flex;flex-direction:column;overflow:hidden}
+.right{grid-column:span 5;display:flex;flex-direction:column;gap:12px;min-width:0}
 .player{position:relative;aspect-ratio:16/9;background:#000;border-bottom:1px solid var(--hair)}
 .player iframe,.player>div{position:absolute;inset:0;width:100%;height:100%;border:0}
-.empty{flex:1;display:grid;place-items:center;padding:56px 24px;text-align:center;color:var(--faint)}
-.empty p{margin:10px 0 0;font-size:13px;max-width:34ch;color:var(--muted)}
-
-.deck{padding:14px 16px 16px}
-.nowline{display:flex;align-items:baseline;gap:10px;margin-bottom:12px;min-height:20px}
-.nowline .n{font-size:13px;font-weight:600;letter-spacing:-.01em}
+.deck{padding:12px 16px 16px}
+.nowline{display:flex;align-items:baseline;gap:10px;margin-bottom:10px;min-height:20px}
+.nowline .n{font-size:13px;font-weight:650;letter-spacing:-.01em}
 .nowline .w{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.2em}
 .nowline .ts{margin-left:auto;font-size:12px;color:var(--muted)}
 
@@ -1140,60 +1350,110 @@ body{
 .playhead.on{opacity:1}
 .tip{position:absolute;bottom:34px;transform:translateX(-50%);white-space:nowrap;pointer-events:none;
   background:var(--solid);color:var(--ink);border:1px solid var(--line);border-radius:8px;
-  padding:5px 9px;font-size:11.5px;box-shadow:var(--shadow-h);opacity:0;transition:opacity .15s;z-index:4}
+  padding:5px 9px;font-size:11.5px;box-shadow:var(--shadow-h);opacity:0;transition:opacity .15s;z-index:6}
 .tip.on{opacity:1}
-.tip b{font-weight:650}
-.tip span{color:var(--faint);margin-left:6px}
+.tip b{font-weight:650} .tip span{color:var(--faint);margin-left:6px}
+.axis{display:flex;justify-content:space-between;margin-top:3px;font-size:10.5px;color:var(--faint)}
 
-.axis{display:flex;justify-content:space-between;margin-top:4px;font-size:10.5px;color:var(--faint)}
-
-/* chapter jumps */
-.chapters{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px;padding-top:14px;
+/* ---- round timeline strip ---- */
+.rounds{display:flex;flex-wrap:wrap;gap:3px;margin-top:14px;padding-top:13px;
   border-top:1px solid var(--hair)}
-.chap{height:28px;min-width:30px;padding:0 9px;border-radius:8px;border:1px solid var(--line);
-  background:none;color:var(--muted);font:inherit;font-size:11.5px;cursor:pointer;
-  transition:background .16s,color .16s,border-color .16s}
-.chap:hover{background:var(--hair);color:var(--ink)}
-.chap[aria-current="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
-.chap:disabled{opacity:.35;cursor:default}
+.rnd{position:relative;width:30px;height:34px;border-radius:7px;border:1px solid var(--line);
+  background:none;color:var(--muted);font:inherit;font-size:11px;cursor:pointer;padding:0;
+  display:grid;place-items:center;transition:background .16s,color .16s,border-color .16s}
+.rnd:hover{background:var(--hair);color:var(--ink)}
+.rnd[aria-pressed="true"]{border-color:var(--accent);color:var(--ink);
+  box-shadow:0 0 0 1px var(--accent) inset}
+.rnd .bar{position:absolute;left:5px;right:5px;bottom:4px;height:2px;border-radius:2px;
+  background:var(--line)}
+.rnd.w .bar{background:var(--win)} .rnd.l .bar{background:var(--loss)}
+.rnd .n{margin-bottom:5px;font-variant-numeric:tabular-nums}
+.rnd .spike{position:absolute;top:3px;right:4px;width:3px;height:3px;border-radius:50%;
+  background:var(--accent);opacity:.9}
+.rnd:disabled{opacity:.4;cursor:default}
+.rndnote{margin-top:9px;font-size:11px;color:var(--faint)}
 
-.moments{list-style:none;margin:14px 0 0;padding:14px 0 0;border-top:1px solid var(--hair);
-  display:grid;gap:2px;max-height:230px;overflow:auto}
+/* ---- the map ---- */
+.mapwrap{position:relative;width:100%;aspect-ratio:1/1;border-radius:12px;overflow:hidden;
+  background:var(--hair);border:1px solid var(--hair)}
+/* Riot's minimap is white geometry on transparent, so it is inverted in the
+   light theme and held well back in both: the dots are the subject here and
+   the map is the paper they sit on. */
+.mapimg{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;
+  opacity:.4;filter:grayscale(1) contrast(1.05)}
+:root[data-theme="light"] .mapimg{opacity:.5;filter:grayscale(1) contrast(1.05) invert(1)}
+.dot{position:absolute;transform:translate(-50%,-50%);border:0;padding:0;cursor:pointer;
+  border-radius:50%;transition:transform .15s ease,opacity .15s ease}
+.dot.other{width:6px;height:6px;background:var(--faint);opacity:.5}
+.dot.mine{width:9px;height:9px;background:var(--accent);
+  box-shadow:0 0 0 2px color-mix(in srgb,var(--solid) 70%,transparent)}
+.dot.death{width:9px;height:9px;background:var(--loss);
+  box-shadow:0 0 0 2px color-mix(in srgb,var(--solid) 70%,transparent)}
+.dot:hover{transform:translate(-50%,-50%) scale(1.5);opacity:1;z-index:3}
+.dot.dim{opacity:.08;pointer-events:none}
+/* With a round picked there are only a handful left, so they stop being a
+   scatter and become the subject: full strength and a size up. */
+.mapwrap.filtered .dot:not(.dim){opacity:1;transform:translate(-50%,-50%) scale(1.3)}
+.mapwrap.filtered .dot.other{background:var(--muted)}
+.maplegend{display:flex;gap:14px;align-items:center;padding:10px 16px 0;flex-wrap:wrap}
+.key{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
+.key i{width:8px;height:8px;border-radius:50%;display:block}
+.key.mine i{background:var(--accent)} .key.death i{background:var(--loss)}
+.key.other i{background:var(--faint);opacity:.55}
+.nomap{display:grid;place-items:center;height:100%;text-align:center;padding:28px;color:var(--faint)}
+.nomap p{margin:8px 0 0;font-size:12px;color:var(--muted);max-width:30ch}
+
+/* ---- scoreboard ---- */
+.board{width:100%;border-collapse:collapse;font-size:12.5px}
+.board th{text-align:right;font-size:9.5px;text-transform:uppercase;letter-spacing:.18em;
+  color:var(--faint);font-weight:500;padding:0 0 8px}
+.board th:first-child,.board td:first-child{text-align:left}
+.board td{padding:5px 0;border-top:1px solid var(--hair);text-align:right;color:var(--muted)}
+.board tr.me td{color:var(--ink);font-weight:600}
+.board tr.me td:first-child{box-shadow:inset 2px 0 0 var(--accent);padding-left:7px}
+.board tr.foe td:first-child{color:var(--muted)}
+.who{display:flex;align-items:center;gap:7px;min-width:0}
+.who img{width:20px;height:20px;border-radius:6px;flex:none;background:var(--hair)}
+.who span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sep td{padding:0;border-top:1px solid var(--line);height:7px}
+
+.moments{list-style:none;margin:13px 0 0;padding:13px 0 0;border-top:1px solid var(--hair);
+  display:grid;gap:2px;max-height:168px;overflow:auto}
 .moment{display:flex;align-items:center;gap:10px;width:100%;border:0;background:none;color:inherit;
-  font:inherit;text-align:left;padding:7px 8px;border-radius:9px;cursor:pointer;transition:background .16s}
+  font:inherit;text-align:left;padding:6px 8px;border-radius:9px;cursor:pointer;transition:background .16s}
 .moment:hover{background:var(--hair)}
 .moment .lab{font-size:13px;font-weight:550;letter-spacing:-.01em}
 .moment .sub{font-size:11.5px;color:var(--faint)}
 .moment .st{margin-left:auto;font-size:11.5px;color:var(--muted)}
-.moment .st.no{color:var(--faint);text-decoration:line-through}
 .star-ico{width:11px;height:11px;flex:none;color:var(--accent)}
 
-.note{padding:12px 16px;font-size:12px;color:var(--muted);border-top:1px solid var(--hair)}
-.foot{margin-top:28px;padding-top:20px;border-top:1px solid var(--line);
+.note{padding:11px 16px;font-size:11.5px;color:var(--muted);border-top:1px solid var(--hair);
+  line-height:1.6}
+.empty{padding:48px 24px;text-align:center;color:var(--faint)}
+.empty p{margin:10px 0 0;font-size:13px;max-width:36ch;margin-inline:auto;color:var(--muted)}
+.foot{margin-top:26px;padding-top:18px;border-top:1px solid var(--line);
   font-size:10px;text-transform:uppercase;letter-spacing:.3em;color:var(--faint);
   display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
-.err{margin-top:12px;border:1px solid color-mix(in srgb,#e5484d 45%,transparent);border-radius:12px;
-  padding:11px 14px;font-size:13px;color:#e5484d;background:color-mix(in srgb,#e5484d 7%,transparent)}
-.err[hidden]{display:none}
 
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:var(--line);border-radius:999px}
 ::-webkit-scrollbar-track{background:transparent}
 
+@media (max-width:980px){
+  .left,.right{grid-column:span 12}
+}
 @media (max-width:900px){
-  .wrap{padding:36px 18px 56px}
-  .brand h1{font-size:30px}
+  .wrap{padding:32px 18px 56px}
+  .brand h1{font-size:28px}
   .scanrow{grid-template-columns:1fr}
-  .tile{grid-column:span 6}
-  .finds,.stage{grid-column:span 12}
+  .matches{grid-template-columns:1fr}
 }
 @media (prefers-reduced-motion:reduce){
   *{animation-duration:.001ms !important;transition-duration:.001ms !important}
   .rise{opacity:1}
 }
 ::view-transition-old(root),::view-transition-new(root){animation:none;mix-blend-mode:normal}
-::view-transition-old(root){z-index:0}
-::view-transition-new(root){z-index:1}
+::view-transition-old(root){z-index:0} ::view-transition-new(root){z-index:1}
 </style>
 </head>
 <body>
@@ -1255,25 +1515,23 @@ body{
     <div class="err" id="err" hidden></div>
   </section>
 
-  <section class="grid stats" id="stats"></section>
+  <div class="totals" id="totals"></div>
 
-  <section class="grid body">
-    <aside class="card finds">
-      <div class="head">
-        <span class="t">Finds</span>
-        <div class="seg sm" role="tablist" aria-label="Filter finds" id="filter">
-          <button type="button" role="tab" data-f="all" aria-selected="true">All</button>
-          <button type="button" role="tab" data-f="confirmed" aria-selected="false">Confirmed</button>
-        </div>
+  <section class="pick">
+    <div class="pickhead">
+      <h2 id="pickTitle">Your matches on someone's stream</h2>
+      <div class="seg sm" role="tablist" aria-label="Filter matches" id="filter">
+        <button type="button" role="tab" data-f="all" aria-selected="true">All</button>
+        <button type="button" role="tab" data-f="confirmed" aria-selected="false">Confirmed</button>
       </div>
-      <ul class="findlist" id="findlist"></ul>
-    </aside>
-
-    <section class="card stage" id="stage"></section>
+    </div>
+    <div class="matches" id="matches"></div>
   </section>
 
+  <section class="grid stageWrap" id="stageWrap"></section>
+
   <footer class="foot">
-    <span id="footleft">Timestamps measured against each broadcast</span>
+    <span>Timestamps measured against each broadcast</span>
     <span id="footright"></span>
   </footer>
 </main>
@@ -1282,16 +1540,13 @@ body{
 /* =====================================================================
    background shader - monochrome domain-warped flow.
    Nothing in awesome-components ships shader source, so this is written
-   here; the look follows reuno-ui/background-paper-shaders: greyscale
-   silk, very low contrast, slow.
+   here; the look follows reuno-ui/background-paper-shaders.
    ===================================================================== */
 (function shader(){
-  var cv = document.getElementById("shader");
-  var gl = null;
+  var cv = document.getElementById("shader"), gl = null;
   try { gl = cv.getContext("webgl", {antialias:false, alpha:true, depth:false, powerPreference:"low-power"})
              || cv.getContext("experimental-webgl"); } catch (e) { gl = null; }
   if (!gl) { cv.style.display = "none"; return; }
-
   var VS = "attribute vec2 p;void main(){gl_Position=vec4(p,0.0,1.0);}";
   var FS = [
     "precision highp float;",
@@ -1316,11 +1571,9 @@ body{
     " col+=(hash(gl_FragCoord.xy+fract(u_t)*vec2(13.0,7.0))-0.5)*0.032;",
     " gl_FragColor=vec4(col,1.0);}"
   ].join("\n");
-
   function compile(type, src){
     var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { return null; }
-    return s;
+    return gl.getShaderParameter(s, gl.COMPILE_STATUS) ? s : null;
   }
   var vs = compile(gl.VERTEX_SHADER, VS), fs = compile(gl.FRAGMENT_SHADER, FS);
   if (!vs || !fs) { cv.style.display = "none"; return; }
@@ -1328,25 +1581,18 @@ body{
   gl.attachShader(pr, vs); gl.attachShader(pr, fs); gl.linkProgram(pr);
   if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) { cv.style.display = "none"; return; }
   gl.useProgram(pr);
-
   var buf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, buf);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,3,-1,-1,3]), gl.STATIC_DRAW);
   var loc = gl.getAttribLocation(pr, "p");
   gl.enableVertexAttribArray(loc);
   gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-
-  var uRes = gl.getUniformLocation(pr, "u_res"),
-      uT   = gl.getUniformLocation(pr, "u_t"),
-      uD   = gl.getUniformLocation(pr, "u_dark"),
-      uM   = gl.getUniformLocation(pr, "u_m");
-
+  var uRes = gl.getUniformLocation(pr, "u_res"), uT = gl.getUniformLocation(pr, "u_t"),
+      uD = gl.getUniformLocation(pr, "u_dark"), uM = gl.getUniformLocation(pr, "u_m");
   var mx = 0, my = 0, tx = 0, ty = 0;
   addEventListener("pointermove", function(e){
-    tx = (e.clientX / innerWidth - 0.5) * 2;
-    ty = (0.5 - e.clientY / innerHeight) * 2;
+    tx = (e.clientX / innerWidth - 0.5) * 2; ty = (0.5 - e.clientY / innerHeight) * 2;
   }, {passive:true});
-
   function size(){
     var dpr = Math.min(devicePixelRatio || 1, 1.25);
     var w = Math.max(1, Math.round(innerWidth * dpr)), h = Math.max(1, Math.round(innerHeight * dpr));
@@ -1354,13 +1600,11 @@ body{
   }
   addEventListener("resize", size, {passive:true});
   size();
-
   var still = matchMedia("(prefers-reduced-motion: reduce)").matches;
   var t0 = performance.now(), last = 0;
   function frame(now){
     requestAnimationFrame(frame);
-    if (document.hidden) { return; }
-    if (now - last < 33) { return; }          /* ~30fps is plenty for this */
+    if (document.hidden || now - last < 33) { return; }
     last = now;
     mx += (tx - mx) * 0.045; my += (ty - my) * 0.045;
     size();
@@ -1388,10 +1632,15 @@ var hhmmss = function(sec){
   var p = function(n){ return (n < 10 ? "0" : "") + n; };
   return h ? h + ":" + p(m) + ":" + p(s) : m + ":" + p(s);
 };
+var short = function(riot){ return String(riot || "").split("#")[0]; };
+/* Riot numbers rounds from zero; people do not. Every round shown to a
+   human goes through here so the strip, the tooltips, the map and the
+   moment list can never disagree with each other. */
+var rno = function(n){ return Number(n) + 1; };
 
 var S = {
-  key: "", groups: [], sel: null, filter: "all", days: 14,
-  player: null, poll: null, tick: null, hasTwitch: true
+  key: "", groups: [], sel: null, filter: "all", days: 14, round: null,
+  player: null, poll: null, tick: null
 };
 
 /* ---- theme: ncdai/theme-switcher-1, with a circular View Transition ---- */
@@ -1410,14 +1659,12 @@ function setTheme(pref, ev){
   }
   var x = ev ? ev.clientX : innerWidth - 60, y = ev ? ev.clientY : 50;
   var far = Math.hypot(Math.max(x, innerWidth - x), Math.max(y, innerHeight - y));
-  var vt = document.startViewTransition(function(){ paint(pref); });
-  vt.ready.then(function(){
+  document.startViewTransition(function(){ paint(pref); }).ready.then(function(){
     document.documentElement.animate(
       { clipPath: ["circle(0px at " + x + "px " + y + "px)",
                    "circle(" + far + "px at " + x + "px " + y + "px)"] },
       { duration: 480, easing: "cubic-bezier(.22,1,.36,1)",
-        pseudoElement: "::view-transition-new(root)" }
-    );
+        pseudoElement: "::view-transition-new(root)" });
   }).catch(function(){});
 }
 var pref = "system";
@@ -1432,103 +1679,102 @@ $$(".themer button").forEach(function(b){
   b.addEventListener("click", function(ev){ setTheme(b.dataset.theme, ev); });
 });
 
-/* ---- segmented controls ---- */
 $$("#window button").forEach(function(b){
   b.addEventListener("click", function(){
     S.days = Number(b.dataset.days);
-    $$("#window button").forEach(function(o){
-      o.setAttribute("aria-checked", String(o === b));
-    });
+    $$("#window button").forEach(function(o){ o.setAttribute("aria-checked", String(o === b)); });
   });
 });
 $$("#filter button").forEach(function(b){
   b.addEventListener("click", function(){
     S.filter = b.dataset.f;
-    $$("#filter button").forEach(function(o){
-      o.setAttribute("aria-selected", String(o === b));
-    });
-    renderFinds();
+    $$("#filter button").forEach(function(o){ o.setAttribute("aria-selected", String(o === b)); });
+    renderMatches();
   });
 });
 
-/* ---- counters, as in the metrics block ---- */
-function countTo(el, to, suffix){
-  var from = Number(el.dataset.v || 0);
-  el.dataset.v = to;
-  if (matchMedia("(prefers-reduced-motion: reduce)").matches || from === to) {
-    el.innerHTML = to + (suffix || ""); return;
-  }
-  var t0 = performance.now(), ms = 620;
-  (function step(now){
-    var k = Math.min(1, (now - t0) / ms);
-    var e = 1 - Math.pow(1 - k, 3);
-    el.innerHTML = Math.round(from + (to - from) * e) + (suffix || "");
-    if (k < 1) { requestAnimationFrame(step); }
-  })(performance.now());
-}
-
-function renderStats(){
-  var gs = S.groups;
+/* ---- totals, now one quiet line ---- */
+function renderTotals(){
   var channels = {}, matches = {}, vods = {}, moments = 0;
-  gs.forEach(function(g){
+  S.groups.forEach(function(g){
     channels[g.channel] = 1; matches[g.match_id] = 1;
     if (!vods[g.vod_id]) { vods[g.vod_id] = g.vod_duration || 0; }
     moments += g.playable || 0;
   });
   var hours = 0;
   Object.keys(vods).forEach(function(v){ hours += vods[v]; });
-  hours = Math.round(hours / 360) / 10;
-
-  var tiles = [
-    ["Streamers", Object.keys(channels).length, "", "lobbies that were on air"],
-    ["Matches",   Object.keys(matches).length,  "", "with a broadcast behind them"],
-    ["Moments",   moments,                      "", "inside a playable window"],
-    ["Broadcast", hours,                        "h", "of footage reachable"]
-  ];
-  var box = $("#stats");
-  if (!box.children.length) {
-    box.innerHTML = tiles.map(function(t, i){
-      return '<div class="tile rise" style="animation-delay:' + (i * 0.07) + 's">' +
-             '<div class="k">' + esc(t[0]) + '</div>' +
-             '<div class="v"><span data-v="0">0</span>' +
-             (t[2] ? '<small>' + esc(t[2]) + '</small>' : '') + '</div>' +
-             '<div class="s">' + esc(t[3]) + '</div></div>';
-    }).join("");
-  }
-  $$("#stats .v span").forEach(function(el, i){ countTo(el, tiles[i][1], ""); });
+  $("#totals").innerHTML =
+    '<span><b>' + Object.keys(matches).length + '</b>matches</span>' +
+    '<span><b>' + Object.keys(channels).length + '</b>streamers</span>' +
+    '<span><b>' + moments + '</b>playable moments</span>' +
+    '<span><b>' + (Math.round(hours / 360) / 10) + 'h</b>of broadcast</span>';
 }
 
-/* ---- finds list ---- */
+/* ================= the match picker ================= */
 function visible(){
   return S.filter === "all" ? S.groups
        : S.groups.filter(function(g){ return g.verdict === "confirmed"; });
 }
-function renderFinds(){
-  var list = $("#findlist"), gs = visible();
+function pips(g){
+  var rs = (g.rounds || []);
+  if (!rs.length) { return ""; }
+  return '<span class="pips">' + rs.map(function(r){
+    return '<i class="pip ' + (r.winner ? (r.won ? "w" : "l") : "") + '"></i>';
+  }).join("") + '</span>';
+}
+function renderMatches(){
+  var box = $("#matches"), gs = visible();
   if (!gs.length) {
-    list.innerHTML = '<li class="empty" style="padding:40px 16px"><span class="eyebrow">Nothing yet</span>' +
-      '<p>' + (S.groups.length ? "No confirmed finds in this account."
-                               : "Run a scan to look for lobby-mates who were live.") + '</p></li>';
+    box.innerHTML = '<div class="card empty"><span class="eyebrow">Nothing yet</span><p>' +
+      (S.groups.length ? "No confirmed matches in this account."
+                       : "Run a scan to find lobby-mates who were live.") + '</p></div>';
+    $("#stageWrap").innerHTML = "";
     return;
   }
-  list.innerHTML = gs.map(function(g, i){
-    return '<li><button class="find rise" data-id="' + esc(g.id) + '"' +
-      ' style="animation-delay:' + Math.min(i * 0.035, 0.4) + 's"' +
+  box.innerHTML = gs.map(function(g, i){
+    var me = g.me || {};
+    var won = g.won === true, lost = g.won === false;
+    var parts = String(g.score || "").split("-");
+    return '<button class="match rise" data-id="' + esc(g.id) + '"' +
+      ' style="animation-delay:' + Math.min(i * 0.05, 0.4) + 's"' +
       ' aria-current="' + String(S.sel === g.id) + '">' +
-      '<span class="r1"><span class="ch">' + esc(g.channel) + '</span>' +
-      '<span class="badge ' + esc(g.verdict) + '">' + esc(g.verdict) + '</span>' +
-      '<span class="count mono">' + (g.playable || 0) + '</span></span>' +
-      '<span class="r2"><span>' + esc(g.map) + '</span><span class="dot"></span>' +
-      '<span>' + esc(g.score || g.mode) + '</span><span class="dot"></span>' +
-      '<span>' + esc((g.started_text || "").slice(0, 10)) + '</span></span>' +
-      '</button></li>';
+      (g.map_id ? '<span class="splash" style="background-image:url(/api/icon/mapsplash/' +
+                  esc(g.map_id) + '.png)"></span>' : '') +
+      '<span class="veil"></span>' +
+      '<span class="inner">' +
+        '<span class="mrow1">' +
+          (g.avatar
+            ? '<img class="av" src="' + esc(g.avatar) + '" alt="" loading="lazy">'
+            : '<span class="av ph">' + esc((g.channel || "?")[0].toUpperCase()) + '</span>') +
+          '<span class="mwho"><span class="ch">' + esc(g.channel_name || g.channel) + '</span>' +
+            '<span class="sub">played as ' + esc(short(g.riot_id)) + '</span></span>' +
+          '<span class="badge ' + esc(g.verdict) + '">' + esc(g.verdict) + '</span>' +
+        '</span>' +
+        '<span class="mrow2">' +
+          (me.agent_id ? '<img class="agent" src="/api/icon/agent/' + esc(me.agent_id) +
+                         '.png" alt="' + esc(me.agent) + '" title="' + esc(me.agent) +
+                         '" loading="lazy">' : '') +
+          '<span><span class="mscore">' +
+            (parts.length === 2
+              ? '<span class="' + (won ? "w" : lost ? "l" : "") + '">' + esc(parts[0]) +
+                '</span><span style="color:var(--faint)">&ndash;</span>' + esc(parts[1])
+              : esc(g.score || "")) +
+          '</span><br><span class="mmap">' + esc(g.map) + ' &middot; ' +
+            esc((g.started_text || "").slice(0, 10)) + '</span></span>' +
+          '<span class="mkda"><b>' + (me.kills || 0) + '/' + (me.deaths || 0) + '/' +
+            (me.assists || 0) + '</b><br>' + (me.damage ? me.damage + ' dmg' : '') +
+            (me.hs != null ? ' &middot; ' + me.hs + '% hs' : '') + '</span>' +
+        '</span>' +
+        '<span class="mrow3">' + pips(g) +
+          '<span class="mcount"><b>' + (g.playable || 0) + '</b> to watch</span>' +
+        '</span>' +
+      '</span></button>';
   }).join("");
-  $$("#findlist .find").forEach(function(b){
+  $$("#matches .match").forEach(function(b){
     b.addEventListener("click", function(){ select(b.dataset.id); });
   });
 }
 
-/* ---- the stage: player, scrubber, chapters, moments ---- */
 function group(){
   for (var i = 0; i < S.groups.length; i++) {
     if (S.groups[i].id === S.sel) { return S.groups[i]; }
@@ -1536,72 +1782,85 @@ function group(){
   return null;
 }
 
+/* ================= the opened match ================= */
 function renderStage(){
-  var g = group(), stage = $("#stage");
-  if (!g) {
-    stage.innerHTML = '<div class="head"><span class="t">Viewer</span></div>' +
-      '<div class="empty"><span class="eyebrow">Nothing selected</span>' +
-      '<p>Pick a find on the left to open the broadcast at your own plays.</p></div>';
-    return;
-  }
+  var g = group(), box = $("#stageWrap");
+  if (!g) { box.innerHTML = ""; return; }
   var span = g.span || {start:0, end:1};
-  var marks = [];
-  (g.rounds || []).forEach(function(r){
-    marks.push({cls:"round", at:r.at, label:"Round " + r.round, sub:"starts", off:r.offset, ok:r.playable});
-    (r.kills || []).forEach(function(k){
-      marks.push({cls:"kill", at:k.at, label:k.victim || "kill",
-                  sub:"round " + r.round + (k.weapon ? " / " + k.weapon : ""),
-                  off:k.offset, ok:k.playable});
-    });
-  });
-  (g.clips || []).forEach(function(c){
-    marks.push({cls:"star", at:c.at, label:c.label, sub:"round " + c.round,
-                off:c.offset, ok:c.playable});
-  });
 
-  stage.innerHTML =
-    '<div class="head">' +
-      '<span class="t">' + esc(g.channel) + '</span>' +
-      '<span class="t" style="letter-spacing:.18em">' + esc(g.map) + ' &middot; ' +
-        esc(g.score || g.mode) + ' &middot; ' + esc(g.timing) + '</span>' +
-    '</div>' +
-    '<div class="player" id="player"></div>' +
-    '<div class="deck">' +
-      '<div class="nowline"><span class="n" id="nowname">&mdash;</span>' +
-        '<span class="w" id="nowsub"></span>' +
-        '<span class="ts mono" id="nowts"></span></div>' +
-      '<div class="scrub" id="scrub">' +
-        '<div class="rail"></div>' +
-        '<div class="playhead" id="playhead"></div>' +
-        '<div class="tip" id="tip"></div>' +
+  box.innerHTML =
+    '<section class="card left">' +
+      '<div class="head"><span class="t">' + esc(g.channel_name || g.channel) + '</span>' +
+        '<span class="t" style="letter-spacing:.18em">' + esc(g.map) + ' &middot; ' +
+          esc(g.timing) + ' timing</span></div>' +
+      '<div class="player" id="player"></div>' +
+      '<div class="deck">' +
+        '<div class="nowline"><span class="n" id="nowname">&mdash;</span>' +
+          '<span class="w" id="nowsub"></span><span class="ts mono" id="nowts"></span></div>' +
+        '<div class="scrub" id="scrub"><div class="rail"></div>' +
+          '<div class="playhead" id="playhead"></div><div class="tip" id="tip"></div></div>' +
+        '<div class="axis"><span class="mono">' + hhmmss(span.start) + '</span>' +
+          '<span class="mono">' + hhmmss(span.end) + '</span></div>' +
+        '<div class="rounds" id="rounds"></div>' +
+        '<div class="rndnote" id="rndnote"></div>' +
+        '<ul class="moments" id="moments"></ul>' +
       '</div>' +
-      '<div class="axis"><span class="mono">' + hhmmss(span.start) + '</span>' +
-        '<span class="mono">' + hhmmss(span.end) + '</span></div>' +
-      '<div class="chapters" id="chapters"></div>' +
-      '<ul class="moments" id="moments"></ul>' +
-    '</div>' +
-    (g.reasons && g.reasons.length
-      ? '<div class="note">' + esc(g.reasons.join("  ·  ")) + '</div>'
-      : "");
+      (g.reasons && g.reasons.length
+        ? '<div class="note">' + esc(g.reasons.join("  ·  ")) + '</div>' : '') +
+    '</section>' +
+    '<div class="right">' +
+      '<section class="card">' +
+        '<div class="head"><span class="t">Where it happened</span>' +
+          '<span class="t" id="maproundlbl"></span></div>' +
+        '<div class="maplegend">' +
+          '<span class="key mine"><i></i>your kills</span>' +
+          '<span class="key death"><i></i>your deaths</span>' +
+          '<span class="key other"><i></i>everyone else</span>' +
+        '</div>' +
+        '<div style="padding:10px 16px 16px"><div class="mapwrap" id="mapwrap"></div></div>' +
+      '</section>' +
+      '<section class="card">' +
+        '<div class="head"><span class="t">Scoreboard</span>' +
+          '<span class="t">' + esc(g.score || "") + '</span></div>' +
+        '<div style="padding:4px 16px 14px"><table class="board" id="board"></table></div>' +
+      '</section>' +
+    '</div>';
 
-  /* scrubber marks */
+  renderScrub(g, span);
+  renderRounds(g);
+  renderMap(g);
+  renderBoard(g);
+  renderMoments(g);
+  mountPlayer(g);
+}
+
+function renderScrub(g, span){
   var scrub = $("#scrub"), tip = $("#tip");
   var at = function(v){
     return Math.max(0, Math.min(100, (v - span.start) / Math.max(1, span.end - span.start) * 100));
   };
+  var marks = [];
+  (g.rounds || []).forEach(function(r){
+    marks.push({cls:"round", at:r.at, label:"Round " + rno(r.round), sub:"starts", off:r.offset, ok:r.playable});
+    (r.kills || []).forEach(function(k){
+      marks.push({cls:"kill", at:k.at, label:k.victim || "kill",
+                  sub:"round " + rno(r.round) + (k.weapon ? " / " + k.weapon : ""),
+                  off:k.offset, ok:k.playable});
+    });
+  });
+  (g.clips || []).forEach(function(c){
+    marks.push({cls:"star", at:c.at, label:c.label, sub:"round " + rno(c.round),
+                off:c.offset, ok:c.playable});
+  });
   marks.sort(function(a, b){ return a.at - b.at; });
   marks.forEach(function(m){
     var b = document.createElement("button");
-    b.type = "button";
-    b.className = "mark " + m.cls;
-    b.style.left = at(m.at) + "%";
-    b.title = m.label;
-    b.innerHTML = "<i></i>";
+    b.type = "button"; b.className = "mark " + m.cls;
+    b.style.left = at(m.at) + "%"; b.title = m.label; b.innerHTML = "<i></i>";
     if (m.ok) { b.addEventListener("click", function(){ seek(m.off, m.label, m.sub); }); }
     b.addEventListener("pointerenter", function(){
       tip.innerHTML = "<b>" + esc(m.label) + "</b><span>" + esc(m.sub) + "</span>";
-      tip.style.left = at(m.at) + "%";
-      tip.classList.add("on");
+      tip.style.left = at(m.at) + "%"; tip.classList.add("on");
     });
     b.addEventListener("pointerleave", function(){ tip.classList.remove("on"); });
     scrub.appendChild(b);
@@ -1612,27 +1871,124 @@ function renderStage(){
     var k = Math.max(0, Math.min(1, (ev.clientX - box.left) / box.width));
     seek(Math.round(span.start + k * (span.end - span.start)), "Scrubbed", "");
   });
+}
 
-  /* chapter jumps: ruixenui/audio-timeline-with-chapters */
-  $("#chapters").innerHTML = (g.rounds || []).map(function(r){
-    return '<button class="chap" type="button" data-off="' + r.offset + '"' +
-      (r.playable ? "" : " disabled") + ' data-round="' + r.round + '">' + r.round + '</button>';
-  }).join("") || '<span class="lbl">No round clock in this match</span>';
-  $$("#chapters .chap").forEach(function(b){
+/* ---- round timeline: win/loss per round, spike marker, click to jump ---- */
+function renderRounds(g){
+  var host = $("#rounds");
+  var byNumber = {};
+  (g.rounds || []).forEach(function(r){ byNumber[r.round] = r; });
+  var all = Object.keys(byNumber).map(Number).sort(function(a, b){ return a - b; });
+  if (!all.length) { host.innerHTML = '<span class="lbl">No round clock in this match</span>'; return; }
+  host.innerHTML = all.map(function(n){
+    var r = byNumber[n];
+    var cls = r.winner ? (r.won ? "w" : "l") : "";
+    return '<button class="rnd ' + cls + '" type="button" data-round="' + n + '"' +
+      (r.playable ? "" : " disabled") +
+      ' aria-pressed="' + String(S.round === n) + '"' +
+      ' title="Round ' + rno(n) + (r.result ? " - " + esc(r.result) : "") + '">' +
+      '<span class="n">' + rno(n) + '</span>' +
+      (r.planted ? '<span class="spike" title="spike planted"></span>' : '') +
+      '<span class="bar"></span></button>';
+  }).join("");
+  $$("#rounds .rnd").forEach(function(b){
     b.addEventListener("click", function(){
-      seek(Number(b.dataset.off), "Round " + b.dataset.round, "start");
+      var n = Number(b.dataset.round), r = byNumber[n];
+      S.round = (S.round === n) ? null : n;
+      $$("#rounds .rnd").forEach(function(o){
+        o.setAttribute("aria-pressed", String(Number(o.dataset.round) === S.round));
+      });
+      paintDots();
+      if (r && r.playable) { seek(r.offset, "Round " + rno(n), r.result || "start"); }
     });
   });
+  var won = all.filter(function(n){ return byNumber[n].won; }).length;
+  $("#rndnote").textContent = all.length + " rounds dated from the kill clock, " +
+    won + " won. Click one to filter the map and jump there.";
+}
 
-  /* the few it thinks are best, listed */
+/* ---- the map ---- */
+function renderMap(g){
+  var host = $("#mapwrap");
+  if (!g.minimap || !(g.positions || []).length) {
+    host.innerHTML = '<div class="nomap"><span class="eyebrow">No map</span><p>' +
+      (g.minimap ? "This match was stored before kill positions were kept. Run "
+                 + "<code>clipsvalorant backfill</code> to fetch them."
+                 : "No minimap for " + esc(g.map) + " in the asset catalogue.") + '</p></div>';
+    return;
+  }
+  host.innerHTML = '<img class="mapimg" alt="' + esc(g.map) +
+    '" src="/api/icon/map/' + esc(g.map_id) + '.png">';
+  g.positions.forEach(function(p, i){
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "dot " + p.kind;
+    b.style.left = (p.mx * 100) + "%";
+    b.style.top = (p.my * 100) + "%";
+    b.dataset.round = p.round;
+    b.title = (p.killer || "?") + " killed " + (p.victim || "?") +
+              (p.weapon ? " with " + p.weapon : "") + " - round " + rno(p.round);
+    if (p.playable) {
+      b.addEventListener("click", function(){
+        seek(p.offset, short(p.killer) + " killed " + short(p.victim),
+             "round " + rno(p.round) + (p.weapon ? " / " + p.weapon : ""));
+      });
+    }
+    host.appendChild(b);
+  });
+  paintDots();
+}
+function paintDots(){
+  var lit = 0;
+  $$("#mapwrap .dot").forEach(function(d){
+    var off = S.round !== null && Number(d.dataset.round) !== S.round;
+    d.classList.toggle("dim", off);
+    if (!off) { lit += 1; }
+  });
+  var wrap = $("#mapwrap");
+  if (wrap) { wrap.classList.toggle("filtered", S.round !== null); }
+  var lbl = $("#maproundlbl");
+  if (lbl) {
+    lbl.textContent = S.round === null
+      ? lit + " kills"
+      : "round " + rno(S.round) + " · " + lit + (lit === 1 ? " kill" : " kills");
+  }
+}
+
+/* ---- scoreboard ---- */
+function renderBoard(g){
+  var rows = (g.scoreboard || []).slice();
+  if (!rows.length) { $("#board").innerHTML = ""; return; }
+  var mine = (g.me || {}).team || "";
+  rows.sort(function(a, b){
+    var at = a.team === mine ? 0 : 1, bt = b.team === mine ? 0 : 1;
+    return at - bt || b.score - a.score;
+  });
+  var html = '<thead><tr><th>Player</th><th>K</th><th>D</th><th>A</th>' +
+             '<th>DMG</th><th>HS</th></tr></thead><tbody>';
+  var side = rows.length ? rows[0].team : "";
+  rows.forEach(function(p){
+    if (p.team !== side) { html += '<tr class="sep"><td colspan="6"></td></tr>'; side = p.team; }
+    html += '<tr class="' + (p.mine ? "me" : (p.team === mine ? "" : "foe")) + '">' +
+      '<td><span class="who">' +
+        (p.agent_id ? '<img src="/api/icon/agent/' + esc(p.agent_id) + '.png" alt="' +
+                      esc(p.agent) + '" title="' + esc(p.agent) + '" loading="lazy">' : '') +
+        '<span>' + esc(p.name) + '</span></span></td>' +
+      '<td>' + p.kills + '</td><td>' + p.deaths + '</td><td>' + p.assists + '</td>' +
+      '<td>' + (p.damage || "") + '</td>' +
+      '<td>' + (p.hs != null ? p.hs + "%" : "") + '</td></tr>';
+  });
+  $("#board").innerHTML = html + '</tbody>';
+}
+
+function renderMoments(g){
   $("#moments").innerHTML = (g.clips || []).map(function(c){
     return '<li><button class="moment" type="button" data-off="' + c.offset + '"' +
       (c.playable ? "" : " disabled") + '>' +
       '<svg class="star-ico" viewBox="0 0 24 24" fill="currentColor"><path d="m12 2 2.9 6.3 6.8.8-5 4.6 1.3 6.7L12 17l-6 3.4 1.3-6.7-5-4.6 6.8-.8z"/></svg>' +
       '<span><span class="lab">' + esc(c.label) + '</span> ' +
-      '<span class="sub">round ' + c.round + '</span></span>' +
-      '<span class="st mono' + (c.playable ? "" : " no") + '">' +
-        esc(c.playable ? c.stamp : "outside") + '</span></button></li>';
+      '<span class="sub">round ' + rno(c.round) + '</span></span>' +
+      '<span class="st mono">' + esc(c.playable ? c.stamp : "outside") + '</span></button></li>';
   }).join("") || '<li class="lbl" style="padding:6px 8px">No standout moments in this one</li>';
   $$("#moments .moment").forEach(function(b){
     b.addEventListener("click", function(){
@@ -1640,8 +1996,6 @@ function renderStage(){
       seek(Number(b.dataset.off), lab ? lab.textContent : "Moment", "");
     });
   });
-
-  mountPlayer(g);
 }
 
 /* ---- Twitch embed ---- */
@@ -1653,10 +2007,9 @@ function mountPlayer(g){
   var first = (g.clips || []).filter(function(c){ return c.playable; })[0]
            || (g.rounds || []).filter(function(r){ return r.playable; })[0];
   var start = first ? first.offset : 0;
-
-  function iframe(){
+  function iframe(at){
     host.innerHTML = '<iframe allowfullscreen src="https://player.twitch.tv/?video=v' +
-      encodeURIComponent(g.vod_id) + "&time=" + hhmmss(start).replace(/:/g, "") +
+      encodeURIComponent(g.vod_id) + "&time=" + hhmmss(at).replace(/:/g, "") +
       "&parent=" + encodeURIComponent(location.hostname) + '"></iframe>';
   }
   function build(){
@@ -1676,29 +2029,25 @@ function mountPlayer(g){
         head.style.left = Math.max(0, Math.min(100, k * 100)) + "%";
         head.classList.toggle("on", k >= -0.02 && k <= 1.02);
         if (ts) { ts.textContent = hhmmss(t); }
-        /* which round the playhead is actually inside */
-        var cur = null;
-        (g.rounds || []).forEach(function(r){ if (r.at <= t) { cur = r.round; } });
-        $$("#chapters .chap").forEach(function(b){
-          b.setAttribute("aria-current", String(Number(b.dataset.round) === cur));
-        });
       }, 500);
-    } catch (e) { iframe(); }
+    } catch (e) { iframe(start); }
   }
   if (window.Twitch && window.Twitch.Player) { build(); return; }
   var s = document.createElement("script");
   s.src = "https://embed.twitch.tv/embed/v1.js";
   s.onload = build;
-  s.onerror = iframe;
+  s.onerror = function(){ iframe(start); };
   document.head.appendChild(s);
-  setTimeout(function(){ if (!S.player && !host.children.length) { iframe(); } }, 4000);
+  setTimeout(function(){ if (!S.player && !host.children.length) { iframe(start); } }, 4000);
 }
 
 function seek(sec, label, sub){
   var n = $("#nowname"), s = $("#nowsub");
   if (n) { n.textContent = label || ""; }
   if (s) { s.textContent = sub || ""; }
-  if (S.player && S.player.seek) { try { S.player.seek(sec); S.player.play && S.player.play(); return; } catch (e) {} }
+  if (S.player && S.player.seek) {
+    try { S.player.seek(sec); if (S.player.play) { S.player.play(); } return; } catch (e) {}
+  }
   var g = group(); if (!g) { return; }
   var host = $("#player");
   if (host) {
@@ -1709,8 +2058,10 @@ function seek(sec, label, sub){
 }
 
 function select(id){
+  var changed = S.sel !== id;
   S.sel = id;
-  $$("#findlist .find").forEach(function(b){
+  if (changed) { S.round = null; }
+  $$("#matches .match").forEach(function(b){
     b.setAttribute("aria-current", String(b.dataset.id === id));
   });
   renderStage();
@@ -1730,27 +2081,23 @@ function fail(msg){
   if (!msg) { e.hidden = true; return; }
   e.hidden = false; e.textContent = msg;
 }
-
 function loadClips(key){
   return api("/api/clips?key=" + encodeURIComponent(key)).then(function(j){
     S.key = j.key; S.groups = j.groups || [];
-    renderStats(); renderFinds();
-    if (!group()) { S.sel = S.groups.length ? S.groups[0].id : null; }
-    renderStage();
-    if (S.sel) { select(S.sel); }
-    $("#footright").textContent = (j.summary && j.summary.matches || 0) + " matches stored";
+    renderTotals(); renderMatches();
+    if (!group()) { S.sel = S.groups.length ? S.groups[0].id : null; S.round = null; }
+    if (S.sel) { select(S.sel); } else { $("#stageWrap").innerHTML = ""; }
+    $("#footright").textContent = ((j.summary && j.summary.matches) || 0) + " matches stored";
   });
 }
-
 function boot(){
   api("/api/state").then(function(j){
     $("#riot").value = j.default_riot_id || "";
+    var bits = String(j.default_riot_id || "").split("#");
     $("#who").innerHTML = j.default_riot_id
-      ? esc(j.default_riot_id.split("#")[0]) + '<span class="tag">#' +
-        esc(j.default_riot_id.split("#")[1] || "") + "</span>"
+      ? esc(bits[0]) + '<span class="tag">#' + esc(bits[1] || "") + "</span>"
       : "Find your plays";
     if (j.region) { var c = $("#region"); c.hidden = false; c.textContent = j.region; }
-    S.hasTwitch = !!j.has_twitch;
     if (!j.has_twitch) { fail("No Twitch credentials configured, so nothing can be confirmed from a broadcast."); }
     if (j.job && j.job.state === "running") { watch(); }
     return loadClips(j.default_key || "");
@@ -1758,10 +2105,10 @@ function boot(){
 }
 
 /* ---- scan + progress ---- */
-var PHASES = {starting:"Starting", ingest:"Reading match history", resolve:"Checking the lobby", done:"Done"};
+var PHASES = {starting:"Starting", ingest:"Reading match history",
+              resolve:"Checking the lobby", done:"Done"};
 function watch(){
-  $("#prog").hidden = false;
-  $("#go").disabled = true;
+  $("#prog").hidden = false; $("#go").disabled = true;
   if (S.poll) { clearInterval(S.poll); }
   S.poll = setInterval(poll, 700);
   poll();
@@ -1773,15 +2120,15 @@ function poll(){
     var fill = $("#pfill");
     if (j.total > 0) {
       fill.classList.remove("indet");
-      var pct = Math.round(j.done / j.total * 100);
-      fill.style.width = pct + "%";
+      fill.style.width = Math.round(j.done / j.total * 100) + "%";
       $("#ppct").textContent = j.done + " / " + j.total + "  " + j.elapsed + "s";
     } else {
       fill.classList.add("indet"); fill.style.width = "";
       $("#ppct").textContent = j.elapsed + "s";
     }
-    $("#log").textContent = (j.lines || []).join("\n");
-    var log = $("#log"); log.scrollTop = log.scrollHeight;
+    var log = $("#log");
+    log.textContent = (j.lines || []).join("\n");
+    log.scrollTop = log.scrollHeight;
     if (j.state !== "running") {
       clearInterval(S.poll); S.poll = null;
       $("#go").disabled = false;
@@ -1817,14 +2164,20 @@ addEventListener("keydown", function(e){
     if (e.key === "Escape") { e.target.blur(); }
     return;
   }
-  if (e.key === "/" ) { e.preventDefault(); $("#riot").focus(); $("#riot").select(); }
+  if (e.key === "/") { e.preventDefault(); $("#riot").focus(); $("#riot").select(); }
+  if (e.key === "Escape" && S.round !== null) {
+    S.round = null;
+    $$("#rounds .rnd").forEach(function(o){ o.setAttribute("aria-pressed", "false"); });
+    paintDots();
+  }
   if (e.key === "j" || e.key === "k") {
-    var gs = visible(); if (!gs.length) { return; }
+    var gs = visible();
+    if (!gs.length) { return; }
     var i = 0;
     for (var n = 0; n < gs.length; n++) { if (gs[n].id === S.sel) { i = n; } }
     i = Math.max(0, Math.min(gs.length - 1, i + (e.key === "j" ? 1 : -1)));
     select(gs[i].id);
-    var el = $('#findlist .find[data-id="' + gs[i].id + '"]');
+    var el = $('#matches .match[data-id="' + gs[i].id + '"]');
     if (el) { el.scrollIntoView({block: "nearest"}); }
   }
 });

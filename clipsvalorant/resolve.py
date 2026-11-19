@@ -475,12 +475,15 @@ def _remember_channel(conn: sqlite3.Connection, row: dict) -> None:
     now = db.utcnow()
     conn.execute(
         """
-        INSERT INTO twitch_channel (id, login, display_name, description, first_seen, last_seen)
-        VALUES (?,?,?,?,?,?)
+        INSERT INTO twitch_channel (id, login, display_name, description,
+                                    profile_image_url, first_seen, last_seen)
+        VALUES (?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
             login = excluded.login,
             display_name = excluded.display_name,
             description = COALESCE(excluded.description, twitch_channel.description),
+            profile_image_url = COALESCE(excluded.profile_image_url,
+                                         twitch_channel.profile_image_url),
             last_seen = excluded.last_seen
         """,
         (
@@ -488,6 +491,9 @@ def _remember_channel(conn: sqlite3.Connection, row: dict) -> None:
             row.get("broadcaster_login") or row.get("login") or "",
             row.get("display_name"),
             row.get("description"),
+            # Only /helix/users carries this; a search hit does not, which is
+            # why it is coalesced rather than overwritten.
+            row.get("profile_image_url") or row.get("thumbnail_url"),
             now,
             now,
         ),

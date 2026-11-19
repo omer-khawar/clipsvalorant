@@ -150,6 +150,38 @@ def ingest_file_cmd(
 
 
 @app.command()
+def backfill(
+    limit: Annotated[
+        int, typer.Option(help="How many matches to re-fetch in one go.")
+    ] = 25,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """Re-fetch matches stored before kill coordinates were kept.
+
+    Costs one API call per match, so it is yours to run rather than something
+    a scan does quietly. Without it, matches ingested earlier have no map
+    view: the payload that carried the coordinates was trimmed on the way to
+    disk, and nothing local can bring them back.
+    """
+    _setup_logging(verbose)
+    cfg = _config()
+    from clipsvalorant.ingest import backfill as run_backfill
+
+    report = run_backfill(cfg, limit=limit)
+    if not report.seen:
+        typer.echo("Every stored match already has its full detail.")
+        return
+    typer.echo(
+        f"{report.seen} match(es) were missing detail; "
+        f"re-fetched {report.stored}, failed {report.failed}."
+    )
+    if report.skipped:
+        typer.echo(f"{report.skipped} left - run it again to continue.")
+    for err in report.errors:
+        typer.secho(f"  ! {err}", fg=typer.colors.YELLOW, err=True)
+
+
+@app.command()
 def recompute(
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
