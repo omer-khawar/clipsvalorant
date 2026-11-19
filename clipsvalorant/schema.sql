@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS match (
     rounds_won        INTEGER,
     rounds_lost       INTEGER,
     ingested_at       TEXT NOT NULL,
+    -- When the streamer search last ran over this match, and how often. A VOD can
+    -- appear hours after the match and clips accumulate for days, so a young match
+    -- is worth re-checking; an old one is past Twitch's retention and never is.
+    last_resolved_at  TEXT,
+    resolve_attempts  INTEGER NOT NULL DEFAULT 0,
     raw_json          TEXT NOT NULL           -- source of truth; schemas drift
 );
 

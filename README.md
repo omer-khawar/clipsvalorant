@@ -6,9 +6,11 @@ was streaming, jump straight to the moment you killed them, from their point of 
 A free personal replacement for [klips.live](https://klips.live/).
 Full design in [PLAN.md](PLAN.md).
 
-**Status: Phase 1 complete and validated against tracker.gg.** Match ingest works — it pulls your match history, stores
-every kill with its millisecond offset, and finds your aces, 4Ks, 3Ks and clutches.
-Phase 2 turns those offsets into Twitch VOD links.
+**Status: working end to end.** Match ingest is validated against tracker.gg — it pulls
+your match history, stores every kill with its millisecond offset, and finds your aces,
+4Ks, 3Ks and clutches. The streamer search turns those offsets into Twitch VOD links and
+confirms them by reading the broadcast itself. `python -m clipsvalorant serve` puts the
+whole thing behind a page with a player in it.
 
 ---
 
@@ -54,6 +56,39 @@ Discord before you run it on a schedule.
 python -m clipsvalorant init
 ```
 Creates the database and applies the schema.
+
+```bash
+python -m clipsvalorant serve
+```
+The web UI, and the easiest way in. Opens <http://localhost:8765/>: type a Riot ID,
+press Search, and the moments it finds play in an embedded Twitch player right on the
+page — no copying timestamps into the address bar.
+
+Opening the page costs nothing. The clip list is read straight out of SQLite, so
+everything found on earlier runs is there instantly; only pressing **Search** goes out
+to Riot and Twitch. The log underneath the search box is the live progress of that run,
+match by match, because reading a broadcast takes long enough that a silent minute
+looks like a hang.
+
+Three things on the page are worth knowing about:
+
+- **Each account gets its own database.** `is_me` is a column, not a query — kills,
+  highlights and the whole notion of *your* plays are derived from it when a match is
+  stored — so two accounts sharing one file would mean one of them silently owning the
+  other's highlights. Searching `Someone#ELSE` writes `data/ui-someone-else.db`, and
+  the dropdown lists every account searched on this machine.
+- **Confirmed and unverified are kept apart,** with the evidence behind each verdict one
+  click away under *why we think this is them*. An unverified channel was broadcasting
+  across your match and nothing more; a short Riot ID collides with an established
+  streamer more often than not.
+- **A moment outside the broadcast is shown, not hidden.** A stream that began at round
+  14 cannot contain round 2, and one that ended early cannot contain the last round.
+  Both say so on the button instead of linking somewhere wrong — Twitch answers an
+  over-long offset with the last frame and no error, which looks exactly like a bad
+  detection.
+
+The server binds to localhost only. The page has no authentication, and anything that
+reached it could spend this machine's API quota.
 
 ```bash
 python -m clipsvalorant ingest --limit 20
@@ -154,40 +189,240 @@ a known difference rather than contorting the model to match.
 Getting tracker's data out needs a real browser: `api.tracker.gg` returns 403 to
 automated clients, and the match list lives in the page's own `TRN_PINIA` store.
 
-### How a streamer is confirmed, and why the obvious test is not enough
+### How a streamer is confirmed, and the two ways to get it wrong
 
-Finding the channel is the easy half. Proving it is the right person is the whole problem.
+Finding the channel is the easy half. Proving it is the right person is the whole
+problem, and it has two failure modes that pull in opposite directions.
 
-The natural test — does this channel have a past broadcast that spans my match? — is worth
-almost nothing on its own. It asks whether somebody was **broadcasting**, never what was on
-screen, and a channel that streams daily passes it for any match ever played. A lobby-mate
-called `Curry#2622` was duly matched to `twitch.tv/curry`, a radiant Valorant streamer, on an
-exact name match plus a broadcast that covered the match. Wrong person: the real Curry was a
-friend with no channel, and the broadcast in question was titled *SECRET DEADLOCK STREAM* —
-a different game entirely. Riot IDs are 3–16 characters, so every short one already belongs
-to somebody on Twitch.
+**Confirming someone who was not there.** The natural test — does this channel have a
+broadcast spanning my match? — is worth almost nothing alone. It asks whether somebody was
+*broadcasting*, never what was on screen, and a channel that streams daily passes it for any
+match ever played. A lobby-mate called `Curry#2622` was duly matched to `twitch.tv/curry`, a
+radiant Valorant streamer, on an exact name match plus a covering broadcast. Wrong person:
+the real Curry was a friend with no channel, and that broadcast was titled *SECRET DEADLOCK
+STREAM*.
 
-So the layers that *find* candidates are kept strictly separate from the rule that **confirms**
-them. A candidate is confirmed only by evidence tying the channel to that particular match:
+**Missing someone who was.** The fix for the above was to demand hard evidence — a Valorant
+clip cut from the covering VOD inside the match window. That quietly introduced the opposite
+bug, because *only streamers with an audience ever get clipped*. `CocaPup#slay` was streaming
+the whole of a Sunset match from the enemy team, on `twitch.tv/cocapuppy`, under the title
+*"short valo stream!! !nt !lurk"*, with a bio reading *"WELCOME!!! I am CocaPup!!"* — and we
+reported that match as empty. Two rules hid them: Layer 1 demanded an *exact* name match, so
+`cocapup` != `cocapuppy` meant no candidate was ever created; and confirmation demanded a clip
+that a self-described new streamer will never have.
 
-- **a Valorant clip cut from the covering VOD at an offset inside the match.** Clips carry
-  `video_id`, `vod_offset` and `game_id`, which makes them the only way to reconstruct what a
-  past broadcast contained: `GET /helix/videos` carries no game id, and `GET /helix/streams`
-  only answers for channels that are live right now.
-- **a Riot ID the channel advertises itself**, in its bio or a VOD title, with the tagline
-  agreeing and not just the name.
+So candidate generation is deliberately **loose** and confirmation is **strict**. That split
+is the design. Generation casts wide — exact names plus prefix near-misses, capped at six per
+player because a four-character Riot ID like `Nuke` resembles hundreds of channels. Then a
+candidate is confirmed only by:
 
-A candidate is ruled out when clips exist for that broadcast and none are Valorant, when every
-Riot ID the channel advertises has a different tagline, or when no broadcast holds at least 60%
-of the match.
+- **the lobby's own names, read off the broadcast** - four or more of the *other* players in
+  the match appearing on screen in that VOD. Decisive, independent of channel size, and the
+  only signal that can also rule a candidate *out*. See *Reading the broadcast* below; or
+- **a Valorant clip cut from the covering VOD at an offset inside the match** — decisive, and
+  the only signal that is independent of channel size. Clips carry `video_id`, `vod_offset`
+  and `game_id`, which is the one way to reconstruct what a past broadcast contained, since
+  `GET /helix/videos` carries no game id and `GET /helix/streams` only answers for channels
+  live right now; or
+- **a Riot ID the channel advertises**, name and tagline both agreeing; or
+- **three weak signals agreeing**: the channel is named for the player, its bio names them in
+  plain words, and the broadcast was Valorant. None of these is worth much alone. Together
+  they reach the small streamers that clip evidence structurally cannot.
 
-Everything else — an exact name match and a broadcast spanning the match included — is printed
-as **unverified**, under a heading saying so, and is never written to the alias table. That last
-part matters: the alias table is consulted first on every later match, so one wrong row is
-permanent and comes back looking like corroboration.
+Ruled out when we read the broadcast and the match was not in it, when the broadcast's clips
+are all some other game, when its title names another game, when every advertised Riot ID has
+a different tagline, or when no broadcast holds at least 60% of the match.
 
-The broadcast title is always printed. It is free, and it is what would have caught the
-collision above.
+Two details that carry more weight than they look like they should. The **broadcast title** is
+a free game check — *"short valo stream"* against *"SECRET DEADLOCK STREAM"* — and a
+watchparty or react title counts against, because watching VCT is not playing it. And a bare
+name in a **bio** is matched only as a whole word after emails, URLs and bare domains are
+stripped; without that, `curry@proxy.gg` and `curry.gg` re-confirm the wrong curry.
+
+Everything below confirmed prints as **unverified**, under a heading saying so, and is never
+written to the alias table — the alias table is consulted first on every later match, so one
+wrong row is permanent and comes back looking like corroboration.
+
+A VOD is chosen by **seconds of overlap**, not pass/fail coverage. A stream picked up two
+minutes into a match still holds every later round; the link maths refuses to point at a
+moment before the stream began rather than clamping to `t=0`.
+
+### Reading the broadcast
+
+Everything above this point is circumstantial. A name that matches, a title that says
+valorant, a stream that was running at the right minute: all of it is consistent with the
+right person and equally consistent with a stranger who happened to be live. The only thing
+that settles it is opening the video and looking, which is what klips.live means when it says
+it confirms the streamer from their saved video.
+
+Valorant paints the lobby's names on screen constantly - the killfeed, the combat report in
+the corner, the round-end scoreboard, the *switch player* banner while you are dead and
+spectating. The match history already gives us all ten names and the millisecond of every
+kill. So the test is direct: seek to a moment when something was happening, read the text, and
+count how many of those ten names come back.
+
+`yt-dlp` turns a VOD id into an HLS playlist and `ffmpeg` seeks it for a single frame. Seeking
+a Twitch DVR playlist is cheap - a frame from eight hours into a broadcast costs about two
+seconds, not an eight-hour download - and frames are cached, so re-running a sweep re-reads
+nothing.
+
+Which seconds to sample matters more than how many. Round ends are tried first, because the
+scoreboard shows all ten names at once; kills come second, where the killfeed shows two.
+Sampling stops the moment the answer is certain.
+
+Measured on the four broadcasts where the answer was already known by other means:
+
+| broadcast | what was actually on screen | lobby names read |
+| --- | --- | --- |
+| `twitch.tv/vaerie` | our Corrode match | **9** of 10, on the first frame |
+| `twitch.tv/cocapuppy` | our Sunset match | **10** of 10, on the first frame |
+| `twitch.tv/solly17x` | Resident Evil | 0, over 10 frames |
+| `twitch.tv/curry` | Deadlock | 0, over 10 frames |
+
+There is no grey zone between nine and zero to tune a threshold into, which is the nicest
+property a signal can have. Four distinct names is the bar, counted after the channel's own
+name is discarded (see *Checking for the streamers we missed*). Two things make a small number
+decisive: the broadcast already overlaps this match's wall-clock, and at that moment those ten
+people were in that match - so seeing four of them means the broadcaster was in it too.
+
+It cuts both ways, and that is the point. `Solly#Busta` matched `twitch.tv/solly17x` on a
+prefix, with a VOD covering the whole match and a title - *"finishing it."* - that gave
+nothing away either direction. It sat as **unverified** because nothing could decide it. It
+was a Resident Evil campaign. This is the only layer that can rule a candidate out on evidence
+rather than on the absence of it, so it outranks every circumstantial signal beneath it: a
+broadcast we have read and found the match missing from is rejected even when the name, the
+bio and the title all agree.
+
+One honest limitation. A match timer at the top of the screen is *not* Valorant's alone -
+Deadlock draws one within pixels of the same place - so a timer never counts as evidence of
+Valorant by itself. Only Valorant's own furniture does: *COMBAT REPORT*, *BUY PHASE*, *ROUND
+ONGOING*, *SWITCH PLAYER*.
+
+This layer is optional. It needs `yt-dlp` and `ffmpeg` on `PATH` plus
+`pip install 'clipsvalorant[vision]'`; without any of them every other layer works unchanged
+and the resolver reports what is missing rather than failing. Turn it off with `--no-watch`.
+
+### Measured across the rank ladder
+
+Run over nine accounts spanning the NA top-500 ladder plus one ordinary account,
+43 matches in all, 1,500 candidates generated:
+
+| account | ladder rank | matches | confirmed |
+| --- | ---: | ---: | --- |
+| MIBR zekken | 1 | 5 | `yay -> yayster` (x2) |
+| twitch stunna | 3 | 5 | - |
+| enzo | 10 | 5 | `KILLERJOHNSON77 -> killerjohnson77` |
+| dont speak to me | 60 | 5 | `Redefy -> redefy`, `punz -> punz` |
+| aika | 150 | 5 | - |
+| spaceuk | 250 | 5 | `Subroza -> subroza`, `reduxx -> reduxxval` |
+| Hayden Patriquin | 350 | 5 | `Marved -> marved6` |
+| houu | 480 | 5 | - |
+| Xeppaa | 6 | 3 | `GeneralSteak -> generalsteakt` |
+
+Twelve confirmations in 43 matches, against two in the 44 matches of an ordinary
+account. The difference is not the detector; it is who you are matched against.
+High-elo lobbies are dense with people who stream for a living, and the names
+coming back - yay, Subroza, Marved, punz - are exactly the ones you would expect.
+
+**Speed.** Between 28 and 152 seconds for five matches, averaging about 19
+seconds per match end to end, of which ingest is 3-4 seconds and the rest is
+Twitch search. A fresh 20-match history lands in six or seven minutes. Reading
+broadcasts barely registers: only VODs that survived are opened, sampling stops
+the moment it is certain, and 169 frames covered all 43 matches. One confirmation
+took a single frame.
+
+### Checking for the streamers we missed
+
+A false positive announces itself: you click a link and a stranger is playing
+Deadlock. A false negative is silent - a streamer we quietly binned looks exactly
+like a match where nobody was streaming. So the two need very different checks,
+and only one of them can be done by reading the output.
+
+Sorting every rejection in a 44-match database by *why* it was rejected:
+
+| reason | count |
+| --- | ---: |
+| no broadcast of that match survived at all | 1,775 |
+| the title named another game | 4 |
+| every clip from it was another game | 3 |
+| we read the broadcast and the match was not in it | 1 |
+
+So 99.6% of rejections are not judgements. There is no video; nothing was weighed
+and nothing could have been decided differently. Only **seven** were decisions,
+which is the entire surface a missed streamer could be hiding behind. `audit`
+walks exactly that surface, re-reading each one with twice the usual frame budget:
+
+```bash
+python -m clipsvalorant audit --limit 200 --frames 20
+```
+
+On the database above it overturned nothing. What it did turn up was more
+interesting than a flipped verdict.
+
+**Every non-Valorant broadcast it re-read returned exactly one "lobby name".**
+`twitch.tv/curry` showed CURRY, `twitch.tv/rogue` showed Rogue, `sacred` showed
+their Apex in-game name `sacred_NRG`. None is a coincidence: a channel is only a
+candidate *because* its name resembles the player's, so its own watermark, overlay
+and title card name something very like that player by construction. It is the
+candidate agreeing with itself.
+
+That is now excluded. When reading a broadcast for player P, P's own name does not
+count - only the other nine, about whom nothing on that channel predicts anything.
+Without the exclusion every name-matched channel with a surviving VOD sat one weak
+signal away from confirmation; with it, the evidence is independent of the reason
+we looked. It costs nothing in recall: the broadcast that returned all ten lobby
+names still returns nine.
+
+The remaining false-negative surface is almost entirely **candidate generation** -
+channels we never thought to look at, because the name resembles nothing and
+nobody clipped them. Reading a broadcast cannot help with a broadcast we never
+open. That is the next thing worth building, not a better verdict rule.
+
+### Measuring recall, and the layer that was not built
+
+Knowing what the tool claims is easy; knowing what it misses is not. A missed
+streamer is indistinguishable from a match where nobody streamed, so the only way
+to find out is to build a second detector that fails differently and see what it
+turns up.
+
+Layer 4 already fetches every Valorant clip made during a match, which names the
+channels demonstrably live on Valorant at that moment. It then keeps only those
+whose name resembles a lobby member or whose bio advertises a Riot ID. The obvious
+next layer is to stop filtering: read *every* covering broadcast and keep whichever
+show four or more lobby names, regardless of what they are called.
+
+That is affordable, which was itself a surprise. A clip names the VOD it came from,
+and `/helix/videos` takes a hundred video ids per call, so a whole match's pool of
+broadcasts costs one request instead of one per channel - 89 VODs in a single call
+where the naive form made 114. A single frame at a round end shows the entire
+scoreboard, so one frame decides nearly every VOD, and frame fetching parallelises
+about 3.6x. A match goes from sixteen minutes to roughly ninety seconds.
+
+So it was built as a measurement, run over ten matches, reading about 1,100 covering
+broadcasts exhaustively:
+
+| | |
+| --- | ---: |
+| streamers it found that the name-based detector missed | **0** |
+| streamers the name-based detector found that it missed | **2** |
+
+It never once beat the existing funnel, and it was blind twice: `cocapuppy`, whose
+stream was titled *"short valo stream!! !nt !lurk"*, and `redefy` - neither of whom
+anybody had clipped, so neither appeared in the pool at all. That is the same
+audience bias that made clip evidence alone miss small streamers in the first place.
+
+The two approaches have complementary blind spots, and the exhaustive one is the
+weaker: it cannot see a streamer nobody clips, while names reach anyone. So the
+layer was measured and then not built. The code that made it affordable
+(`videos_by_id`) is kept, because it is the cheap way to ask about many broadcasts
+at once.
+
+One honest limit remains: none of this yields an *absolute* recall figure, and no
+amount of effort will. Twitch has no endpoint that answers "who was broadcasting
+this game at this time" - `/helix/streams` is live-only, `/helix/videos` needs a
+user id, and clips only surface channels somebody clipped. Every possible oracle is
+itself a biased sample. What can be said is that the best available independent
+check, run exhaustively, found nothing the funnel had missed.
 
 ### The real bottleneck is VOD retention, not identity
 
@@ -210,6 +445,44 @@ a VOD can be looked up days later — but the window is days, not weeks. A match
 fortnight after it was played usually has nothing left to link to, however well the player is
 identified. Run `resolve` within a few days of playing, or on a schedule, and the same matches
 that come back empty now would have resolved while the VODs existed.
+
+### Running it on a schedule
+
+Everything above is about identifying people correctly. This is about looking in
+time, and on the evidence it matters more. 1,775 of 1,783 rejections were "no
+broadcast survived", so the deciding factor in whether a streamer is ever found is
+*when* you look, not how cleverly.
+
+```bash
+python -m clipsvalorant sweep --dry-run   # what it would do, fetching nothing
+python -m clipsvalorant sweep --quiet     # a pass; prints only when it finds somebody
+```
+
+A sweep ingests new matches and then resolves only what is worth resolving:
+
+- **older than 14 days** - never. Twitch has deleted the broadcasts; there is
+  nothing left to find and asking costs a call per player.
+- **never looked at** - always.
+- **young, unsettled, last looked at a while ago** - again, up to five times. A VOD
+  is published when the broadcast *ends*, which can be hours after the match, and
+  viewers keep cutting clips from it for days. The evidence that confirms a streamer
+  mostly arrives after the match does, so a single look at ingest time is not enough.
+- **already confirmed, or out of attempts** - no. Stop spending quota on a settled
+  question.
+- **no highlights of your own** - no. Finding a streamer there would produce nothing
+  to link to.
+
+`--quiet` prints only when something was confirmed, which is what you want from
+anything that mails you its output. Run it a few times a day; there is no value in
+running it more often than VODs appear, and none at all in running it on matches
+past retention.
+
+For a match that has only just ended the broadcast may still be running, and
+`/helix/streams` will say what the channel is playing. That is the one authoritative
+game check available, and the only one a title cannot lie to - one broadcast in this
+sample was titled *VCT OQ Watchparty* while showing Deadlock. It is corroboration,
+never a confirmation: being live on Valorant now says nothing about who was in a
+lobby an hour ago.
 
 ### Four things that make highlight detection subtle
 

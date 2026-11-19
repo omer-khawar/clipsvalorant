@@ -14,6 +14,8 @@ from clipsvalorant.resolve import (
     _prefix_related,
     _same_id,
     _tags_in,
+    bio_names,
+    game_from_title,
     normalise,
     riot_ids_in,
     vod_link,
@@ -169,3 +171,59 @@ def test_normalise_strips_everything_but_letters_and_digits():
 def test_vod_links_never_go_negative():
     assert vod_link("7", -50).endswith("t=00h00m00s")
     assert vod_link("7", 3725).endswith("t=01h02m05s")
+
+
+# --- the false-negative regression -------------------------------------
+#
+# klips found a streamer in a Sunset match that we reported as empty. It was
+# CocaPup#slay -> twitch.tv/cocapuppy: a VOD titled "short valo stream!! !nt
+# !lurk" covering the whole match, a bio reading "I am CocaPup!!", and nobody
+# had ever clipped it. Two separate rules kept it invisible. Layer 1 demanded an
+# exact name match, so no candidate was ever created; and confirmation demanded
+# a clip, which a brand-new streamer will never have. Requiring clips does not
+# just lose coverage, it biases the whole tool toward streamers with an audience.
+
+
+def test_a_small_streamer_with_no_clips_can_still_be_confirmed():
+    ev = Evidence(
+        name_prefix=True, vod_covers=True, match_len_s=2348, vod_overlap_s=2348,
+        clips_on_vod=0, bio_names_player=True, title_says_valorant=True,
+    )
+    assert ev.verdict() == "confirmed"
+
+
+def test_the_name_alone_is_still_not_enough():
+    """Same channel shape, but the bio does not name them: not confirmed."""
+    ev = Evidence(
+        name_prefix=True, vod_covers=True, match_len_s=2348, vod_overlap_s=2348,
+        title_says_valorant=True,
+    )
+    assert ev.verdict() == "likely"
+
+
+def test_a_title_naming_another_game_rules_out_even_an_exact_name():
+    ev = Evidence(
+        name_exact=True, vod_covers=True, match_len_s=1516, vod_overlap_s=1516,
+        title_says_other_game="deadlock",
+    )
+    assert ev.verdict() == "rejected"
+
+
+def test_watching_valorant_is_not_playing_valorant():
+    assert game_from_title("VCT OQ Watchparty") == (False, "watchparty")
+    assert game_from_title("short valo stream!! !nt !lurk") == (True, "")
+    assert game_from_title("SECRET DEADLOCK STREAM") == (False, "deadlock")
+
+
+def test_a_bio_names_a_player_but_not_through_an_email():
+    assert bio_names("WELCOME!!! I am CocaPup!! I am a new streamer", "CocaPup")
+    # The one that would have re-confirmed the wrong curry.
+    assert not bio_names("BUSINESS : curry@proxy.gg", "Curry")
+    assert not bio_names("follow me at curry.gg for more", "Curry")
+    assert not bio_names("stand on my money im 4'8", "vae")
+
+
+def test_prefix_generation_needs_a_long_enough_name():
+    """'Nuke' resembles hundreds of channels; 'CocaPup' resembles a handful."""
+    assert _prefix_related("CocaPup", "cocapuppy", min_len=5)
+    assert not _prefix_related("Nuke", "nuke73", min_len=5)
