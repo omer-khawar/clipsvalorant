@@ -1,6 +1,7 @@
 """Command line interface.
 
     python -m clipsvalorant init
+    python -m clipsvalorant serve              # the web UI, with the player
     python -m clipsvalorant ingest --limit 20
     python -m clipsvalorant ingest-file tests/fixtures/match_v4_sample.json
     python -m clipsvalorant matches
@@ -10,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import datetime as _dt
 import sys
 from datetime import datetime, timezone
 from typing import Annotated, Optional
@@ -211,6 +213,10 @@ def resolve(
     ] = None,
     limit: Annotated[int, typer.Option(help="How many recent matches to check.")] = 5,
     lead: Annotated[int, typer.Option(help="Seconds of lead-in before each moment.")] = 8,
+    watch_vods: Annotated[bool, typer.Option(
+        "--watch/--no-watch",
+        help="Open each covering VOD and read the screen to confirm the match.",
+    )] = True,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
     """Find players in your matches who were streaming, and print VOD links."""
@@ -235,7 +241,7 @@ def resolve(
     from clipsvalorant.twitch import TwitchError
 
     try:
-        report = resolve_recent(cfg, limit=limit, match_id=match)
+        report = resolve_recent(cfg, limit=limit, match_id=match, watch_vods=watch_vods)
     except TwitchError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
@@ -248,8 +254,8 @@ def resolve(
         typer.echo(
             "\nNo streamers found. Either nobody in those lobbies was live, their VODs\n"
             "have expired (Twitch keeps them roughly 7-14 days), or their Twitch name\n"
-            "differs from their in-game name - the case klips.live says covers 72% of\n"
-            "streamers, which needs the Phase 5 layer."
+            "differs from their in-game name - the case klips.live says covers 72%\n"
+            "of streamers."
         )
         return
 
@@ -282,6 +288,7 @@ def resolve(
 
 def _show(conn, cand, lead: int, *, colour: str, marker: str) -> None:
     """One candidate: who, where, on what evidence, and the timestamps."""
+    from clipsvalorant import calibrate
     from clipsvalorant.resolve import vod_link
 
     # Keyed on the match this candidate came from. A channel that streams daily
@@ -313,12 +320,20 @@ def _show(conn, cand, lead: int, *, colour: str, marker: str) -> None:
     ).fetchall()
     if not highlights:
         typer.echo("      (no highlights of yours in this match)")
+    cal = calibrate.load(conn, row["id"], cand.vod.id)
+    if not cal.measured and highlights:
+        typer.secho(
+            f"      (start of match not read off the broadcast; these use the "
+            f"{cal.shift_s:.0f}s median and may be seconds out)",
+            fg=typer.colors.BRIGHT_BLACK,
+        )
     for h in highlights:
-        offset = (
-            row["started_at_epoch"]
-            + h["time_in_match_ms"] // 1000
-            - cand.vod.created_epoch
-            - lead
+        offset = calibrate.moment_offset(
+            match_start_epoch=row["started_at_epoch"],
+            vod_created_epoch=cand.vod.created_epoch,
+            time_in_match_ms=h["time_in_match_ms"],
+            shift_s=cal.shift_s,
+            lead_s=lead,
         )
         # A stream that started mid-match simply does not contain the earlier
         # moments. Say so rather than silently linking to t=0.
@@ -331,6 +346,135 @@ def _show(conn, cand, lead: int, *, colour: str, marker: str) -> None:
         typer.echo(
             f"      round {h['round']:>2}  {h['label']:<13} {vod_link(cand.vod.id, offset)}"
         )
+
+
+@app.command()
+def sweep(
+    limit: Annotated[int, typer.Option(help="How many recent matches to list.")] = 20,
+    mode: Annotated[
+        Optional[str],
+        typer.Option(help="Queue filter. Omit for every mode, which is what a sweep wants."),
+    ] = None,
+    lead: Annotated[int, typer.Option(help="Seconds of lead-in before each moment.")] = 8,
+    quiet: Annotated[
+        bool, typer.Option("--quiet", "-q", help="Only print when something was found.")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Say what would be resolved, fetch nothing.")
+    ] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """Ingest new matches and resolve the ones still worth resolving.
+
+    Built to run unattended on a schedule. Twitch deletes past broadcasts after
+    7-14 days, so a match resolved a fortnight late usually has nothing left to
+    link to however well the players are identified - running regularly is what
+    actually finds streamers, not a cleverer search.
+    """
+    _setup_logging(verbose)
+    cfg = _config()
+    from clipsvalorant.sweep import sweep as run_sweep
+
+    started = _dt.datetime.now(_dt.timezone.utc)
+    report = run_sweep(cfg, limit=limit, mode=mode, dry_run=dry_run)
+
+    found = bool(report.confirmed)
+    if not quiet or found:
+        typer.echo(f"[{started.strftime('%Y-%m-%d %H:%M:%S')}Z] {report.summary()}")
+    for err in report.errors:
+        typer.secho(f"  ! {err}", fg=typer.colors.YELLOW, err=True)
+
+    if not found:
+        if not quiet:
+            typer.echo("No new streamers confirmed this pass.")
+        return
+
+    with db.session(cfg.db_path) as conn:
+        typer.secho("\nCONFIRMED", fg=typer.colors.GREEN, bold=True)
+        for cand in report.confirmed:
+            _show(conn, cand, lead, colour=typer.colors.GREEN, marker="->")
+
+
+@app.command()
+def audit(
+    limit: Annotated[int, typer.Option(help="How many rejections to re-examine.")] = 100,
+    frames: Annotated[int, typer.Option(help="Frame budget per broadcast.")] = 20,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """Re-open broadcasts we ruled out, and check whether we were wrong.
+
+    False positives announce themselves - you click a link and a stranger is
+    playing Deadlock. False negatives are silent: a streamer we quietly binned
+    looks exactly like a match where nobody was streaming. This is the check
+    for those.
+    """
+    _setup_logging(verbose)
+    cfg = _config(require_api_key=False)
+    from clipsvalorant.resolve import audit_verdicts
+
+    flips, notes = audit_verdicts(cfg, limit=limit, frames=frames)
+    for note in notes:
+        typer.echo(note)
+    if not flips:
+        typer.secho(
+            "\nNo rejection overturned. Every broadcast we ruled out stayed ruled out.",
+            fg=typer.colors.GREEN,
+        )
+        return
+    typer.secho(f"\n{len(flips)} rejection(s) were WRONG:", fg=typer.colors.RED, bold=True)
+    for flip in flips:
+        typer.secho(f"  {flip}", fg=typer.colors.RED)
+    typer.echo("\nThese have been corrected to confirmed. Run 'highlights' for links.")
+
+
+@app.command(name="calibrate")
+def calibrate_cmd(
+    limit: Annotated[int, typer.Option(help="How many encounters to measure.")] = 50,
+    force: Annotated[
+        bool, typer.Option("--force", help="Re-measure ones already measured.")
+    ] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """Measure where each confirmed match really starts inside its broadcast.
+
+    A match carries one wall-clock timestamp and one in-match clock, and they
+    do not share a zero: the timestamp is the queue popping, the clock starts
+    when the map loads. Agent select and loading sit in between - 101, 109 and
+    125 seconds on the three broadcasts this was measured against - so adding
+    the two together lands about a round and a half early.
+
+    This reads the countdown off the screen and writes down the real gap. It
+    costs frames, not API calls.
+    """
+    _setup_logging(verbose)
+    cfg = _config(require_api_key=False)
+    from clipsvalorant.calibrate import backfill
+
+    notes = backfill(cfg, limit=limit, force=force)
+    for note in notes:
+        typer.echo(note)
+    typer.secho("\nLinks will now point at the play rather than a round before it.",
+                fg=typer.colors.GREEN)
+
+
+@app.command()
+def serve(
+    port: Annotated[int, typer.Option(help="Port to listen on. Taken? the next free one.")] = 8765,
+    host: Annotated[str, typer.Option(help="Interface to bind. Localhost by default.")] = "127.0.0.1",
+    open_browser: Annotated[
+        bool, typer.Option("--open/--no-open", help="Open a browser window.")
+    ] = True,
+) -> None:
+    """Start the local web UI: search for a Riot ID and watch what it finds.
+
+    Bound to localhost, because the page has no authentication and would hand
+    anyone who reached it the ability to spend this machine's API quota.
+    """
+    cfg = _config(require_api_key=False)
+    from clipsvalorant.web import serve as run_server
+
+    run_server(cfg, host=host, port=port, open_browser=open_browser,
+               say=lambda line: typer.echo(line))
 
 
 @app.command()

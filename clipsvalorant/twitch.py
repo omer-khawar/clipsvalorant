@@ -244,6 +244,69 @@ class TwitchClient:
             )
         return out
 
+    def live_now(self, channel_ids: list[str]) -> dict[str, str]:
+        """Which of these channels are live this second, and on what game.
+
+        Returns channel id -> game_id. The only endpoint that answers
+        authoritatively what a channel is playing, and it answers only for
+        right now: there is no historical form, which is the whole reason the
+        rest of this program reconstructs the past from clips and pixels.
+
+        Useful on a match that has just ended, where the broadcast is still in
+        progress. A title can lie and often does -- one broadcast here was
+        titled "VCT OQ Watchparty" while showing Deadlock -- and this cannot.
+        """
+        out: dict[str, str] = {}
+        for start in range(0, len(channel_ids), 100):
+            chunk = channel_ids[start:start + 100]
+            if not chunk:
+                continue
+            try:
+                payload = self._get("/streams", {"user_id": chunk})
+            except Exception:
+                continue
+            for row in payload.get("data", []):
+                uid = row.get("user_id")
+                if uid:
+                    out[uid] = row.get("game_id") or ""
+        return out
+
+    def videos_by_id(self, video_ids: list[str]) -> list[Vod]:
+        """Several VODs at once, by their own ids.
+
+        The per-channel form asks "what has this channel broadcast?" and costs a
+        call for every channel considered. But a clip already names the VOD it
+        was cut from, and this endpoint takes a hundred video ids per request.
+        Going from clips to VODs directly is therefore about two orders of
+        magnitude cheaper than going via their broadcasters, which is what makes
+        it affordable to check every channel that was live rather than only the
+        ones whose name we liked.
+        """
+        out: list[Vod] = []
+        for start in range(0, len(video_ids), 100):
+            chunk = video_ids[start:start + 100]
+            if not chunk:
+                continue
+            try:
+                payload = self._get("/videos", {"id": chunk})
+            except Exception:
+                continue
+            for row in payload.get("data", []):
+                created = row.get("created_at")
+                out.append(
+                    Vod(
+                        id=row["id"],
+                        channel_id=row.get("user_id") or "",
+                        stream_id=row.get("stream_id"),
+                        title=row.get("title") or "",
+                        created_at=created or "",
+                        created_epoch=to_epoch(created),
+                        duration_s=parse_duration(row.get("duration")),
+                        url=row.get("url") or f"https://www.twitch.tv/videos/{row['id']}",
+                    )
+                )
+        return out
+
     def clips_in_window(
         self, game_id: str, started_at: str, ended_at: str, *, limit: int = 200
     ) -> list[dict]:

@@ -16,6 +16,19 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def to_epoch(stamp: str | None) -> int | None:
+    """Parse a timestamp written by utcnow() back to unix seconds."""
+    if not stamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -31,6 +44,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("highlight", "distinct_victims", "INTEGER"),
     ("encounter", "verdict", "TEXT"),
     ("encounter", "evidence", "TEXT"),
+    ("match", "last_resolved_at", "TEXT"),
+    ("match", "resolve_attempts", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 

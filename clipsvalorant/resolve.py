@@ -33,13 +33,18 @@ import json
 import logging
 import re
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Callable
 
-from clipsvalorant import db
+from clipsvalorant import calibrate, db
 from clipsvalorant.config import Config
 from clipsvalorant.models import Match, Player
 from clipsvalorant.twitch import TwitchClient, Vod
+from clipsvalorant.vision import Reader, wanted_names
+from clipsvalorant.vod import FrameReader, missing_tools
+from clipsvalorant.watch import CERTAIN_NAMES, MAX_FRAMES, watch
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +57,23 @@ VOD_SLACK_S = 45
 # to point at a moment before the stream began. Curry's VOD began 129s after the
 # match did; what ruled it out was having no Valorant in it, not the late start.
 MIN_OVERLAP = 0.6
+
+# Candidate generation is deliberately loose, because confirmation is strict.
+# Requiring an exact name match was how CocaPup#slay -> twitch.tv/cocapuppy was
+# missed entirely: the VOD was titled "short valo stream!!" and covered the whole
+# match, but no candidate was ever created, so no evidence was ever weighed.
+# The cap is only about cost - a 4-character Riot ID like "Nuke" resembles
+# hundreds of channels, and each one costs a /videos call.
+MIN_PREFIX_LEN = 5
+# Enough of a match inside a broadcast to be worth opening it. Below this there
+# is no room for a sampling point to land on anything.
+MIN_WATCH_WINDOW_S = 90
+# How soon after a match a broadcast might still be running. Inside this window
+# /helix/streams can say what a channel is playing, which is the only
+# authoritative game check that exists -- and the only one a title cannot lie
+# to. Outside it the question is meaningless: everyone has gone to bed.
+LIVE_CHECK_H = 6
+MAX_PREFIX_CANDIDATES = 6
 
 # How long after a broadcast people are still cutting clips out of its VOD.
 CLIP_LOOKAHEAD_DAYS = 14
@@ -67,6 +89,58 @@ _RIOT_ID = re.compile(r"([A-Za-z0-9][A-Za-z0-9 _.\-]{1,30})#([A-Za-z0-9]{3,5})(?
 
 def normalise(name: str) -> str:
     return _NON_ALNUM.sub("", name.casefold())
+
+
+# A broadcast title is free and says what a VOD contains more often than not.
+# It is only ever one signal among several: titles lie by omission, and a stream
+# can change game mid-broadcast.
+VALORANT_WORDS = ("valorant", "valo", "vct", "radiant", "immortal", "ranked val")
+OTHER_GAMES = (
+    "deadlock", "fortnite", "minecraft", "apex", "league of legends", "lol ",
+    "cs2", "csgo", "counter-strike", "overwatch", "rocket league", "gta",
+    "rust", "dead by daylight", "dbd", "roblox", "call of duty", "warzone",
+    "marvel rivals", "elden ring", "tarkov", "hearthstone", "chess", "poker",
+    "just chatting", "watchparty", "watch party", "react",
+)
+
+
+def _words(text: str) -> str:
+    return " " + re.sub(r"[^a-z0-9]+", " ", (text or "").casefold()).strip() + " "
+
+
+NOT_PLAYING = ("watchparty", "watch party", "react", "reacting", "just chatting")
+
+
+def game_from_title(title: str) -> tuple[bool, str]:
+    """(mentions Valorant, name of another activity). Watching VCT is not playing."""
+    padded = _words(title)
+    for phrase in NOT_PLAYING:
+        if f" {phrase.strip().replace(' ', ' ')} " in padded or phrase.strip() in padded:
+            return False, phrase.strip()
+    if any(f" {w.strip()} " in padded for w in VALORANT_WORDS):
+        return True, ""
+    for other in OTHER_GAMES:
+        if f" {other.strip()} " in padded:
+            return False, other.strip()
+    return False, ""
+
+
+def bio_names(bio: str | None, player_name: str) -> bool:
+    """Does the channel bio name this player in plain words?
+
+    "WELCOME!!! I am CocaPup!!" counts. An address does not: "curry@proxy.gg"
+    and "curry.gg" contain the string without anybody claiming the name, and
+    that distinction is the whole difference between finding a small streamer
+    and re-confirming the wrong one.
+    """
+    if not bio or len(normalise(player_name)) < 4:
+        return False
+    cleaned = re.sub(r"\S+@\S+", " ", bio)
+    cleaned = re.sub(r"https?://\S+", " ", cleaned)
+    cleaned = re.sub(r"[\w-]+\.[A-Za-z]{2,4}", " ", cleaned)
+    return re.search(
+        rf"(?<![A-Za-z0-9]){re.escape(player_name)}(?![A-Za-z0-9])", cleaned, re.I
+    ) is not None
 
 
 def riot_ids_in(text: str | None) -> set[str]:
@@ -114,6 +188,19 @@ class Evidence:
     advertised_ids: tuple[str, ...] = ()
     id_confirms: bool = False
     id_conflicts: bool = False
+    bio_names_player: bool = False
+    title_says_valorant: bool = False
+    title_says_other_game: str = ""
+    # Layer 5 - what the broadcast itself showed. Everything above this line is
+    # circumstantial: a name, a title, a window of wall-clock. These come from
+    # opening the video and reading the screen, which is the only evidence that
+    # answers the actual question.
+    frames_read: int = 0
+    live_on_valorant: bool = False
+    lobby_names_seen: tuple[str, ...] = ()
+    me_seen_in_vod: bool = False
+    valorant_ui_frames: int = 0
+    vod_not_this_match: bool = False
 
     @property
     def wrong_game(self) -> bool:
@@ -121,8 +208,20 @@ class Evidence:
         return self.clips_on_vod > 0 and self.valorant_clips_on_vod == 0
 
     @property
+    def vod_shows_this_match(self) -> bool:
+        """Enough of the lobby was named on screen to rule out coincidence.
+
+        Ten people were in that match and we know all ten names. Seeing five of
+        them on a stranger's broadcast is not something a shared friend group or
+        a popular name can explain.
+        """
+        return len(self.lobby_names_seen) >= CERTAIN_NAMES
+
+    @property
     def ties_to_this_match(self) -> bool:
-        return self.clips_inside_match > 0 or self.id_confirms
+        return (
+            self.vod_shows_this_match or self.clips_inside_match > 0 or self.id_confirms
+        )
 
     @property
     def vod_usable(self) -> bool:
@@ -133,25 +232,58 @@ class Evidence:
 
     def confirmed_by(self) -> str | None:
         """Which signal, if any, ties this channel to this particular match."""
+        if self.vod_shows_this_match:
+            return (
+                f"{len(self.lobby_names_seen)} of the other players in that lobby "
+                "appear by name in the VOD itself"
+            )
         if self.clips_inside_match > 0:
             return "clips cut from that VOD inside the match"
         if self.id_confirms:
             return "the Riot ID the channel advertises"
         return None
 
+    @property
+    def named_like_player(self) -> bool:
+        return self.name_exact or self.name_prefix
+
+    @property
+    def looks_like_valorant(self) -> bool:
+        return (
+            self.valorant_clips_on_vod > 0
+            or self.title_says_valorant
+            or self.live_on_valorant
+        )
+
     def verdict(self) -> str:
+        # Layer 5: we opened the broadcast and read the lobby off the screen.
+        # This sits above even the coverage test, because a stream that joined
+        # late covers less of the match than the threshold wants and still
+        # plainly *is* the match. Arithmetic about overlap is a guess about
+        # what a broadcast contains; this is a measurement of it.
+        if self.vod_shows_this_match:
+            return "confirmed"
         if not self.vod_usable:
             return "rejected"
-        if self.clips_inside_match > 0:
+        # Decisive, and independent of how big the channel is.
+        if self.clips_inside_match > 0 or self.id_confirms:
             return "confirmed"
-        if self.wrong_game:
+        # We looked at the broadcast and our match was not in it. This outranks
+        # every circumstantial signal below, which is the whole point of
+        # looking: a name that matches and a bio that agrees are still only a
+        # guess, and this is not.
+        if self.vod_not_this_match:
             return "rejected"
-        if self.id_confirms:
-            return "confirmed"
+        if self.wrong_game or self.title_says_other_game:
+            return "rejected"
         if self.id_conflicts:
             # The channel advertises a Riot ID, and it is somebody else's.
             return "rejected"
-        if self.name_exact and self.valorant_clips_on_vod > 0:
+        # Three independent agreements - the channel is named for this player,
+        # its bio names them in plain words, and the broadcast was Valorant.
+        if self.named_like_player and self.bio_names_player and self.looks_like_valorant:
+            return "confirmed"
+        if self.named_like_player and self.looks_like_valorant:
             return "likely"
         return "unconfirmed"
 
@@ -192,8 +324,30 @@ class Evidence:
             )
         else:
             out.append("nobody clipped that VOD, so its game is unknown")
+        if self.live_on_valorant:
+            out.append("that channel is live on Valorant right now")
+        if self.title_says_valorant:
+            out.append("that broadcast's title says Valorant")
+        if self.title_says_other_game:
+            out.append(f"that broadcast's title says {self.title_says_other_game}, not Valorant")
+        if self.bio_names_player:
+            out.append("the channel bio names this player in plain words")
         if self.map_named_in_clip:
             out.append("a clip title names this match's map")
+        if self.lobby_names_seen:
+            shown = ", ".join(sorted(self.lobby_names_seen)[:4])
+            more = len(self.lobby_names_seen) - 4
+            out.append(
+                f"{len(self.lobby_names_seen)} of this lobby's players are named "
+                f"on screen in that VOD ({shown}{f', +{more} more' if more > 0 else ''})"
+            )
+            if self.me_seen_in_vod:
+                out.append("your own Riot name is on screen in that VOD")
+        elif self.vod_not_this_match:
+            out.append(
+                f"we read {self.frames_read} frames of that VOD and found no sign "
+                "of this match"
+            )
         if self.id_confirms:
             out.append("the channel advertises this exact Riot ID")
         elif self.id_conflicts:
@@ -231,6 +385,9 @@ class ResolveReport:
     clips_seen: int = 0
     clip_channels: int = 0
     bios_read: int = 0
+    frames_read: int = 0
+    calibrated: int = 0
+    uncalibrated: int = 0
     confirmed: list[Candidate] = field(default_factory=list)
     candidates: list[Candidate] = field(default_factory=list)
     rejected: list[Candidate] = field(default_factory=list)
@@ -246,9 +403,39 @@ class ResolveReport:
             f"{self.name_candidates} name candidate(s), "
             f"{self.clips_seen} clip(s) from {self.clip_channels} channel(s), "
             f"{self.bios_read} bio(s) read, "
-            f"{len(self.confirmed)} confirmed, {len(self.candidates)} unverified, "
+            + (f"{self.frames_read} VOD frame(s) read, " if self.frames_read else "")
+            + f"{len(self.confirmed)} confirmed, {len(self.candidates)} unverified, "
             f"{len(self.rejected)} ruled out"
         )
+
+
+@dataclass
+class Watcher:
+    """Layer 5's machinery, built once per run and reused across candidates."""
+
+    frames: FrameReader
+    reader: Reader
+    limit: int = MAX_FRAMES
+
+    @property
+    def ready(self) -> bool:
+        return self.reader.available
+
+
+def build_watcher(cache_dir, *, limit: int = MAX_FRAMES) -> tuple["Watcher | None", str]:
+    """A watcher, or None and the reason there isn't one.
+
+    Layer 5 leans on two external programs and an optional OCR package. Any of
+    them can be absent on a given machine, and that is not an error: every
+    other layer still works, so we say what is missing and carry on.
+    """
+    missing = missing_tools()
+    if missing:
+        return None, f"{' and '.join(missing)} not on PATH"
+    watcher = Watcher(FrameReader(cache_dir), Reader(), limit=limit)
+    if not watcher.ready:
+        return None, "no OCR engine (pip install 'clipsvalorant[vision]')"
+    return watcher, ""
 
 
 def vod_link(vod_id: str, offset_s: int) -> str:
@@ -401,12 +588,22 @@ def gather_evidence(
     if not ev.vod_usable:
         return
 
+    says_valorant, other_game = game_from_title(covering.title)
+    ev.title_says_valorant = says_valorant
+    ev.title_says_other_game = other_game
+
     # Layer 3 - does the channel publish a Riot ID anywhere we can read?
     texts = [v.title for v in vods[:20]]
     try:
         for user in client.users(ids=[cand.channel_id]):
             _remember_channel(conn, user)
-            texts.append(user.get("description") or "")
+            bio = user.get("description") or ""
+            texts.append(bio)
+            # A bio naming the player in plain words - "I am CocaPup!!" - is the
+            # signal that reaches small streamers, who are never clipped and so
+            # can never satisfy the clip test however long we wait.
+            if bio_names(bio, cand.player.name):
+                ev.bio_names_player = True
     except Exception as exc:
         report.errors.append(f"{cand.channel_login}: users failed: {exc}")
     found: set[str] = set()
@@ -539,6 +736,7 @@ def resolve_match(
     my_puuid: str,
     report: ResolveReport,
     game_id: str | None = None,
+    watcher: "Watcher | None" = None,
 ) -> None:
     started = match.metadata.started_at
     start = int(
@@ -550,12 +748,88 @@ def resolve_match(
     my_team = me.team if me else None
     unresolved: list[Player] = []
 
+    # Layer 5 needs to know who to look for and when to look. Both are free:
+    # the lobby is the match history, and the kill times tell us the moments
+    # when Valorant was painting names on the screen.
+    lobby = wanted_names([(p.name, p.puuid == my_puuid) for p in match.players])
+    my_name = me.name if me else ""
+    # Calibration dates a frame by reading the countdown on it, which only
+    # means anything against the times the rounds actually began.
+    round_starts = calibrate.round_starts(match.kills)
+    kills = [
+        (row["round"], row["time_in_match_ms"] / 1000)
+        for row in conn.execute(
+            "SELECT round, time_in_match_ms FROM kill WHERE match_id = ? "
+            "ORDER BY time_in_match_ms",
+            (match.id,),
+        )
+    ]
+
+    def inspect(cand: Candidate) -> None:
+        """Open the broadcast and see whether this match is in it.
+
+        Worth doing for any broadcast holding enough of the match to contain a
+        sampling point, not merely those that clear the coverage threshold. A
+        stream that joined late fails that threshold and can still show the
+        lobby on screen, and what is on screen beats what the arithmetic
+        guessed.
+        """
+        if watcher is None or cand.vod is None:
+            return
+        lo = max(0.0, cand.vod.created_epoch - start)
+        hi = min(end, cand.vod.end_epoch) - start
+        if hi - lo < MIN_WATCH_WINDOW_S:
+            return
+        seen = watch(
+            watcher.reader, watcher.frames, cand.vod.id,
+            start - cand.vod.created_epoch, kills, lobby, my_name,
+            limit=watcher.limit, window=(lo, hi),
+            exclude_name=cand.player.name,
+        )
+        ev = cand.evidence
+        ev.frames_read = seen.frames_read
+        ev.lobby_names_seen = tuple(sorted(seen.names))
+        ev.me_seen_in_vod = seen.me_seen
+        ev.valorant_ui_frames = seen.valorant_frames
+        ev.vod_not_this_match = seen.saw_nothing
+        report.frames_read += seen.frames_read
+
+    def calibrate_vod(cand: Candidate) -> None:
+        """Measure where this match really starts in this broadcast.
+
+        Only for candidates that survived, and only once per broadcast. It
+        costs around a dozen frames, which is the same order as the check
+        that confirmed them - worth paying for a link that lands on the
+        play, and pure waste on the ninety-odd channels ruled out.
+        """
+        if watcher is None or cand.vod is None or cand.verdict == "rejected":
+            return
+        if calibrate.load(conn, match.id, cand.vod.id).measured:
+            return
+        base = start - cand.vod.created_epoch
+        lo = max(0.0, cand.vod.created_epoch - start) + base
+        hi = min(end, cand.vod.end_epoch) - start + base
+        cal = calibrate.measure(
+            watcher.reader, watcher.frames, cand.vod.id,
+            base=base, starts=round_starts, window=(lo, hi),
+        )
+        if cal.measured:
+            calibrate.store(conn, match.id, cand.vod.id, cal)
+            report.calibrated += 1
+            log.info("%s starts %.0fs into VOD %s beyond its own timestamp "
+                     "(%d frames agreed)", match.id[:8], cal.shift_s,
+                     cand.vod.id, cal.votes)
+        else:
+            report.uncalibrated += 1
+
     def finish(cand: Candidate) -> None:
         gather_evidence(client, conn, cand, match, start, end, game_id, report)
+        inspect(cand)
         _remember_encounter(conn, match.id, cand, cand.player.team == my_team)
         if cand.verdict == "confirmed":
             _remember_alias(conn, cand.player, cand.channel_id,
                             cand.source.split(":")[-1], cand.confidence)
+        calibrate_vod(cand)
         report.file(cand)
 
     for player in match.players:
@@ -577,19 +851,45 @@ def resolve_match(
         if not candidates:
             target = normalise(player.name)
             try:
-                hits = client.search_channels(player.name, limit=20)
+                hits = client.search_channels(player.name, limit=40)
             except Exception as exc:
                 report.errors.append(f"{player.name}#{player.tag}: search failed: {exc}")
                 continue
+            near = 0
             for hit in hits:
                 login = hit.get("broadcaster_login", "")
                 display = hit.get("display_name", "")
-                if normalise(login) == target or normalise(display) == target:
-                    _remember_channel(conn, hit)
-                    cand = Candidate(match.id, player, hit["id"], login, display, "name_match")
-                    cand.evidence.name_exact = True
-                    candidates.append(cand)
+                exact = normalise(login) == target or normalise(display) == target
+                # Twitch returns search results by relevance, so the first few
+                # near-misses are the plausible ones.
+                prefix = not exact and len(target) >= MIN_PREFIX_LEN and (
+                    _prefix_related(player.name, login, min_len=MIN_PREFIX_LEN)
+                    or _prefix_related(player.name, display, min_len=MIN_PREFIX_LEN)
+                )
+                if prefix:
+                    if near >= MAX_PREFIX_CANDIDATES:
+                        continue
+                    near += 1
+                if not (exact or prefix):
+                    continue
+                _remember_channel(conn, hit)
+                cand = Candidate(match.id, player, hit["id"], login, display,
+                                 "name_match" if exact else "name_prefix")
+                cand.evidence.name_exact = exact
+                cand.evidence.name_prefix = prefix
+                candidates.append(cand)
             report.name_candidates += len(candidates)
+
+        # One call per player, and only while a broadcast could still be
+        # running. Asked of a match from last week it would answer about
+        # whatever the channel is playing today, which says nothing at all.
+        if candidates and game_id and (time.time() - end) < LIVE_CHECK_H * 3600:
+            try:
+                live = client.live_now([c.channel_id for c in candidates])
+            except Exception:
+                live = {}
+            for cand in candidates:
+                cand.evidence.live_on_valorant = live.get(cand.channel_id) == game_id
 
         for cand in candidates:
             finish(cand)
@@ -605,10 +905,154 @@ def resolve_match(
             finish(cand)
 
 
-def resolve_recent(cfg: Config, *, limit: int = 5, match_id: str | None = None) -> ResolveReport:
+def audit_verdicts(
+    cfg: Config, *, limit: int = 100, frames: int = MAX_FRAMES * 2
+) -> tuple[list[str], list[str]]:
+    """Re-open broadcasts nobody looked at properly, and settle them.
+
+    Rejections are not all equal, and the difference matters. Nearly all of
+    them say only "no broadcast of this match survived", which no amount of
+    looking can overturn - there is no video. The interesting ones are the
+    handful we actually judged: a title that named another game, clips that
+    were all something else, a screen we read too few frames of. Those were
+    decided on circumstance, and a missed streamer could only be hiding there.
+
+    Unconfirmed rows need the same treatment for the opposite reason. They
+    are not a judgement either - they are the absence of one, left behind
+    when a broadcast was never read, and they are the more dangerous kind.
+    A rejection that was wrong hides a streamer; an unconfirmed row that is
+    wrong *shows* one, with timestamps beside it that look exactly like the
+    confirmed sort. twitch.tv/solly17x sat in this state for a fortnight on
+    nothing but a name that begins the same way and a stream that happened to
+    be running - it was Elden Ring throughout.
+
+    So this walks both sets, re-reads each broadcast with twice the usual
+    frame budget, confirms the ones that turn out to be the match, and rules
+    out the unconfirmed ones that plainly are not. Returns (flips, notes).
+    """
+    flips: list[str] = []
+    notes: list[str] = []
+    watcher, why = build_watcher(cfg.db_path.parent / "frames", limit=frames)
+    if watcher is None:
+        return flips, [f"cannot audit: {why}"]
+
+    with db.session(cfg.db_path) as conn:
+        rows = conn.execute(
+            "SELECT e.id, e.match_id, e.riot_id, e.channel_login, e.vod_id, "
+            "       e.evidence, e.verdict, m.started_at_epoch AS start, m.game_length_ms, "
+            "       v.created_epoch, v.end_epoch, v.title "
+            "FROM encounter e "
+            "JOIN match m ON m.id = e.match_id "
+            "JOIN twitch_vod v ON v.id = e.vod_id "
+            "WHERE e.verdict IN ('rejected', 'unconfirmed') "
+            "  AND e.vod_id IS NOT NULL "
+            "ORDER BY m.started_at_epoch DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+        checked = 0
+        for row in rows:
+            start = row["start"]
+            end = start + (row["game_length_ms"] or 0) // 1000
+            lo = max(0.0, row["created_epoch"] - start)
+            hi = min(end, row["end_epoch"]) - start
+            if hi - lo < MIN_WATCH_WINDOW_S:
+                continue  # no video of this match to look at: not a judgement call
+            players = [
+                (r["name"], bool(r["is_me"]))
+                for r in conn.execute(
+                    "SELECT name, is_me FROM match_player WHERE match_id = ?",
+                    (row["match_id"],),
+                )
+            ]
+            lobby = wanted_names(players)
+            my_name = next((n for n, mine in players if mine), "")
+            kills = [
+                (k["round"], k["time_in_match_ms"] / 1000)
+                for k in conn.execute(
+                    "SELECT round, time_in_match_ms FROM kill WHERE match_id = ? "
+                    "ORDER BY time_in_match_ms",
+                    (row["match_id"],),
+                )
+            ]
+            checked += 1
+            seen = watch(
+                watcher.reader, watcher.frames, row["vod_id"],
+                start - row["created_epoch"], kills, lobby, my_name,
+                limit=frames, window=(lo, hi),
+                # The same exclusion the live path makes, and for the same
+                # reason: this channel is a candidate because it is named
+                # like the player, so its own overlay agreeing with itself
+                # is not evidence of anything.
+                exclude_name=row["riot_id"].partition("#")[0],
+            )
+            if len(seen.names) >= CERTAIN_NAMES:
+                flips.append(
+                    f"{row['riot_id']} -> twitch.tv/{row['channel_login']}: "
+                    f"ruled out, but {len(seen.names)} of the lobby are on screen "
+                    f"({', '.join(sorted(seen.names)[:4])})"
+                )
+                conn.execute(
+                    "UPDATE encounter SET verdict = 'confirmed', "
+                    "verified_how = 'audit:vod_names' WHERE id = ?",
+                    (row["id"],),
+                )
+                conn.commit()
+            elif row["verdict"] == "unconfirmed" and seen.saw_nothing:
+                notes.append(
+                    f"{row['riot_id']} -> twitch.tv/{row['channel_login']}: "
+                    f"read {seen.frames_read} frames and found no Valorant at all "
+                    "- ruled out"
+                )
+                conn.execute(
+                    "UPDATE encounter SET verdict = 'rejected', "
+                    "verified_how = 'audit:not_this_match' WHERE id = ?",
+                    (row["id"],),
+                )
+                conn.commit()
+            elif seen.names:
+                notes.append(
+                    f"{row['riot_id']} -> twitch.tv/{row['channel_login']}: "
+                    f"{len(seen.names)} name(s) seen, short of the {CERTAIN_NAMES} "
+                    "needed - worth a human look"
+                )
+        notes.insert(
+            0,
+            f"{len(rows)} undecided encounter(s) had a broadcast on file; {checked} "
+            "held enough of the match to be worth re-reading",
+        )
+    return flips, notes
+
+
+def resolve_recent(
+    cfg: Config,
+    *,
+    limit: int = 5,
+    match_id: str | None = None,
+    match_ids: list[str] | None = None,
+    watch_vods: bool = True,
+    on_match: Callable[[str, "ResolveReport"], None] | None = None,
+) -> ResolveReport:
+    """Resolve recent matches, optionally reporting after each one.
+
+    `on_match` exists for callers that have somebody waiting: reading a single
+    broadcast can take a minute, so a UI that only hears the final total looks
+    hung for as long as the work takes. It is handed the match id and the
+    running report, and anything it raises is swallowed - a progress bar is
+    never a reason to lose a resolve that already happened.
+    """
     report = ResolveReport()
     with db.session(cfg.db_path) as conn:
-        if match_id:
+        if match_ids is not None:
+            if not match_ids:
+                return report
+            holes = ",".join("?" * len(match_ids))
+            rows = conn.execute(
+                f"SELECT id, raw_json FROM match WHERE id IN ({holes}) "
+                "ORDER BY started_at_epoch DESC",
+                match_ids,
+            ).fetchall()
+        elif match_id:
             rows = conn.execute(
                 "SELECT id, raw_json FROM match WHERE id LIKE ?", (f"{match_id}%",)
             ).fetchall()
@@ -621,6 +1065,12 @@ def resolve_recent(cfg: Config, *, limit: int = 5, match_id: str | None = None) 
         if not rows:
             report.errors.append("No matching match in the database.")
             return report
+
+        watcher = None
+        if watch_vods:
+            watcher, why = build_watcher(cfg.db_path.parent / "frames")
+            if watcher is None:
+                report.errors.append(f"not reading VODs: {why}")
 
         with TwitchClient(cfg.twitch_client_id, cfg.twitch_client_secret) as client:
             try:
@@ -635,6 +1085,16 @@ def resolve_recent(cfg: Config, *, limit: int = 5, match_id: str | None = None) 
                     continue
                 report.matches_checked += 1
                 resolve_match(conn, client, match, my_puuid=me.puuid, report=report,
-                              game_id=game_id)
+                              game_id=game_id, watcher=watcher)
+                conn.execute(
+                    "UPDATE match SET last_resolved_at = ?, "
+                    "resolve_attempts = resolve_attempts + 1 WHERE id = ?",
+                    (db.utcnow(), row["id"]),
+                )
                 conn.commit()
+                if on_match is not None:
+                    try:
+                        on_match(row["id"], report)
+                    except Exception:
+                        log.debug("progress callback failed", exc_info=True)
     return report
