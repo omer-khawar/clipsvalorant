@@ -283,8 +283,22 @@ it at five minutes.
 cd /opt/clipsvalorant && git pull && sudo systemctl restart clipsvalorant
 ```
 
-The unit rebuilds the image, so that is the whole deploy. Note that it also
-restarts the app, which still **drops a scan in progress** — the queue lives
+The unit rebuilds the image, so that is the whole deploy.
+
+**This only works because `/opt/clipsvalorant` is a git checkout.** It was not
+one for the first day of this machine's life — the code had been copied up by
+hand, so `git pull` answered `not a git repository`, and every deploy was a
+file written over SSH with nothing anywhere to say whether the box and the
+repository still agreed. If you rebuild this machine, clone it; do not copy
+it.
+
+Expect **about 20 seconds** for a code change. The Dockerfile installs
+dependencies from `pyproject.toml` before it copies any source, so a Python
+edit reruns only the last two layers. Changing `pyproject.toml` reinstalls
+onnxruntime and opencv and takes about four minutes on this shape — that is
+the real cost, and it is now paid only when dependencies actually move.
+
+Note that a restart also **drops a scan in progress** — the queue lives
 in memory and nothing resumes. Deploy when nobody is mid-scan, or fix the
 resumability first.
 
