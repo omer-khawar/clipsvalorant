@@ -89,10 +89,12 @@ def test_known_match_ids(cfg):
 # ------------------------------------------------- the window, before fetching
 
 class _Entry:
-    """A row of the stored-matches listing: an id and a date, nothing more."""
+    """A row of the stored-matches listing: an id, a date and a queue."""
 
-    def __init__(self, match_id, started_at):
-        self.meta = type("M", (), {"id": match_id, "started_at": started_at})()
+    def __init__(self, match_id, started_at, mode=None):
+        self.meta = type(
+            "M", (), {"id": match_id, "started_at": started_at, "mode": mode}
+        )()
 
 
 class _Client:
@@ -109,6 +111,7 @@ class _Client:
         self.listed = listed
         self.honours_page = honours_page
         self.calls = []
+        self.modes = []
         self.detail_calls = []
 
     def __enter__(self):
@@ -119,6 +122,7 @@ class _Client:
 
     def stored_matches(self, name, tag, region, *, mode=None, size=20, page=1):
         self.calls.append((size, page))
+        self.modes.append(mode)
         if not self.honours_page:
             page = 1
         start = (page - 1) * size
@@ -352,3 +356,47 @@ def test_ingest_walks_the_pages_and_still_drops_what_is_past_the_window(cfg, mon
     assert report.too_old == 5
     assert report.complete is True
     assert "3 listing pages" in report.summary()
+
+
+# ------------------------------------------------- the queue nobody looked at
+
+def test_other_modes_counts_only_what_the_filter_hides(cfg, monkeypatch):
+    """A scan fixed to Competitive can miss a third of a fortnight. Saying
+    '45 matches' while 24 sit in Swiftplay and custom games is the truth
+    about the wrong number, and a match played in the wrong queue looks
+    from the outside exactly like a scanner that found nobody."""
+    from datetime import datetime, timedelta, timezone
+
+    from clipsvalorant.ingest import other_modes
+
+    now = datetime.now(timezone.utc)
+    listed = [
+        _Entry("m0", now - timedelta(days=1), "Competitive"),
+        _Entry("m1", now - timedelta(days=2), "Swiftplay"),
+        _Entry("m2", now - timedelta(days=3), "Deathmatch"),
+        _Entry("m3", now - timedelta(days=4), "Swiftplay"),
+        _Entry("m4", now - timedelta(days=40), "Custom Game"),
+    ]
+    client = _Client(listed)
+    monkeypatch.setattr("clipsvalorant.ingest.HenrikClient", lambda *a, **k: client)
+
+    found = other_modes(
+        cfg, mode="competitive",
+        since_epoch=int((now - timedelta(days=14)).timestamp()),
+    )
+
+    assert dict(found) == {"Swiftplay": 2, "Deathmatch": 1}
+    assert client.modes == [None]      # asked without the filter, once
+    assert len(client.calls) == 1
+
+
+def test_other_modes_asks_nothing_when_nothing_is_filtered(cfg, monkeypatch):
+    """`mode=None` already scans every queue, so there is nothing hidden to
+    report and no call worth spending to find it out."""
+    from clipsvalorant.ingest import other_modes
+
+    client = _Client([])
+    monkeypatch.setattr("clipsvalorant.ingest.HenrikClient", lambda *a, **k: client)
+
+    assert other_modes(cfg, mode=None, since_epoch=None) == {}
+    assert client.calls == []

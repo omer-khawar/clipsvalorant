@@ -1240,3 +1240,71 @@ def test_the_progress_line_estimates_from_this_machines_own_pace(cfg, monkeypatc
     assert "left" not in checked[0] and "left" not in checked[1]
     assert "left" in checked[2]
     assert "left" not in checked[5]
+
+
+def test_the_scan_says_which_queues_it_never_looked_at(cfg, monkeypatch):
+    """The complaint this answers: a scan that reports on 45 matches while
+    24 more sit in queues it never asked for has not told you it stopped
+    short, and a match played in Swiftplay is indistinguishable from a
+    scanner that found nobody."""
+    from collections import Counter
+
+    from clipsvalorant.ingest import IngestReport
+
+    monkeypatch.setattr("clipsvalorant.ingest.ingest",
+                        lambda c, **k: IngestReport(seen=2, stored=0, complete=True))
+    monkeypatch.setattr(
+        "clipsvalorant.ingest.other_modes",
+        lambda c, **k: Counter({"Swiftplay": 8, "Deathmatch": 8, "Custom Game": 4}),
+    )
+    monkeypatch.setattr("clipsvalorant.resolve.resolve_recent",
+                        lambda *a, **k: _NoReport())
+    monkeypatch.setattr("clipsvalorant.web._correct_region", lambda acct, job: acct)
+
+    acct = web.config_for(cfg, "Queues#NA1")
+    with db.session(acct.db_path) as conn:
+        _store_match(conn, "m0", RECENT)
+        conn.commit()
+    cfg = dataclasses.replace(cfg, twitch_client_id="id", twitch_client_secret="s")
+    job = web.Job(id="j", riot_id="Queues#NA1", key="")
+    web.run_search(cfg, job, days=14, watch=False)
+
+    lines = " ".join(job.snapshot()["lines"])
+    assert "20 other match(es)" in lines
+    assert "Swiftplay 8" in lines and "Custom Game 4" in lines
+
+
+def test_counting_the_other_queues_can_fail_without_failing_the_scan(cfg, monkeypatch):
+    """It is a footnote bought with one extra API call. A footnote must not
+    be able to take the scan down with it."""
+    from clipsvalorant.ingest import IngestReport
+
+    def explode(*a, **k):
+        raise RuntimeError("listing unavailable")
+
+    monkeypatch.setattr("clipsvalorant.ingest.ingest",
+                        lambda c, **k: IngestReport(seen=1, stored=0, complete=True))
+    monkeypatch.setattr("clipsvalorant.ingest.other_modes", explode)
+    monkeypatch.setattr("clipsvalorant.resolve.resolve_recent",
+                        lambda *a, **k: _NoReport())
+    monkeypatch.setattr("clipsvalorant.web._correct_region", lambda acct, job: acct)
+
+    acct = web.config_for(cfg, "Footnote#NA1")
+    with db.session(acct.db_path) as conn:
+        _store_match(conn, "m0", RECENT)
+        conn.commit()
+    cfg = dataclasses.replace(cfg, twitch_client_id="id", twitch_client_secret="s")
+    job = web.Job(id="j", riot_id="Footnote#NA1", key="")
+    web.run_search(cfg, job, days=14, watch=False)
+
+    assert job.state == "done"
+
+
+def test_the_queue_control_reaches_the_api():
+    """The backend has always understood mode=any. Nothing ever sent it, so
+    every scan anyone ever ran was Competitive-only without saying so."""
+    assert 'id="queue"' in web.PAGE
+    assert 'data-mode="competitive" aria-checked="true"' in web.PAGE
+    assert 'data-mode="any"' in web.PAGE
+    assert "mode: S.mode" in web.PAGE
+    assert 'mode: "competitive"' in web.PAGE

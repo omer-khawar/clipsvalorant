@@ -863,7 +863,7 @@ def run_search(
     well its streamers are identified. `fetch` only caps how many matches are
     asked for, which is what stops a wide window becoming unbounded API calls.
     """
-    from clipsvalorant.ingest import ingest
+    from clipsvalorant.ingest import ingest, other_modes
     from clipsvalorant.resolve import resolve_recent
     from clipsvalorant.henrik import HenrikClient, HenrikError
 
@@ -899,6 +899,28 @@ def run_search(
         job.say(report.summary())
         for err in report.errors[:5]:
             job.say(f"! {err}")
+
+        # What the queue filter is holding back. One listing call, and it is
+        # the difference between "45 matches" and "45 of 69": a scan fixed to
+        # Competitive can miss a third of a fortnight, and a match played in
+        # Swiftplay or a custom game looks from the outside exactly like a
+        # scanner that failed to find anybody.
+        if mode:
+            try:
+                skipped = other_modes(acct, mode=mode, since_epoch=cutoff,
+                                      limit=fetch, cancel=job.token)
+            except Cancelled:
+                raise
+            except Exception as exc:  # a footnote must not fail a scan
+                log.debug("Could not count the other queues: %s", exc)
+                skipped = None
+            if skipped:
+                spread = ", ".join(f"{name} {n}" for name, n in skipped.most_common())
+                job.say(
+                    f"{mode.capitalize()} only - {sum(skipped.values())} other "
+                    f"match(es) in this window were not looked at ({spread}). "
+                    "Switch the queue to All to include them."
+                )
         with db.session(acct.db_path) as conn:
             ids = [
                 r["id"]
@@ -2220,6 +2242,13 @@ body{
           <button type="button" role="radio" data-days="30" aria-checked="false">30d</button>
         </div>
       </div>
+      <div class="field">
+        <span class="lbl">Queue</span>
+        <div class="seg" role="radiogroup" aria-label="Which queue to scan" id="queue">
+          <button type="button" role="radio" data-mode="competitive" aria-checked="true">Comp</button>
+          <button type="button" role="radio" data-mode="any" aria-checked="false">All</button>
+        </div>
+      </div>
       <div class="actions">
         <button class="go" id="go" type="submit">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
@@ -2368,7 +2397,8 @@ var rno = function(n){ return Number(n) + 1; };
 var pad2 = function(n){ return (n < 10 ? "0" : "") + n; };
 
 var S = {
-  key: "", groups: [], sel: null, filter: "all", days: 14, round: null,
+  key: "", groups: [], sel: null, filter: "all", days: 14, mode: "competitive",
+  round: null,
   player: null, poll: null, tick: null,
   /* the queue: your ticket, and whether you have stepped out of the
      waiting screen to look at clips while you wait */
@@ -2415,6 +2445,12 @@ $$("#window button").forEach(function(b){
   b.addEventListener("click", function(){
     S.days = Number(b.dataset.days);
     $$("#window button").forEach(function(o){ o.setAttribute("aria-checked", String(o === b)); });
+  });
+});
+$$("#queue button").forEach(function(b){
+  b.addEventListener("click", function(){
+    S.mode = b.dataset.mode;
+    $$("#queue button").forEach(function(o){ o.setAttribute("aria-checked", String(o === b)); });
   });
 });
 $$("#filter button").forEach(function(b){
@@ -3047,6 +3083,7 @@ $("#scanform").addEventListener("submit", function(ev){
        only the ones that are new AND inside the window get fetched in detail
        - so this asks for the whole window and lets the window end the walk. */
     body: JSON.stringify({riot_id: riot, days: S.days, watch: true,
+                          mode: S.mode,
                           fetch: Math.min(250, Math.max(40, S.days * 8))})
   }).then(function(j){
     $("#log").textContent = "";

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import timezone
 
@@ -478,6 +479,50 @@ def ingest(
                 report.highlights += found
 
     return report
+
+
+def other_modes(
+    cfg: Config,
+    *,
+    mode: str | None,
+    since_epoch: int | None,
+    limit: int = 100,
+    cancel: CancelToken | None = None,
+) -> Counter:
+    """The queues this scan is not looking at, and how many matches of each.
+
+    One listing call, and it buys the difference between "45 matches" and
+    "45 of 69". A scan filtered to Competitive can be two thirds of a busy
+    account's fortnight, with the rest in Swiftplay, Deathmatch and custom
+    games - and nothing used to say so, which makes a match played in the
+    wrong queue indistinguishable from a scanner that is broken.
+    """
+    found: Counter = Counter()
+    want = (mode or "").strip().lower()
+    if not want:
+        return found  # nothing is being filtered out, so nothing is hidden
+
+    cancel = cancel or NullToken()
+    with HenrikClient(cfg.henrik_api_key, cancel=cancel) as client:
+        listed = _list_window(
+            client,
+            cfg,
+            mode=None,
+            limit=limit,
+            since_epoch=since_epoch,
+            report=IngestReport(),
+            cancel=cancel,
+        )
+
+    for entry in listed:
+        if since_epoch is not None:
+            when = _listed_epoch(entry)
+            if when is not None and when < since_epoch:
+                continue
+        label = (entry.meta.mode or "Unknown").strip()
+        if label.lower() != want:
+            found[label] += 1
+    return found
 
 
 def needs_backfill(conn) -> list[str]:
