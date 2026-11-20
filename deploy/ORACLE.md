@@ -36,9 +36,28 @@ ssh ubuntu@129.159.174.254
 capacity in *all three* Ashburn availability domains — AD-2, AD-1 and AD-3
 were each refused by the API, despite the console claiming A1 was available
 in any of them. This is the well-known Arm shortage. The micro is the
-documented fallback and is genuinely fine here: the scan is network-bound,
-and 952 MB is roughly what the Fly machine had while it ran Layer 5
-successfully. A1 can be retried another day and the instance replaced.
+documented fallback, and A1 can be retried another day and the instance
+replaced. It is worth retrying: see what the shape actually costs you, two
+sections down.
+
+**Retry log.** Keep this, so the next attempt knows whether anything has
+changed rather than guessing:
+
+| Date | Result |
+|---|---|
+| 2026-11-19 | AD-1, AD-2, AD-3 all refused |
+| 2026-11-20 | AD-1, AD-2, AD-3 all refused, same error |
+
+The error is `Out of capacity for shape VM.Standard.A1.Flex in availability
+domain AD-n. Create the instance in a different availability domain or try
+again later.` Nothing about the form causes it — the same form with
+`VM.Standard.E2.1.Micro` builds immediately. Switching availability domain
+in the wizard re-checks capacity on the spot and shows the refusal without
+your having to press **Create** again, so three domains cost one pass.
+
+Do not try another region to get around it. Always Free resources exist only
+in the tenancy's home region, which here is `us-ashburn-1`; an instance
+anywhere else is billable.
 
 One trap worth recording: the console filters the image list by the selected
 shape, so once an Arm image is chosen the micro shape greys out as "not
@@ -149,7 +168,13 @@ has an `aarch64` wheel on PyPI — `onnxruntime` 1.32.0, `numpy`, `pillow`,
   volumes, so don't take more than you need if you want a second instance.
 - **Networking:** keep *Assign a public IPv4 address* — **yes**. This is the
   thing Google charges for and Oracle does not.
-- **SSH keys:** paste your public key
+- **SSH keys:** *Paste public key*, and paste yours. The field is at the
+  bottom of the **Networking** step, not under Basic information where you
+  would look for it, and it is not on the review page at all — so a form
+  that looks complete can still be one you cannot log into. The default is
+  *Generate a key pair for me*, which hands you a new private key to
+  download and keep; pasting the key you already have is one less secret to
+  look after.
 
 Create it, then note the **public IP address** from the instance page.
 
