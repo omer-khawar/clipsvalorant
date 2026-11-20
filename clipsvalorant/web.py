@@ -1001,9 +1001,21 @@ MAX_WAITING = 24
 KEEP_DONE_S = 20 * 60
 
 # What a scan tends to cost, used only to turn a position into a number of
-# minutes. Measured on the 14-day scans this mostly runs, which land between
-# two and five minutes depending on how many broadcasts have to be opened.
-TYPICAL_SCAN_S = 210
+# minutes. This was guessed at two to five minutes and was wrong by a factor
+# of four, which meant the queue told the fourth person in line to expect a
+# quarter of an hour and then kept them an hour.
+#
+# Measured instead, from the timestamps a scan leaves behind - ingested_at
+# and last_resolved_at across one full account: 100 matches cost 341s to
+# ingest and 461s to resolve, so 3.4s and 4.7s a match, 800s together. The
+# resolve half is the cheaper one per match despite being the half that
+# opens broadcasts, because Layer 5 is selective: that same scan read 292
+# frames in total, against 4,104 candidates it judged on cheaper evidence.
+#
+# Rounded up rather than down. A line that overstates the wait is kinder
+# than one that understates it, and a full scan is the case worth quoting:
+# a quieter account finishes sooner and nobody minds.
+TYPICAL_SCAN_S = 800
 
 
 class Queue:
