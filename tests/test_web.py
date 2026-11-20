@@ -850,22 +850,27 @@ def test_group_ids_are_stable_across_reloads(conn):
 def test_the_ceiling_warning_only_fires_when_the_window_was_truncated(cfg, monkeypatch):
     """A busy player can fill the listing and still have the whole window
     covered. Warning there would cry wolf on every scan they ever run, which
-    is how a true warning stops being read."""
+    is how a true warning stops being read.
+
+    Whether it was covered is ingest's answer, not something inferred from
+    the dates lying in the database: ingest is the half that walks the pages,
+    so it is the only half that knows whether the history ran out or the
+    ceiling did."""
     import time as _time
 
     from clipsvalorant.ingest import IngestReport
 
     monkeypatch.setattr("clipsvalorant.web._correct_region", lambda acct, job: acct)
-    monkeypatch.setattr("clipsvalorant.ingest.ingest",
-                        lambda c, **k: IngestReport(seen=40, stored=0))
+    monkeypatch.setattr(
+        "clipsvalorant.ingest.ingest",
+        lambda c, **k: IngestReport(seen=40, stored=0, complete=True),
+    )
     monkeypatch.setattr("clipsvalorant.resolve.resolve_recent",
                         lambda *a, **k: _NoReport())
 
     acct = web.config_for(cfg, "Busy#NA1")
     now = int(_time.time())
     with db.session(acct.db_path) as conn:
-        # Forty matches, the oldest of them twenty days back: the listing is
-        # full but it still reaches past a fourteen-day cutoff.
         for n in range(40):
             _store_match(conn, f"old-{n}", now - (20 - n // 4) * 86400)
         conn.commit()
@@ -876,28 +881,35 @@ def test_the_ceiling_warning_only_fires_when_the_window_was_truncated(cfg, monke
 
 
 def test_the_ceiling_warning_does_fire_when_the_window_was_truncated(cfg, monkeypatch):
+    """And when it fires it says how far back the listing actually got, so
+    the number in front of the user is the window they really received."""
     import time as _time
 
     from clipsvalorant.ingest import IngestReport
 
+    now = int(_time.time())
     monkeypatch.setattr("clipsvalorant.web._correct_region", lambda acct, job: acct)
-    monkeypatch.setattr("clipsvalorant.ingest.ingest",
-                        lambda c, **k: IngestReport(seen=40, stored=0))
+    monkeypatch.setattr(
+        "clipsvalorant.ingest.ingest",
+        lambda c, **k: IngestReport(
+            seen=40, stored=0, complete=False, oldest_listed=now - 3 * 86400,
+        ),
+    )
     monkeypatch.setattr("clipsvalorant.resolve.resolve_recent",
                         lambda *a, **k: _NoReport())
 
     acct = web.config_for(cfg, "Busier#NA1")
-    now = int(_time.time())
     with db.session(acct.db_path) as conn:
-        # Forty matches all inside the last three days: we ran out of matches
-        # long before we ran out of window.
         for n in range(40):
             _store_match(conn, f"new-{n}", now - 3 * 3600 * (n % 24) - 3600)
         conn.commit()
 
     job = web.Job(id="j", riot_id="Busier#NA1", key="")
     web.run_search(cfg, job, days=14, fetch=40, watch=False)
-    assert any("ceiling" in note for note in job.notes), job.notes
+    note = next((n for n in job.notes if "ceiling" in n), None)
+    assert note, job.notes
+    assert "3.0 days back" in note
+    assert "not the full 14 days" in note
 
 
 # ------------------------------------------------------------ the queue

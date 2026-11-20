@@ -65,8 +65,14 @@ MAX_DAYS = 30
 # Matches pulled from HenrikDev in one search. The day window decides which of
 # them are worth resolving; this is only a ceiling on the asking, so that a
 # wide window cannot turn into an unbounded number of API calls.
+#
+# The ceiling used to be one hundred, which is also the largest page the
+# listing endpoint returns - so the two limits coincided and thirty days
+# quietly meant "the hundred most recent matches", which for an active player
+# was twenty-one days. ingest.PAGE_SIZE is the page now and this is only the
+# ceiling: 250 is thirty days at eight matches a day, more than anyone plays.
 DEFAULT_FETCH = 40
-MAX_FETCH = 100
+MAX_FETCH = 250
 
 MAX_JOB_LINES = 400
 
@@ -886,10 +892,9 @@ def run_search(
                 )
             ]
             edges = conn.execute(
-                "SELECT MAX(started_at_epoch) AS newest,"
-                "       MIN(started_at_epoch) AS oldest FROM match"
+                "SELECT MAX(started_at_epoch) AS newest FROM match"
             ).fetchone()
-            newest, oldest = edges["newest"], edges["oldest"]
+            newest = edges["newest"]
 
         if not ids:
             if newest:
@@ -910,19 +915,18 @@ def run_search(
             job.state = "done"
             return
 
-        # The ceiling only truncated the window if we ran out of matches
-        # before running out of days. A listing that came back full but still
-        # reaches past the cutoff covered everything that was asked for, and
-        # warning there would cry wolf on every scan by a busy player.
-        covered = (time.time() - oldest) / 86400 if oldest else 0.0
-        if report.seen >= fetch and covered < days * 0.9:
-            # A tenth of the window, not a second of it. A listing that lands
-            # on the boundary has covered what was asked for, and a warning
-            # that fires every time stops being read.
+        # Whether the window was covered is ingest's answer to give, not
+        # something to infer from how full the listing came back: it is the
+        # half that walks the pages and the only half that knows whether it
+        # stopped because the history ran out or because the ceiling did.
+        if not report.complete:
+            reach = report.oldest_listed
+            covered = (time.time() - reach) / 86400 if reach else 0.0
             job.note(
-                f"Hit the {fetch}-match ceiling after {covered:.1f} days, so this "
-                f"is the most recent {fetch} matches rather than the full {days}. "
-                "Pick a shorter window, or scan again later."
+                f"Stopped at the {fetch}-match ceiling {covered:.1f} days back, so "
+                f"this is the most recent {report.seen} matches and not the full "
+                f"{days} days - older matches inside the window were never looked "
+                "at. A shorter window gets covered in full."
             )
 
         if not acct.has_twitch:
@@ -3012,11 +3016,11 @@ $("#scanform").addEventListener("submit", function(ev){
   api("/api/search", {
     method: "POST", headers: {"Content-Type": "application/json"},
     /* The ceiling has to follow the window, or picking 14 days quietly
-       gives you eight. Listing more costs one call whatever the size - only
-       matches that are new AND inside the window are fetched in detail - so
-       this is close to free. */
+       gives you eight. Listing is cheap - one call per hundred matches, and
+       only the ones that are new AND inside the window get fetched in detail
+       - so this asks for the whole window and lets the window end the walk. */
     body: JSON.stringify({riot_id: riot, days: S.days, watch: true,
-                          fetch: Math.min(100, Math.max(40, S.days * 8))})
+                          fetch: Math.min(250, Math.max(40, S.days * 8))})
   }).then(function(j){
     $("#log").textContent = "";
     S.gateOut = false;

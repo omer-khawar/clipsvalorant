@@ -21,6 +21,15 @@ from clipsvalorant.models import Match
 
 log = logging.getLogger(__name__)
 
+# The listing endpoint answers one page at a time. One hundred is the largest
+# page this project has seen it return, and a thirty-day window for an active
+# player is comfortably more than that, so a window wider than one page has to
+# be walked rather than asked for in a single call.
+PAGE_SIZE = 100
+# Purely a guard against a `page` parameter that silently does nothing. The
+# real stop conditions are the window, the end of the history, and `limit`.
+MAX_PAGES = 12
+
 
 @dataclass
 class IngestReport:
@@ -30,6 +39,14 @@ class IngestReport:
     failed: int = 0
     highlights: int = 0
     too_old: int = 0
+    pages: int = 0
+    # True when the listing was walked all the way out of the window, or the
+    # history ran out before the window did. False means `limit` stopped it
+    # first and there are older matches inside the window nobody looked at.
+    # The caller is expected to say so rather than present a partial answer
+    # as a whole one.
+    complete: bool = True
+    oldest_listed: int | None = None
     errors: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -39,10 +56,14 @@ class IngestReport:
             f"{self.skipped} already known",
             f"{self.highlights} highlight(s)",
         ]
+        if self.pages > 1:
+            parts.append(f"{self.pages} listing pages")
         if self.too_old:
             parts.append(f"{self.too_old} past the window, not fetched")
         if self.failed:
             parts.append(f"{self.failed} failed")
+        if not self.complete:
+            parts.append("stopped at the ceiling, older matches not listed")
         return ", ".join(parts)
 
 
@@ -50,6 +71,111 @@ def _epoch(dt) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp())
+
+
+def _listed_epoch(entry) -> int | None:
+    """When the listing says this match started, or None if it does not say.
+
+    A field that moves or vanishes must not silently empty a whole scan, so
+    'no date' means 'fetch it and see', never 'too old'.
+    """
+    try:
+        return _epoch(entry.meta.started_at)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _list_window(
+    client,
+    cfg: Config,
+    *,
+    mode: str | None,
+    limit: int,
+    since_epoch: int | None,
+    report: IngestReport,
+    cancel: CancelToken,
+) -> list:
+    """Page through the listing until it leaves the window, or runs out.
+
+    Asking for `size=100` returns the hundred most recent matches and nothing
+    else, so a scan that never asked for page two could only ever cover as
+    many days as a hundred matches happen to span. For an active player that
+    is three weeks, which is how choosing thirty days quietly returned 69% of
+    them. The window decides the depth now; `limit` is the ceiling that keeps
+    it from becoming unbounded, and when the ceiling is what stopped the walk
+    `report.complete` is False so the caller can say so.
+    """
+    out: list = []
+    seen_ids: set[str] = set()
+    # Fixed for the whole walk, deliberately. Which matches page two holds
+    # depends on the size page one was asked with, so shrinking the size to
+    # fit the remaining ceiling would ask for a page that overlaps the one
+    # already read - and the overlap looks exactly like the end of the
+    # history. Over-reading the last page costs nothing: it is the same one
+    # call either way, and anything past the ceiling is trimmed below.
+    size = min(PAGE_SIZE, max(1, limit))
+    page = 1
+    complete = True
+
+    while True:
+        cancel.check()
+        chunk = client.stored_matches(
+            cfg.riot_name,
+            cfg.riot_tag,
+            cfg.region,
+            mode=mode,
+            size=size,
+            page=page,
+        )
+        report.pages = page
+
+        fresh = [e for e in chunk if e.meta.id not in seen_ids]
+        if not fresh:
+            if len(chunk) >= size:
+                # A full page of matches already read means `page` was
+                # accepted and ignored, not that the history ended. Calling
+                # that complete would be the exact lie this walk exists to
+                # stop telling.
+                complete = False
+            break
+        for entry in fresh:
+            seen_ids.add(entry.meta.id)
+        out.extend(fresh)
+
+        # The window first, then the end of the history, then the ceiling.
+        # A page that both crosses the cutoff and fills the ceiling covered
+        # the window, and saying otherwise would cry wolf.
+        if since_epoch is not None:
+            dated = [w for w in (_listed_epoch(e) for e in fresh) if w is not None]
+            if dated and min(dated) < since_epoch:
+                break
+        if len(fresh) < size:
+            break
+        if len(out) >= limit:
+            complete = False
+            break
+        page += 1
+        if page > MAX_PAGES:
+            complete = False
+            break
+
+    kept = out[:limit]
+    dropped = out[limit:]
+    if dropped and (
+        since_epoch is None
+        or any(
+            w is not None and w >= since_epoch
+            for w in (_listed_epoch(e) for e in dropped)
+        )
+    ):
+        # Trimming threw away a match that was inside the window, which is
+        # the one case the caller must not present as a complete answer.
+        complete = False
+
+    report.complete = complete
+    dates = [w for w in (_listed_epoch(e) for e in kept) if w is not None]
+    report.oldest_listed = min(dates) if dates else None
+    return kept
 
 
 def persist_match(
@@ -280,15 +406,20 @@ def ingest(
     since_epoch: int | None = None,
     cancel: CancelToken | None = None,
 ) -> IngestReport:
-    """Fetch the most recent `limit` matches and store any we do not already have.
+    """Store every match inside the window, up to `limit` of them.
 
-    `since_epoch` is the oldest match worth having. The listing already
-    carries each match's start time, so a match older than that can be
-    dropped before its detail is fetched - and the detail is the expensive
-    part. HenrikDev charges a point per call plus one per Riot request it
-    triggers behind the scenes, and when the window runs dry the client
-    sleeps it out, so fetching forty matches to resolve twelve is not merely
-    wasteful, it is most of the wall clock.
+    `since_epoch` is the oldest match worth having, and it drives how deep
+    the listing is walked: the endpoint pages, and a scan that only ever read
+    page one covered as many days as a hundred matches happened to span.
+    `limit` is the ceiling that stops a wide window becoming unbounded API
+    calls, and when it is what ended the walk the report says so.
+
+    The listing already carries each match's start time, so a match older
+    than the window can be dropped before its detail is fetched - and the
+    detail is the expensive part. HenrikDev charges a point per call plus one
+    per Riot request it triggers behind the scenes, and when the window runs
+    dry the client sleeps it out, so fetching forty matches to resolve twelve
+    is not merely wasteful, it is most of the wall clock.
     """
     report = IngestReport()
     cancel = cancel or NullToken()
@@ -297,8 +428,14 @@ def ingest(
         already = db.known_match_ids(conn)
 
         with HenrikClient(cfg.henrik_api_key, cancel=cancel) as client:
-            listed = client.stored_matches(
-                cfg.riot_name, cfg.riot_tag, cfg.region, mode=mode, size=limit
+            listed = _list_window(
+                client,
+                cfg,
+                mode=mode,
+                limit=limit,
+                since_epoch=since_epoch,
+                report=report,
+                cancel=cancel,
             )
             report.seen = len(listed)
 
@@ -311,10 +448,7 @@ def ingest(
                     report.skipped += 1
                     continue
                 if since_epoch is not None:
-                    try:
-                        when = _epoch(entry.meta.started_at)
-                    except (AttributeError, TypeError, ValueError):
-                        when = None  # no date on the listing: fetch it and see
+                    when = _listed_epoch(entry)
                     if when is not None and when < since_epoch:
                         report.too_old += 1
                         continue
