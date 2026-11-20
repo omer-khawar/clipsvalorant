@@ -13,7 +13,7 @@
 
 [Unit]
 Description=val:grind (clipsvalorant)
-Documentation=https://github.com/omerkhawar/clipsvalorant
+Documentation=https://github.com/omer-khawar/clipsvalorant
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target

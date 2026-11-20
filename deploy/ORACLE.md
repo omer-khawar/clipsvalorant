@@ -210,7 +210,7 @@ sudo usermod -aG docker ubuntu && newgrp docker
 ## 6. Get the code and write the secrets
 
 ```bash
-sudo git clone https://github.com/omerkhawar/clipsvalorant.git /opt/clipsvalorant && sudo chown -R ubuntu:ubuntu /opt/clipsvalorant
+sudo git clone https://github.com/omer-khawar/clipsvalorant.git /opt/clipsvalorant && sudo chown -R ubuntu:ubuntu /opt/clipsvalorant
 ```
 
 ```bash
