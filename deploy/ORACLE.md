@@ -180,14 +180,28 @@ the health check in step 8.
 
 ---
 
-## 4. Get a hostname
+## 4. Get a hostname — you already have one
 
 Caddy needs a real hostname to get a certificate; Let's Encrypt will not
-issue one for a bare IP. DuckDNS gives you one free, permanently.
+issue one for a bare IP. **There is nothing to sign up for.** sslip.io is
+free wildcard DNS that resolves any hostname containing an IP address to that
+address, so your machine already has a name:
 
-Sign in at <https://www.duckdns.org/> with any of its login options, create a
-subdomain (say `valgrind`), point it at your instance's public IP, and copy
-your **token** from the top of the page.
+```
+129.159.174.254  ->  129-159-174-254.sslip.io
+```
+
+Take your public IP, swap the dots for hyphens, append `.sslip.io`. That is
+`SITE_HOST`. No account, no token, no domain, and Let's Encrypt issues
+against it happily — that is what is serving this machine today.
+
+The one trade is that the name follows the IP, so recreating the instance
+changes the URL. If you would rather have a name that survives that, DuckDNS
+is free and permanent: sign in at <https://www.duckdns.org/>, create a
+subdomain, point it at the IP, and copy your **token** from the top of the
+page. `.env.example` keeps `DUCKDNS_DOMAIN` and `DUCKDNS_TOKEN` for exactly
+that case, and `keepalive.sh` refreshes the record when they are filled in
+and silently skips it when they are not.
 
 ---
 
@@ -217,11 +231,13 @@ sudo git clone https://github.com/omer-khawar/clipsvalorant.git /opt/clipsvalora
 cd /opt/clipsvalorant/deploy && cp .env.example .env && nano .env
 ```
 
-Fill in `SITE_HOST` (the full `something.duckdns.org`), `DUCKDNS_DOMAIN` (just
-the label) and `DUCKDNS_TOKEN`, your `HENRIK_API_KEY`, the two Twitch values,
-and **set `CLIPS_PASSWORD`**. The machine is on a public hostname; without a
-password anyone who finds it spends your API quota and can see whose matches
-have been scanned.
+Fill in `SITE_HOST` — the sslip.io name from step 4, or your DuckDNS one —
+your `HENRIK_API_KEY`, the two Twitch values, and **set `CLIPS_PASSWORD`**.
+The machine is on a public hostname; without a password anyone who finds it
+spends your API quota and can see whose matches have been scanned.
+
+Leave `DUCKDNS_DOMAIN` and `DUCKDNS_TOKEN` empty unless you chose DuckDNS.
+The keepalive checks whether they are set before using them.
 
 ---
 
@@ -251,17 +267,30 @@ and (Arm shapes only) memory under 20%. All of those must be true at once, so
 defeating any one is enough — and a clip finder nobody uses for a week meets
 all three.
 
-`keepalive.sh` fetches the site hourly over its public hostname and refreshes
-the DNS record. That is a genuine end-to-end health check which happens to
-satisfy the policy — it exercises DNS, Caddy, the certificate and the app, so
-a failed renewal shows up in a log instead of in a friend's complaint.
+`keepalive.sh` fetches the site hourly over its public hostname, and refreshes
+the DNS record if you went the DuckDNS route. That is a genuine end-to-end
+health check which happens to satisfy the policy — it exercises DNS, Caddy,
+the certificate and the app, so a failed renewal shows up in a log instead of
+in a friend's complaint.
 
 ```bash
 sudo cp /opt/clipsvalorant/deploy/keepalive.sh /usr/local/bin/clipsvalorant-keepalive && sudo chmod +x /usr/local/bin/clipsvalorant-keepalive
 ```
 
+**Use the systemd timer, not cron.** This image ships without the `cron`
+package, and `crontab -` fails *silently* on it — so the obvious one-liner
+leaves you with no reclamation guard and no error saying so. This file told
+you to run that one-liner for a day before anyone noticed.
+
 ```bash
-( crontab -l 2>/dev/null; echo "17 * * * * /usr/local/bin/clipsvalorant-keepalive >> /var/log/clipsvalorant-keepalive.log 2>&1" ) | crontab -
+sudo cp /opt/clipsvalorant/deploy/clipsvalorant-keepalive.{service,timer} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now clipsvalorant-keepalive.timer
+```
+
+Check it is actually scheduled — an installed timer that is not running looks
+identical to one that is, until seven idle days pass:
+
+```bash
+systemctl list-timers clipsvalorant-keepalive.timer
 ```
 
 Run it once by hand to prove everything works end to end:
@@ -271,9 +300,15 @@ Run it once by hand to prove everything works end to end:
 ```
 
 `healthz: 200` means DNS, both firewall layers, the certificate and the app
-are all correct. Then open `https://your-subdomain.duckdns.org` and run a
-scan — and let it finish, because for the first time nothing will interrupt
-it at five minutes.
+are all correct. It writes to `/var/log/clipsvalorant-keepalive.log`, and that
+log is worth knowing about: when the machine went down it recorded
+`WARNING: the site did not answer 200` at the top of two consecutive hours and
+a 200 again when it came back, which is the whole outage without anyone
+watching. (A failed check logs the code as `000000` rather than `000` — the
+curl format string and the fallback both print one. Cosmetic.)
+
+Then open your `SITE_HOST` in a browser and run a scan — and let it finish,
+because for the first time nothing will interrupt it at five minutes.
 
 ---
 
@@ -322,7 +357,8 @@ resumability first.
 | No public IPv4 assigned | No inbound, and no outbound without paid NAT | Keep the IP — it is free here |
 | Home region picked carelessly | Permanent; adds latency across 9,000 calls | Choose near you at signup |
 | Boot volumes over 200 GB total | Billable | 50 GB is plenty |
-| Idle for 7 days | Instance reclaimed | Install the keepalive cron |
+| Idle for 7 days | Instance reclaimed | Install the keepalive **timer** |
+| Installing the keepalive as cron | No guard at all, silently — this image has no `cron` | Use the systemd timer |
 | `CLIPS_PASSWORD` left empty | Anyone spends your API quota | Set it before sharing the URL |
 | Losing the `caddy_data` volume | A new certificate on every restart, then rate-limited | Don't `docker compose down -v` |
 
