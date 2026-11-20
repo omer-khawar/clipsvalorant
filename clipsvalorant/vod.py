@@ -351,7 +351,28 @@ class FrameReader:
     def _frame_from_segment(
         self, index: Index, hit: tuple[int, float], dest: Path
     ) -> Path | None:
-        """Pull the frame out of the single segment that holds it."""
+        """Pull the frame out of the single segment that holds it.
+
+        The seek goes AFTER `-i`, which makes it an output option: ffmpeg
+        decodes the segment from its start and throws frames away until the
+        timestamp, rather than jumping into the middle of the file.
+
+        That ordering is the whole difference between working and not on
+        ffmpeg 5.1, which is what Debian bookworm ships and therefore what
+        this runs on. Asked to seek into a lone fragmented-MP4 segment it
+        lands mid-NAL and gives up:
+
+            Invalid NAL unit size (-37230577 > 6779)
+
+        -- returning 0 and writing nothing, four times out of four. The only
+        offsets that survived were the ones that happened to land exactly on
+        a segment boundary and so seeked zero seconds, and a kill timestamp
+        almost never does. A newer ffmpeg handles it either way, which is
+        exactly why this was invisible until it ran on the server.
+
+        Decoding forward costs 1-5s depending on how deep into the ten
+        seconds we land, against 0.5s for the seek that does not work.
+        """
         i, remainder = hit
         spec = dest.with_suffix(".m3u8")
         try:
@@ -360,7 +381,7 @@ class FrameReader:
             return None
         try:
             return self._run_ffmpeg(
-                [*LOCAL_HLS_ARGS, "-ss", f"{remainder:.3f}", "-i", str(spec)], dest
+                [*LOCAL_HLS_ARGS, "-i", str(spec), "-ss", f"{remainder:.3f}"], dest
             )
         finally:
             try:

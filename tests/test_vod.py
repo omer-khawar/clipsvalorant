@@ -317,6 +317,19 @@ def test_a_deep_frame_never_hands_ffmpeg_the_whole_playlist(tmp_path):
     assert list(tmp_path.glob("*.m3u8")) == []
 
 
+def test_the_seek_is_an_output_option(tmp_path):
+    """`-ss` after `-i` decodes forward and discards; before `-i` it jumps into
+    the file. ffmpeg 5.1 - what Debian bookworm ships, and what the server
+    runs - cannot do the second one into a lone fragmented-MP4 segment: it
+    lands mid-NAL and writes nothing, every time the offset does not happen to
+    fall on a segment boundary. Newer builds tolerate either, which is how
+    this passed here and failed there."""
+    r = _Spy(tmp_path)
+    r.frame("v1", 24)
+    args = r.calls[0]
+    assert args.index("-ss") > args.index("-i"), args
+
+
 def test_a_frame_past_the_end_costs_no_ffmpeg_at_all(tmp_path):
     r = _Spy(tmp_path)
     assert r.frame("v1", 9_000) is None
