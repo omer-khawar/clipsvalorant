@@ -1194,3 +1194,49 @@ def test_the_health_check_answers_without_the_password(srv, monkeypatch):
     monkeypatch.setenv(web.PASSWORD_ENV, "hunter2")
     status, body, _ = _raw_get(srv.port, "/healthz", None)
     assert status == 200 and body.strip() == b"ok"
+
+
+def test_how_long_rounds_to_words_that_are_true():
+    """The estimate behind it is an average over a handful of matches, so
+    quoting seconds would claim a precision the number does not have."""
+    assert web._how_long(0) == "1s"
+    assert web._how_long(45) == "45s"
+    assert web._how_long(89) == "89s"
+    assert web._how_long(600) == "10 min"
+    assert web._how_long(3599) == "1h"
+    assert web._how_long(3600) == "1h"
+    assert web._how_long(4500) == "1h 15m"
+
+
+def test_the_progress_line_estimates_from_this_machines_own_pace(cfg, monkeypatch):
+    """A match costs about 4.7s on a laptop and about 34s on the 1/8 OCPU
+    box, so a constant would be wrong on one of them. The figure shown is
+    the one this run is setting - and it is withheld until three matches
+    have gone by, and on the last one, where there is nothing left to wait
+    for."""
+    from clipsvalorant.ingest import IngestReport
+
+    monkeypatch.setattr("clipsvalorant.ingest.ingest",
+                        lambda c, **k: IngestReport(seen=6, stored=6, complete=True))
+
+    def fake_resolve(acct, *, match_ids, watch_vods, on_match, **_):
+        for mid in match_ids:
+            on_match(mid, _NoReport())
+        return _NoReport()
+
+    monkeypatch.setattr("clipsvalorant.resolve.resolve_recent", fake_resolve)
+    other = web.config_for(cfg, "Pacey#NA1")
+    with db.session(other.db_path) as conn:
+        for n in range(6):
+            _store_match(conn, f"m{n}", RECENT - n * 3600)
+        conn.commit()
+    cfg = dataclasses.replace(cfg, twitch_client_id="id", twitch_client_secret="s")
+    monkeypatch.setattr("clipsvalorant.web._correct_region", lambda acct, job: acct)
+    job = web.Job(id="j", riot_id="Pacey#NA1", key="")
+    web.run_search(cfg, job, days=14, watch=False)
+
+    checked = [ln for ln in job.snapshot()["lines"] if " checked - " in ln]
+    assert len(checked) == 6
+    assert "left" not in checked[0] and "left" not in checked[1]
+    assert "left" in checked[2]
+    assert "left" not in checked[5]

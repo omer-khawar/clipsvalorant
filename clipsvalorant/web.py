@@ -797,6 +797,23 @@ class _JobLog(logging.Handler):
             pass
 
 
+def _how_long(seconds: float) -> str:
+    """A wait, in the roundest words that are still true.
+
+    Deliberately coarse. The estimate it dresses is an average over a
+    handful of matches, and quoting it to the second would claim a
+    precision the number does not have.
+    """
+    seconds = max(0.0, seconds)
+    if seconds < 90:
+        return f"{max(1, int(round(seconds)))}s"
+    minutes = int(round(seconds / 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours}h" if rest == 0 else f"{hours}h {rest}m"
+
+
 def _correct_region(acct: Config, job: Job) -> Config:
     """Ask HenrikDev which shard this Riot ID actually plays on.
 
@@ -946,15 +963,25 @@ def run_search(
             + "..."
         )
         done = 0
+        began = time.time()
 
         def tick(match_id: str, report: Any) -> None:
             nonlocal done
             done += 1
             job.step("resolve", done=done)
+            # The pace this machine is actually managing, not a constant
+            # measured on another one. A match costs about 4.7s on a laptop
+            # and about 34s on a 1/8 OCPU box, so the only figure worth
+            # showing is the one this run is setting, and a wide window on
+            # slow hardware is an hour nobody was warned about.
+            left = ""
+            if 3 <= done < len(ids):
+                pace = (time.time() - began) / done
+                left = f", about {_how_long(pace * (len(ids) - done))} left"
             job.say(
                 f"match {done}/{len(ids)} checked - "
                 f"{len(report.confirmed)} confirmed, {len(report.likely)} likely, "
-                f"{len(report.unverified)} unverified"
+                f"{len(report.unverified)} unverified{left}"
             )
 
         found = resolve_recent(
