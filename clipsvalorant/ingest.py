@@ -46,6 +46,10 @@ class IngestReport:
     # The caller is expected to say so rather than present a partial answer
     # as a whole one.
     complete: bool = True
+    # The oldest match the listing kept. It is how deep the window was
+    # actually covered only when `complete` is False, because a walk that
+    # ran to the cutoff deliberately keeps the whole page it crossed on -
+    # entries past the window and all, which `too_old` then drops.
     oldest_listed: int | None = None
     errors: list[str] = field(default_factory=list)
 
