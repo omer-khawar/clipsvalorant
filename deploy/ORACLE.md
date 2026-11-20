@@ -302,6 +302,10 @@ Changing `pyproject.toml` reinstalls onnxruntime and opencv and costs **320s**
 here, measured the same day. That is the real price of this shape, and it is
 now paid only when dependencies actually move.
 
+The site answers **502 for a few seconds** during a restart, while Caddy is
+already up and the app is still importing onnxruntime. It clears itself and
+is not worth investigating; check again before you go looking.
+
 Note that a restart also **drops a scan in progress** — the queue lives
 in memory and nothing resumes. Deploy when nobody is mid-scan, or fix the
 resumability first.
