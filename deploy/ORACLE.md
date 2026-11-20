@@ -292,11 +292,15 @@ file written over SSH with nothing anywhere to say whether the box and the
 repository still agreed. If you rebuild this machine, clone it; do not copy
 it.
 
-Expect **about 20 seconds** for a code change. The Dockerfile installs
+Expect **about half a minute** for a code change. The Dockerfile installs
 dependencies from `pyproject.toml` before it copies any source, so a Python
-edit reruns only the last two layers. Changing `pyproject.toml` reinstalls
-onnxruntime and opencv and takes about four minutes on this shape — that is
-the real cost, and it is now paid only when dependencies actually move.
+edit reruns only the last two layers. Measured on this machine, changing one
+line of `web.py`: **31s**, against 243s and 249s for the same kind of change
+before the layers were reordered.
+
+Changing `pyproject.toml` reinstalls onnxruntime and opencv and costs **320s**
+here, measured the same day. That is the real price of this shape, and it is
+now paid only when dependencies actually move.
 
 Note that a restart also **drops a scan in progress** — the queue lives
 in memory and nothing resumes. Deploy when nobody is mid-scan, or fix the
