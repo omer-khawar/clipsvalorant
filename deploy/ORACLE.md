@@ -116,10 +116,27 @@ Free monthly allowance covers running 24/7 (1,500 OCPU-hours ÷ 730 ≈ 2.05,
 and 9,000 GB-hours ÷ 730 ≈ 12.3). Asking for more silently makes it billable.
 
 If you get **"Out of host capacity"**, that is normal for Arm and not
-something you did wrong. Either retry over a few hours or take the E2.1.Micro
-— the app is network-bound and barely touches the CPU, so 1/8 OCPU is
-genuinely workable. *Everything below is identical for either shape*, because
-the image is built on the machine and picks up its own architecture.
+something you did wrong. Either retry over a few hours or take the
+E2.1.Micro. *Everything below is identical for either shape*, because the
+image is built on the machine and picks up its own architecture.
+
+**The micro is a fallback, not an equal.** This runbook used to say the app
+was network-bound and barely touched the CPU, so 1/8 OCPU was "genuinely
+workable". That was written before anything was measured and it is wrong.
+Layer 5 reads VOD frames with OCR, which is pure CPU, and the difference is
+not subtle:
+
+| | 12-core laptop | this 1/8 OCPU micro |
+|---|---|---|
+| One VOD frame, decode + OCR | ~1.6s | ~13.2s |
+| One match, end to end | ~4.7s | ~34s |
+| 100 matches | 461s | over 50 minutes |
+
+Both numbers are measured, the laptop's from `ingested_at` and
+`last_resolved_at` across a full 100-match scan. Same code, same API keys:
+the whole of the difference is the hardware. A scan on the micro is not
+slightly slower, it is seven times slower, and it is why a wide window feels
+broken rather than merely patient. If A1 has capacity, take it.
 
 I verified the Arm question directly rather than guessing: every dependency
 has an `aarch64` wheel on PyPI — `onnxruntime` 1.32.0, `numpy`, `pillow`,
