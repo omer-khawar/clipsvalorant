@@ -65,12 +65,27 @@ INDEX_TIMEOUT_S = 30
 # A sane ceiling on that text. A seven-hour VOD indexes to about 55 KB, so
 # anything past this is not a playlist we understand.
 MAX_INDEX_BYTES = 8 * 1024 * 1024
-# How many frames to have in flight while the caller is reading one. Fetching
-# a frame costs about two seconds and OCR about two and a half, and they use
-# different resources, so overlapping them hides most of the fetch. Four is
-# past the point where more helps: measured at 2.2x on four workers and 2.6x
-# on eight, against ffmpeg processes that are not free to spawn.
-PREFETCH = 4
+# How many frames to have in flight while the caller is reading one.
+#
+# This was four, justified by fetching and reading using "different
+# resources - one is ffmpeg waiting on Twitch, the other is OCR on the CPU".
+# That stopped being true the day the seek moved after `-i`: a fetch now
+# decodes up to ten seconds of 720p60 forward, which is CPU work, and on a
+# two-core box four of them compete with the OCR they exist to feed.
+#
+# Measured on the deployed machine, ten fresh frames fetched and read:
+#
+#     four in flight   181.9s   (ocr 174.7s, waiting on frames 7.2s)
+#     two in flight    162.3s   (ocr 160.1s, waiting 2.2s)
+#     one in flight    134.2s   (ocr 132.1s, waiting 2.1s)
+#
+# One at a time wins by 26% with no parallelism at all, because the frames
+# were never the wait - 7.2s of 182s - and every core handed to ffmpeg is a
+# core taken from the thing that actually costs something.
+#
+# On a machine with cores to spare the original reasoning still holds, so
+# this scales rather than dropping to one everywhere.
+PREFETCH = 1 if (os.cpu_count() or 1) <= 2 else 4
 # How many VODs to resolve playlists for at once. Resolving one costs about
 # 2.6 seconds, of which 1.25 is `yt-dlp` starting Python up before it has
 # touched the network at all - so this is idle time twice over, and a scan
