@@ -10,7 +10,7 @@ the moment the answer is certain - and a frame costs about two seconds.
 import threading
 import time
 
-from clipsvalorant.vod import FrameReader
+from clipsvalorant.vod import FrameReader, one_segment_playlist, parse_index
 
 
 class _Reader(FrameReader):
@@ -186,3 +186,165 @@ def test_nothing_to_prefetch_is_not_an_error(tmp_path):
     r.prefetch_playlists([])
     r.prefetch_playlists(["", None])
     assert r.resolved == []
+
+
+# ---- finding the segment ourselves ---------------------------------------
+#
+# Handing ffmpeg the whole playlist and an -ss an hour deep worked on one
+# machine and, on the deployed one, downloaded the broadcast from the start
+# until the timeout killed it - so every frame failed and Layer 5 confirmed
+# nothing while looking exactly like a broadcast with nothing in it. These
+# cover the arithmetic that replaced it.
+
+BASE = "https://cdn.invalid/abc_nika_123/720p60/index-dvr.m3u8"
+
+PLAYLIST = """#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:10
+#EXT-X-PLAYLIST-TYPE:EVENT
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-MAP:URI="init-0.mp4"
+#EXTINF:10.000,
+0.mp4
+#EXTINF:10.000,
+1.mp4
+#EXTINF:4.500,
+2.mp4
+#EXTINF:10.000,
+3.mp4
+#EXT-X-ENDLIST
+"""
+
+
+def test_segment_urls_resolve_against_the_playlist():
+    """Twitch names segments `1017.mp4` and nothing else. Resolved against the
+    wrong base they are 404s, which would look like a VOD that had expired."""
+    index = parse_index(PLAYLIST, BASE)
+    assert index is not None
+    assert index.urls[0] == "https://cdn.invalid/abc_nika_123/720p60/0.mp4"
+    assert index.init == "https://cdn.invalid/abc_nika_123/720p60/init-0.mp4"
+
+
+def test_a_segment_is_found_by_adding_up_the_durations():
+    """Not by dividing by the target duration. Segments are usually ten
+    seconds and are not promised to be: one short segment early shifts every
+    later one, and a frame read from the wrong moment is worse than none."""
+    index = parse_index(PLAYLIST, BASE)
+    assert index.covering(0) == (0, 0.0)
+    assert index.covering(15) == (1, 5.0)
+    # 2.mp4 runs 20.0 -> 24.5, so 24.0 is four seconds into it ...
+    assert index.covering(24) == (2, 4.0)
+    # ... and 24.5 is already the next one, which a /10 would have missed.
+    assert index.covering(24.5) == (3, 0.0)
+    assert index.total == 34.5
+
+
+def test_a_moment_the_broadcast_does_not_reach_is_not_a_failure():
+    """A stream that joined late or stopped early does not hold the moment we
+    wanted. Saying so costs nothing; it used to cost a walk through the VOD."""
+    index = parse_index(PLAYLIST, BASE)
+    assert index.covering(34.5) is None
+    assert index.covering(9_000) is None
+    assert index.covering(-1) is None
+
+
+def test_a_master_playlist_is_not_a_segment_list():
+    """The URIs in one are renditions, not segments. Read as segments they
+    would be four frames of nothing; better to report no index and fall back."""
+    master = (
+        "#EXTM3U\n"
+        '#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080\n'
+        "chunked/index-dvr.m3u8\n"
+        '#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720\n'
+        "720p60/index-dvr.m3u8\n"
+    )
+    assert parse_index(master, BASE) is None
+    assert parse_index("", BASE) is None
+
+
+def test_the_one_segment_playlist_carries_the_init_and_one_segment():
+    """Fragmented MP4 will not decode without the `#EXT-X-MAP` fragment, and a
+    second segment in here would be a second download for no extra evidence."""
+    index = parse_index(PLAYLIST, BASE)
+    text = one_segment_playlist(index, 2)
+    assert text.count("#EXTINF:") == 1
+    assert "https://cdn.invalid/abc_nika_123/720p60/2.mp4" in text
+    assert '#EXT-X-MAP:URI="https://cdn.invalid/abc_nika_123/720p60/init-0.mp4"' in text
+    assert "#EXT-X-ENDLIST" in text
+    # VOD, not EVENT: it is complete, and nothing should wait for more.
+    assert "#EXT-X-PLAYLIST-TYPE:VOD" in text
+
+
+def test_an_mpeg_ts_vod_needs_no_init_segment():
+    """Older VODs have no `#EXT-X-MAP`. Inventing one would break them."""
+    plain = "#EXTM3U\n#EXTINF:10.000,\n0.ts\n#EXT-X-ENDLIST\n"
+    index = parse_index(plain, BASE)
+    assert index.init is None
+    assert "#EXT-X-MAP" not in one_segment_playlist(index, 0)
+
+
+class _Spy(FrameReader):
+    """A FrameReader that records the ffmpeg arguments instead of running it."""
+
+    def __init__(self, cache_dir, *, index_text=PLAYLIST):
+        super().__init__(cache_dir=cache_dir)
+        self.index_text = index_text
+        self.calls: list[list[str]] = []
+
+    def playlist(self, vod_id):
+        return BASE
+
+    def _fetch_index(self, url):
+        return parse_index(self.index_text, url) if self.index_text else None
+
+    def _run_ffmpeg(self, args, dest):
+        self.calls.append(list(args))
+        dest.write_bytes(b"x" * 2048)
+        return dest
+
+
+def test_a_deep_frame_never_hands_ffmpeg_the_whole_playlist(tmp_path):
+    """The bug, in one assertion. `-i <the whole index>` with a large `-ss` is
+    what downloaded gigabytes and timed out; what goes in now is a local
+    playlist holding the one segment, and a seek of a few seconds inside it."""
+    r = _Spy(tmp_path)
+    assert r.frame("v1", 24) is not None
+    args = r.calls[0]
+    assert BASE not in args
+    assert args[args.index("-i") + 1].endswith(".m3u8")
+    assert args[args.index("-ss") + 1] == "4.000"
+    # The temporary playlist is cleaned up behind it.
+    assert list(tmp_path.glob("*.m3u8")) == []
+
+
+def test_a_frame_past_the_end_costs_no_ffmpeg_at_all(tmp_path):
+    r = _Spy(tmp_path)
+    assert r.frame("v1", 9_000) is None
+    assert r.calls == []
+
+
+def test_an_unreadable_playlist_still_gets_one_attempt(tmp_path):
+    """Falling back matters: on a build that seeks properly the old path is
+    fine, and refusing to try would turn a parse we got wrong into no frames."""
+    r = _Spy(tmp_path, index_text="")
+    assert r.frame("v1", 24) is not None
+    args = r.calls[0]
+    assert args[args.index("-i") + 1] == BASE
+    assert args[args.index("-ss") + 1] == "24"
+
+
+def test_the_index_is_fetched_once_per_vod(tmp_path):
+    """Four threads pull frames out of one VOD. Fetching the playlist four
+    times would undo most of what this saves."""
+    r = _Spy(tmp_path)
+    fetched = []
+    original = r._fetch_index
+
+    def counting(url):
+        fetched.append(url)
+        return original(url)
+
+    r._fetch_index = counting
+    for offset in (1, 12, 24, 31):
+        r.frame("v1", offset)
+    assert len(fetched) == 1
