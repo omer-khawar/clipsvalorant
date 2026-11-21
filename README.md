@@ -1,8 +1,9 @@
 # clipsvalorant
 
-**Live at [clipsvalorant.fly.dev](https://clipsvalorant.fly.dev)** — type a Riot ID and
-scan. One shared HenrikDev key runs it, so scans take turns in a queue rather than all
-at once; the page tells you where you are in the line.
+Type a Riot ID and scan. One HenrikDev key runs it, so scans take turns in a queue
+rather than all at once; the page tells you where you are in the line. It runs locally
+with `python -m clipsvalorant serve`, and [deploy/ORACLE.md](deploy/ORACLE.md) puts the
+same thing on a free virtual machine with HTTPS.
 
 > **The page is called val:grind** — *your play, their POV*. The brand lives in the web
 > UI: the mark, the wordmark, the splash and the queue screen. The package, the CLI and
@@ -176,12 +177,20 @@ how the test suite runs.
 `serve` is a standard-library HTTP server, which rules out the serverless hosts: there is
 no WSGI app to hand them, and a scan is a background thread that outlives the request
 that started it by several minutes. What it needs is an ordinary process with a disk.
-`Dockerfile` and `fly.toml` are that, on [Fly.io](https://fly.io) — one machine, one
-volume, scaled to zero when nobody is looking.
 
-The deployed page is better off than the local one in one respect: Twitch's embedded
-player wants a real hostname in its `parent` parameter, and `clipsvalorant.fly.dev` is
-one.
+**[deploy/ORACLE.md](deploy/ORACLE.md) is the current recipe** and the one that is
+maintained: an Oracle Always Free virtual machine, Docker Compose, and Caddy for a real
+certificate. It is free rather than nearly free, it is a runbook rather than a sketch,
+and every number in it was measured on the machine it describes. Read that; the rest of
+this section is the history and the parts that are true of any host.
+
+A hosted copy is better off than a local one in one respect: Twitch's embedded player
+wants a real hostname in its `parent` parameter, and `localhost` only works because
+Twitch makes an exception for it.
+
+`fly.toml` is still here and still works. Fly is where this ran first, and the move off
+it was not Fly's fault — Oracle's free tier is a whole machine with a disk, and this
+needs CPU more than it needs anything else.
 
 ### The queue
 
@@ -210,19 +219,30 @@ What that means in the code:
 ### The password
 
 `CLIPS_PASSWORD` gates every route but `/healthz` behind one shared password — any
-username, since there are no accounts to tell apart. Unset, as it is on the deployed
-copy, the page is open to anyone with the link.
+username, since there are no accounts to tell apart. Unset, the page is open to anyone
+with the link, and `serve` says so at startup rather than leaving you to find out.
 
 Leaving it off is a real trade and worth naming: the HenrikDev key is yours, the quota
 spent is yours, and HenrikDev's terms bar "big analytic projects" and ask for user
-consent. A password is what keeps a hosted copy recognisably a personal tool. Turn it
-back on with one command and no redeploy:
+consent. A password is what keeps a hosted copy recognisably a personal tool. On the Oracle
+deploy it lives in `deploy/.env`, which is not committed, and changing it is an edit and
+a restart:
 
 ```bash
-fly secrets set CLIPS_PASSWORD=something -a clipsvalorant
+sudo systemctl restart clipsvalorant
 ```
 
-### First deploy
+On Fly it is a secret and needs no redeploy:
+
+```bash
+fly secrets set CLIPS_PASSWORD=something -a your-app-name
+```
+
+### First deploy, the Fly way
+
+Kept because `fly.toml` is kept, and because a managed host is the right answer for
+somebody who does not want to own a machine. For the maintained path, see
+[deploy/ORACLE.md](deploy/ORACLE.md).
 
 ```bash
 pwsh -Command "iwr https://fly.io/install.ps1 -useb | iex"
@@ -259,7 +279,7 @@ fly deploy --remote-only --ha=false
 file and their own "one search at a time" lock, so which half of your results you saw
 would depend on which machine the proxy picked.
 
-Then `fly open`, or <https://clipsvalorant.fly.dev>. After that, every change is
+Then `fly open`. After that, every change is
 `fly deploy --remote-only`.
 
 ### What is different up there
@@ -287,8 +307,8 @@ Then `fly open`, or <https://clipsvalorant.fly.dev>. After that, every change is
 .venv/Scripts/python.exe -m pytest -q
 ```
 
-45 tests, no network. They run against two synthetic fixtures built by the `_generate*.py`
-scripts in `tests/fixtures/`, with deliberately known answers:
+348 tests, no network. They run against two synthetic fixtures built by the
+`_generate*.py` scripts in `tests/fixtures/`, with deliberately known answers:
 
 - a clean ace (round 2), a 3K (round 4) and a 1v5 clutch attempt (round 6)
 - six kills on five bodies via a resurrection — an ace with `kill_count` 5 (round 10)
@@ -297,6 +317,49 @@ scripts in `tests/fixtures/`, with deliberately known answers:
 - a teamkill and a self-kill, neither of which may inflate a multi-kill (round 14)
 - negative cases: an ace round that must not register as a clutch, a round where you died
   before becoming last alive, and a full Deathmatch that must yield nothing at all
+
+---
+
+## What one scan actually covers
+
+Two settings decide which matches a scan can possibly find anything in, and for a long
+while both were narrower than they looked and neither said so.
+
+**The window is walked, not asked for.** HenrikDev's stored-matches listing pages, and
+a hundred matches is the largest page it returns. Reading only page one meant the window
+never decided the depth — a hundred matches did, which for an active account is about
+three weeks. Choosing 30 days returned 100 of 144 matches and reported the 100 as though
+they were all of it. `_list_window` now walks pages until one crosses the cutoff, the
+history runs out, or the ceiling stops it, and `IngestReport.complete` says which, so
+the page can tell you when it stopped short rather than leaving you to notice.
+
+Two things it has to get right, both of them tested. The page size cannot change
+mid-walk: which matches page two holds depends on the size page one was asked with, so
+shrinking it to fit the remaining ceiling returns a page that overlaps the one already
+read — and that overlap is indistinguishable from the end of the history. And a full
+page of matches already seen means `page` was accepted and ignored, which is not the
+end of the history either, and is reported as incomplete.
+
+**The queue filter hides more than you would guess.** Scans default to Competitive, and
+nothing used to say so. On one real account that is 45 of 69 matches in a fortnight:
+
+| queue | matches in 14 days |
+|---|---|
+| Competitive | 45 |
+| Swiftplay | 8 |
+| Deathmatch | 8 |
+| Custom Game | 4 |
+| Team Deathmatch | 3 |
+| Gauntlet: Glitched | 1 |
+
+A custom game is exactly where a scrim against a streamer lives, and one of those
+hidden Swiftplay matches had a Paper Rex player in the lobby. So a friend who says he
+played against a pro and a scan that comes back empty can both be telling the truth —
+which is indistinguishable from a broken scanner, and cost several days of hunting a
+bug in the identity funnel that was never there. The page has a Queue control now, and
+a filtered scan names what it is holding back and how to include it. The default stays
+Competitive: every queue is half again as many matches to resolve, and on a small
+machine that is a real wait, so it should be a choice rather than a surprise either way.
 
 ---
 
@@ -594,6 +657,27 @@ What is left is the shape of the problem rather than an inefficiency: klips.live
 fast partly because its alias database is shared across everybody who uses it, so most
 lobbies are a lookup rather than a search. This one starts empty and per-account, and
 only `alias` rows accumulated from previous runs close that gap.
+
+#### And then the part that was not the code at all
+
+Every saving above was measured on one machine. The same code then moved to another and
+ran seven times slower, and two days went into looking for the bug. There was no bug:
+
+| | 12-core laptop | 1/8 OCPU free tier |
+|---|---|---|
+| One frame, fetched and read | ~1.6s | ~13.2s |
+| One match, end to end | ~4.7s | ~34s |
+| 100 matches | 461s | over 50 minutes |
+
+Same code, same keys, same queue depth. The laptop figures come from the `ingested_at`
+and `last_resolved_at` columns of a real 100-match scan, which is why they can be
+checked rather than remembered. Layer 5 is OCR and OCR is pure CPU, so an eighth of a
+core is exactly what it sounds like.
+
+Worth writing down because of how it presents: a scan that takes an hour, pauses for a
+minute at a time while a rate limit refills, and finishes with fewer confirmations than
+you expected looks precisely like a scanner that is broken. It is worth knowing which
+machine a timing came off before believing a profile.
 
 ### How a streamer is confirmed, and the two ways to get it wrong
 
