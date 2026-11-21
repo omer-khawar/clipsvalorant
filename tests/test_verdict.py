@@ -8,8 +8,13 @@ that a name and a broadcast clock can never confirm anything by themselves - onl
 evidence tying a channel to *this* match can.
 """
 
+import dataclasses
+import tempfile
+from pathlib import Path
+
 from clipsvalorant.models import Player
 from clipsvalorant.resolve import (
+    MIN_PREFIX_LEN,
     Evidence,
     _prefix_related,
     _same_id,
@@ -21,6 +26,7 @@ from clipsvalorant.resolve import (
     vod_link,
 )
 from clipsvalorant.twitch import Vod
+from clipsvalorant.watch import CERTAIN_NAMES
 
 
 def _vod(created: int, duration: int, title: str = "") -> Vod:
@@ -43,14 +49,21 @@ def test_name_match_plus_a_broadcast_is_never_confirmed():
     assert ev.confirmed_by() is None
 
 
-def test_clips_inside_the_match_confirm():
-    """What vaerie had: Valorant clips cut from that VOD, at offsets in the match."""
+def test_a_valorant_clip_inside_the_match_does_not_confirm():
+    """twitch.tv/NeonQuin, reported as NeoN#Rage in a match it was never in.
+
+    A clip cut from the covering VOD, filed under Valorant, at an offset inside
+    the match says one thing: Valorant was on screen during those minutes. For
+    a channel that streams Valorant daily that is true of every match its
+    broadcast overlaps, so it cannot separate the player from a stranger. It is
+    worth showing and it is not worth an alias.
+    """
     ev = Evidence(
         name_prefix=True, vod_covers=True, match_len_s=1516, vod_overlap_s=1516,
         clips_on_vod=36, valorant_clips_on_vod=36, clips_inside_match=3,
     )
-    assert ev.verdict() == "confirmed"
-    assert ev.ties_to_this_match
+    assert ev.verdict() == "likely"
+    assert not ev.ties_to_this_match
 
 
 def test_a_different_game_rules_a_channel_out():
@@ -86,14 +99,23 @@ def test_an_advertised_riot_id_belonging_to_someone_else_rules_out():
     assert ev.verdict() == "rejected"
 
 
-def test_clip_evidence_outvotes_an_advertised_id():
-    """A streamer with two accounts should not be rejected over the one in their bio."""
-    ev = Evidence(
+def test_only_the_screen_outvotes_an_advertised_id():
+    """A streamer with two accounts should not be rejected over the one in
+    their bio -- but it takes the lobby on screen to say so.
+
+    Clips used to do this job and could not: they say Valorant was on, which
+    an advertised Riot ID belonging to somebody else already implied.
+    """
+    clipped = Evidence(
         vod_covers=True, match_len_s=1516, vod_overlap_s=1516, clips_inside_match=2,
         valorant_clips_on_vod=5, clips_on_vod=5,
         advertised_ids=("Smurf#9999",), id_conflicts=True,
     )
-    assert ev.verdict() == "confirmed"
+    assert clipped.verdict() == "rejected"
+    watched = dataclasses.replace(
+        clipped, lobby_names_seen=tuple(str(i) for i in range(CERTAIN_NAMES))
+    )
+    assert watched.verdict() == "confirmed"
 
 
 def test_no_usable_broadcast_is_rejected():
@@ -184,12 +206,20 @@ def test_vod_links_never_go_negative():
 # just lose coverage, it biases the whole tool toward streamers with an audience.
 
 
-def test_a_small_streamer_with_no_clips_can_still_be_confirmed():
+def test_a_small_streamer_with_no_clips_reaches_the_page_but_not_the_alias_table():
+    """A bio naming the player in plain words is the signal that reaches
+    streamers nobody clips, and it is still only a resemblance plus a claim.
+
+    `bio_names_player` is a substring of free text -- "I am Nuke!!" -- and the
+    page is where it belongs. `id_confirms`, where the channel publishes the
+    whole Riot ID including the tagline, is the one that confirms.
+    """
     ev = Evidence(
         name_prefix=True, vod_covers=True, match_len_s=2348, vod_overlap_s=2348,
         clips_on_vod=0, bio_names_player=True, title_says_valorant=True,
     )
-    assert ev.verdict() == "confirmed"
+    assert ev.verdict() == "likely"
+    assert dataclasses.replace(ev, id_confirms=True).verdict() == "confirmed"
 
 
 def test_the_name_alone_is_still_not_enough():
@@ -227,3 +257,208 @@ def test_prefix_generation_needs_a_long_enough_name():
     """'Nuke' resembles hundreds of channels; 'CocaPup' resembles a handful."""
     assert _prefix_related("CocaPup", "cocapuppy", min_len=5)
     assert not _prefix_related("Nuke", "nuke73", min_len=5)
+
+
+# --- the clip pool's own name bar ---------------------------------------
+
+def test_the_clip_pool_uses_the_same_name_bar_as_the_name_search():
+    """Four letters of a shared prefix is a coincidence, and it cost a result.
+
+    `_prefix_related` defaults to three characters, which Layer 1 overrides to
+    five and Layer 4 did not. So NeoN#Rage matched twitch.tv/NeonQuin - a
+    channel that merely begins with those four letters - and because NeonQuin
+    was being clipped on Valorant during the match, the candidate went straight
+    to confirmed and the alias was written down. The frames said otherwise:
+    NeonQuin was four rounds into a different game.
+    """
+    assert _prefix_related("NeoN", "neonquin")              # the old default
+    assert not _prefix_related("NeoN", "neonquin", min_len=MIN_PREFIX_LEN)
+    assert _prefix_related("Vaerie", "vae", min_len=MIN_PREFIX_LEN) is False
+    assert _prefix_related("CocaPup", "cocapuppy", min_len=MIN_PREFIX_LEN)
+
+
+def test_a_channel_from_the_clip_pool_needs_five_characters_to_be_tied_to_a_player():
+    """The regression in one call, with nothing else in the lobby to decide it."""
+    from clipsvalorant import db
+    from clipsvalorant.resolve import ResolveReport, clip_derived_candidates
+
+    short = Player(puuid="p1", name="NeoN", tag="Rage", team="Blue")
+    long = Player(puuid="p2", name="CocaPup", tag="slay", team="Blue")
+
+    class _Clips:
+        def clips_in_window(self, *a, **k):
+            return [
+                {"broadcaster_id": "c1", "broadcaster_login": "neonquin",
+                 "broadcaster_name": "NeonQuin"},
+                {"broadcaster_id": "c2", "broadcaster_login": "cocapuppy",
+                 "broadcaster_name": "cocapuppy"},
+            ]
+
+        def users(self, *, logins=None, ids=None):
+            return []
+
+    class _Match:
+        id = "m1"
+
+    with db.session(Path(tempfile.mkdtemp()) / "x.db") as conn:
+        found = clip_derived_candidates(
+            conn, _Clips(), _Match(), [short, long],
+            0, 1800, "516575", ResolveReport(),
+        )
+    tied = {c.channel_login: c.player.name for c in found}
+    assert tied == {"cocapuppy": "CocaPup"}
+
+
+# --- re-reading what is already on disk ---------------------------------
+
+def _encounter(conn, *, riot_id, login, verdict, evidence, channel_id="c1"):
+    import json
+
+    if conn.execute("SELECT 1 FROM match WHERE id = 'm1'").fetchone() is None:
+        conn.execute(
+            "INSERT INTO match (id, started_at, started_at_epoch, ingested_at,"
+            " raw_json) VALUES ('m1','',0,'','{}')"
+        )
+    conn.execute(
+        "INSERT INTO encounter (match_id, puuid, riot_id, channel_id, channel_login,"
+        " vod_id, confidence, verified_how, verdict, evidence, found_at)"
+        " VALUES ('m1','p',?,?,?,'v',0.95,'clip_window',?,?,'')",
+        (riot_id, channel_id, login, verdict, json.dumps(evidence.__dict__)),
+    )
+
+
+def test_a_withdrawn_rule_is_applied_to_what_was_already_written_down():
+    """The expensive half of a verdict is the evidence, and it is on the row.
+
+    So a rule we have stopped believing can be withdrawn from the whole
+    database for nothing - no Twitch call, no frame - which is the only way a
+    match whose broadcasts Twitch has already deleted ever gets corrected.
+    Without it, NeoN#Rage -> twitch.tv/NeonQuin would have been fixed on the
+    18 November match and left standing on the 6 November one forever.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from clipsvalorant import db
+    from clipsvalorant.resolve import restate_verdicts
+
+    ev = Evidence(
+        name_prefix=True, vod_covers=True, match_len_s=1745, vod_overlap_s=1745,
+        clips_on_vod=2, valorant_clips_on_vod=1, clips_inside_match=1,
+    )
+    path = Path(tempfile.mkdtemp()) / "x.db"
+    with db.session(path) as conn:
+        _encounter(conn, riot_id="NeoN#Rage", login="neonquin",
+                   verdict="confirmed", evidence=ev)
+        conn.execute(
+            "INSERT INTO alias (riot_name, riot_tag, channel_id, source,"
+            " confidence, confirmed_at) VALUES ('NeoN','Rage','c1','clip_window',0.95,'')"
+        )
+        out = restate_verdicts(conn)
+
+        assert out.withdrawn == 1
+        assert out.aliases_dropped == 1
+        row = conn.execute("SELECT verdict FROM encounter").fetchone()
+        # The prefix was never good enough either, so nothing is left of it.
+        assert row["verdict"] == "unconfirmed"
+        assert conn.execute("SELECT COUNT(*) AS n FROM alias").fetchone()["n"] == 0
+
+
+def test_restating_leaves_a_confirmation_the_screen_paid_for_alone():
+    import tempfile
+    from pathlib import Path
+
+    from clipsvalorant import db
+    from clipsvalorant.resolve import restate_verdicts
+
+    ev = Evidence(
+        name_exact=True, vod_covers=True, match_len_s=1745, vod_overlap_s=1745,
+        lobby_names_seen=tuple(str(i) for i in range(CERTAIN_NAMES)),
+    )
+    path = Path(tempfile.mkdtemp()) / "y.db"
+    with db.session(path) as conn:
+        _encounter(conn, riot_id="CocaPup#slay", login="cocapuppy",
+                   verdict="confirmed", evidence=ev)
+        out = restate_verdicts(conn)
+        assert out.changed == 0
+        assert conn.execute(
+            "SELECT verdict FROM encounter"
+        ).fetchone()["verdict"] == "confirmed"
+
+
+def test_an_expired_broadcast_does_not_delete_a_confirmation():
+    """Reported on razor#d4c: twitch.tv/cocapuppy was confirmed off ten of ten
+    lobby names, and a later scan dropped it from the page.
+
+    Nothing about the streamer had changed. Twitch had deleted the broadcast,
+    so the re-run reached "no VOD holds enough of the match" and wrote that
+    over the row. It is the one rejection every match earns eventually, it is
+    a fact about retention rather than about the lobby, and the confirmation
+    it overwrites can never be made again - the video is gone.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from clipsvalorant import db
+    from clipsvalorant.resolve import Candidate, _remember_encounter
+
+    seen = Evidence(
+        vod_covers=True, match_len_s=1745, vod_overlap_s=1745,
+        lobby_names_seen=tuple(str(i) for i in range(CERTAIN_NAMES)),
+    )
+    player = Player(puuid="p", name="CocaPup", tag="slay", team="Blue")
+    path = Path(tempfile.mkdtemp()) / "z.db"
+    with db.session(path) as conn:
+        conn.execute(
+            "INSERT INTO match (id, started_at, started_at_epoch, ingested_at,"
+            " raw_json) VALUES ('m1','',0,'','{}')"
+        )
+        was = Candidate("m1", player, "c1", "cocapuppy", "cocapuppy",
+                        "name_prefix", evidence=seen)
+        _remember_encounter(conn, "m1", was, True)
+        assert was.verdict == "confirmed"
+
+        # The same channel, the same match, a fortnight later: the broadcast
+        # is gone and nothing else was learned.
+        expired = Candidate("m1", player, "c1", "cocapuppy", "cocapuppy",
+                            "name_prefix",
+                            evidence=Evidence(name_prefix=True, match_len_s=1745))
+        assert expired.verdict == "rejected"
+        _remember_encounter(conn, "m1", expired, True)
+        assert conn.execute(
+            "SELECT verdict FROM encounter"
+        ).fetchone()["verdict"] == "confirmed"
+
+
+def test_a_rejection_we_actually_learned_is_still_written_down():
+    """The guard above must not turn into "confirmations are permanent". A
+    broadcast we read and found a different game in is a real change of mind."""
+    import tempfile
+    from pathlib import Path
+
+    from clipsvalorant import db
+    from clipsvalorant.resolve import Candidate, _remember_encounter
+
+    player = Player(puuid="p", name="NeoN", tag="Rage", team="Blue")
+    path = Path(tempfile.mkdtemp()) / "w.db"
+    with db.session(path) as conn:
+        conn.execute(
+            "INSERT INTO match (id, started_at, started_at_epoch, ingested_at,"
+            " raw_json) VALUES ('m1','',0,'','{}')"
+        )
+        _remember_encounter(conn, "m1", Candidate(
+            "m1", player, "c1", "neonquin", "NeonQuin", "clip_window",
+            evidence=Evidence(
+                vod_covers=True, match_len_s=1745, vod_overlap_s=1745,
+                lobby_names_seen=tuple(str(i) for i in range(CERTAIN_NAMES)))), True)
+        later = Candidate("m1", player, "c1", "neonquin", "NeonQuin",
+                          "clip_window",
+                          evidence=Evidence(vod_covers=True, match_len_s=1745,
+                                            vod_overlap_s=1745, frames_read=10,
+                                            valorant_ui_frames=7,
+                                            vod_other_match=True))
+        assert later.verdict == "rejected"
+        _remember_encounter(conn, "m1", later, True)
+        assert conn.execute(
+            "SELECT verdict FROM encounter"
+        ).fetchone()["verdict"] == "rejected"

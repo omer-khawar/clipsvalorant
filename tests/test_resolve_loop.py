@@ -226,6 +226,7 @@ class _Frames:
         self.prefetched: list[list[str]] = []
         self.singles: list[str] = []
         self.order: list[str] = []
+        self.looked: list[tuple[str, list[float]]] = []
 
     def prefetch_playlists(self, vod_ids, **kw):
         ids = list(vod_ids)
@@ -238,6 +239,8 @@ class _Frames:
 
     def iter_frames(self, vod_id, offsets, **kw):
         self.order.append(f"look:{vod_id}")
+        offsets = list(offsets)
+        self.looked.append((vod_id, offsets))
         for off in offsets:
             yield off, None
 
@@ -317,3 +320,42 @@ def test_the_summary_counts_likely_apart_from_unverified():
     line = report.summary()
     assert "1 confirmed" in line and "1 likely" in line
     assert "2 unverified" in line
+
+
+# ------------------------------------------- where in the broadcast we look
+
+def test_frames_are_sampled_where_the_match_is_not_where_its_timestamp_says(
+    resolved, sample_match
+):
+    """`metadata.started_at` is the queue pop, not the first round.
+
+    The map finishes loading about a hundred seconds later - 101, 109 and 125
+    on the three broadcasts that were measured - so sampling at
+    `started_at + time_in_match` aims every frame a buy phase and most of a
+    round early. The round-end scoreboard is the one frame that returns all
+    ten names at once, and it was being missed by more than a round, which is
+    why confirming the same streamer twice could come out differently.
+
+    The same ten frames, pointed at the right seconds: no extra call, no extra
+    second, and `calibrate.FALLBACK_SHIFT_S` is the median of the three.
+    """
+    from clipsvalorant import calibrate
+
+    others = [p for p in sample_match.players if p.puuid != resolved.me.puuid]
+    target = others[0]
+    cid = f"id-{target.name.lower()}"
+    start = int(sample_match.metadata.started_at.timestamp())
+    vod = Vod(id="v1", channel_id=cid, stream_id=None, title="valorant ranked",
+              created_at="", created_epoch=start - 600, duration_s=7200, url="")
+    watcher = _Watcher()
+    resolved(FakeTwitch(videos_for={cid: [vod]}), watcher=watcher)
+
+    looked = [offs for vid, offs in watcher.frames.looked if vid == "v1"]
+    assert looked, "the broadcast was never opened"
+    offsets = looked[0]
+    # Every sample is the naive offset plus the shift, and the first kill of
+    # the fixture match is 12s in - so without the shift one of these would
+    # land at 600 + 14, before the map had finished loading.
+    assert min(offsets) > 600 + calibrate.FALLBACK_SHIFT_S
+    naive = [o - calibrate.FALLBACK_SHIFT_S for o in offsets]
+    assert all(o >= 600 for o in naive)

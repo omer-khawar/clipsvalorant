@@ -35,7 +35,7 @@ import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -209,6 +209,10 @@ class Evidence:
     me_seen_in_vod: bool = False
     valorant_ui_frames: int = 0
     vod_not_this_match: bool = False
+    # We read the broadcast, Valorant was plainly on screen, and not one of the
+    # other nine players was. That is not "we could not tell": it is a different
+    # game of Valorant, and it is the only thing that caught NeonQuin.
+    vod_other_match: bool = False
 
     @property
     def wrong_game(self) -> bool:
@@ -227,9 +231,20 @@ class Evidence:
 
     @property
     def ties_to_this_match(self) -> bool:
-        return (
-            self.vod_shows_this_match or self.clips_inside_match > 0 or self.id_confirms
-        )
+        """Something here names *this lobby*, not merely this half hour.
+
+        A Valorant clip cut from the broadcast during the match used to count,
+        and it is the reason twitch.tv/NeonQuin was reported as NeoN#Rage in
+        yrn#wkmts's 18 November Lotus match. The clip proves what the title and
+        the overlap could not - that Valorant was on screen - and stops there.
+        For a channel that streams Valorant daily it is true of every match it
+        overlaps, so it can only ever say "this is a Valorant streamer who was
+        live", which is how the candidate came to our attention in the first
+        place. Reading the frames settled it: at the offsets this match should
+        have occupied, NeonQuin was four rounds into a different game, with a
+        different ten people in it.
+        """
+        return self.vod_shows_this_match or self.id_confirms
 
     @property
     def vod_usable(self) -> bool:
@@ -245,8 +260,6 @@ class Evidence:
                 f"{len(self.lobby_names_seen)} of the other players in that lobby "
                 "appear by name in the VOD itself"
             )
-        if self.clips_inside_match > 0:
-            return "clips cut from that VOD inside the match"
         if self.id_confirms:
             return "the Riot ID the channel advertises"
         return None
@@ -264,6 +277,16 @@ class Evidence:
         )
 
     def verdict(self) -> str:
+        """Confirmed means this lobby, not this half hour.
+
+        Only two things earn it: the other players named on screen, and a Riot
+        ID the channel publishes itself. Everything else in this class is a
+        coincidence that has not happened yet - a name that resembles another
+        name, a broadcast that was running, a clip proving Valorant was on.
+        Those reach 'likely', which the page shows and the alias table refuses,
+        and that asymmetry is deliberate: a wrong alias is permanent, and Layer
+        2 would hand it back first forever.
+        """
         # Layer 5: we opened the broadcast and read the lobby off the screen.
         # This sits above even the coverage test, because a stream that joined
         # late covers less of the match than the threshold wants and still
@@ -273,24 +296,26 @@ class Evidence:
             return "confirmed"
         if not self.vod_usable:
             return "rejected"
-        # Decisive, and independent of how big the channel is.
-        if self.clips_inside_match > 0 or self.id_confirms:
+        if self.id_confirms:
             return "confirmed"
         # We looked at the broadcast and our match was not in it. This outranks
         # every circumstantial signal below, which is the whole point of
         # looking: a name that matches and a bio that agrees are still only a
         # guess, and this is not.
-        if self.vod_not_this_match:
+        if self.vod_not_this_match or self.vod_other_match:
             return "rejected"
         if self.wrong_game or self.title_says_other_game:
             return "rejected"
         if self.id_conflicts:
             # The channel advertises a Riot ID, and it is somebody else's.
             return "rejected"
-        # Three independent agreements - the channel is named for this player,
-        # its bio names them in plain words, and the broadcast was Valorant.
+        # Circumstance from here down. None of it distinguishes the player from
+        # a stranger with a similar name who was also playing Valorant, so none
+        # of it confirms.
+        if self.clips_inside_match > 0 and self.named_like_player:
+            return "likely"
         if self.named_like_player and self.bio_names_player and self.looks_like_valorant:
-            return "confirmed"
+            return "likely"
         if self.named_like_player and self.looks_like_valorant:
             return "likely"
         return "unconfirmed"
@@ -318,7 +343,8 @@ class Evidence:
         if self.clips_inside_match:
             out.append(
                 f"{self.clips_inside_match} Valorant clip(s) cut from that VOD "
-                "at offsets inside the match"
+                "during this match's minutes, so Valorant was on screen - which "
+                "is not the same as this match being on screen"
             )
         elif self.valorant_clips_on_vod:
             out.append(
@@ -351,6 +377,12 @@ class Evidence:
             )
             if self.me_seen_in_vod:
                 out.append("your own Riot name is on screen in that VOD")
+        elif self.vod_other_match:
+            out.append(
+                f"we read {self.frames_read} frames of that VOD, {self.valorant_ui_frames} "
+                "of them plainly Valorant, and not one player from this lobby was on "
+                "screen - they were in a different game"
+            )
         elif self.vod_not_this_match:
             out.append(
                 f"we read {self.frames_read} frames of that VOD and found no sign "
@@ -396,9 +428,17 @@ class ResolveReport:
     frames_read: int = 0
     calibrated: int = 0
     uncalibrated: int = 0
+    # Ties that an earlier run wrote down as certain and this one read the
+    # broadcast and withdrew. Counted and reported, never silent: a result
+    # vanishing between two scans of the same account is exactly the thing
+    # that looks like the page losing it.
+    aliases_dropped: int = 0
     # Of `calibrated`, how many needed no frames of their own because
     # the confirmation pass had already read enough.
     calibrated_free: int = 0
+    # What re-reading the stored verdicts changed before this run fetched
+    # anything. None when nobody looked.
+    restated: "Restatement | None" = None
     confirmed: list[Candidate] = field(default_factory=list)
     candidates: list[Candidate] = field(default_factory=list)
     rejected: list[Candidate] = field(default_factory=list)
@@ -429,6 +469,8 @@ class ResolveReport:
             f"{self.clips_seen} clip(s) from {self.clip_channels} channel(s), "
             f"{self.bios_read} bio(s) read, "
             + (f"{self.frames_read} VOD frame(s) read, " if self.frames_read else "")
+            + (f"{self.aliases_dropped} earlier tie(s) withdrawn, "
+               if self.aliases_dropped else "")
             + f"{len(self.confirmed)} confirmed, {len(self.likely)} likely, "
             f"{len(self.unverified)} unverified (not shown), "
             f"{len(self.rejected)} ruled out"
@@ -551,9 +593,74 @@ def _remember_alias(
     )
 
 
+# Aliases that were never settled by looking at a broadcast. Each of these is a
+# resemblance that something circumstantial agreed with, and the schema's own
+# warning applies to them most: Layer 2 hands them back first and skips every
+# later check, so a wrong one is quoted back as corroboration forever. There
+# was exactly one way out of that, and it was to delete the row.
+_UNWATCHED_SOURCES = frozenset(
+    {"name_match", "name_prefix", "clip_window", "title_regex"}
+)
+
+
+def _forget_alias(
+    conn: sqlite3.Connection, player: Player, channel_id: str
+) -> bool:
+    """Drop an alias that no longer has a confirmation holding it up.
+
+    Called from two places, for the same reason. `settle` calls it when Layer
+    5 read that channel's VOD, found Valorant on screen and found none of this
+    lobby in it -- the measurement that caught NeoN#Rage -> twitch.tv/NeonQuin
+    after the clip test had written it down as certain. `restate_verdicts`
+    calls it when a stored confirmation does not survive being re-read under
+    the current rules.
+
+    An alias is an assertion that two names are the same person, and Layer 2
+    returns it first and skips every later check, so it may only rest on
+    something that proved it. A content-confirmed alias is left alone:
+    `vod_ocr` and `manual` were settled by somebody looking, and one match
+    whose frames went wrong is not enough to undo that.
+    """
+    row = conn.execute(
+        "SELECT source FROM alias WHERE riot_name = ? COLLATE NOCASE "
+        "AND riot_tag = ? COLLATE NOCASE AND channel_id = ?",
+        (player.name, player.tag, channel_id),
+    ).fetchone()
+    if row is None or row["source"] not in _UNWATCHED_SOURCES:
+        return False
+    conn.execute(
+        "DELETE FROM alias WHERE riot_name = ? COLLATE NOCASE "
+        "AND riot_tag = ? COLLATE NOCASE AND channel_id = ?",
+        (player.name, player.tag, channel_id),
+    )
+    return True
+
+
 def _remember_encounter(
     conn: sqlite3.Connection, match_id: str, cand: Candidate, same_team: bool
 ) -> None:
+    """Write the verdict down, unless doing so would destroy a better one.
+
+    A confirmation is a thing that was seen. The broadcast it was seen in is
+    not: Twitch deletes past broadcasts after 7 to 14 days, and from then on
+    every re-examination of that match reaches "no VOD holds enough of it" and
+    calls the channel rejected. That is not a finding about the streamer, it
+    is a finding about Twitch's retention, and letting it overwrite the row
+    silently deletes work that can never be redone - the VOD is gone, so no
+    later run can confirm it again.
+
+    Reported on razor#d4c: twitch.tv/cocapuppy, confirmed off ten of ten lobby
+    names on the first frame, was gone from the page after a later scan. Only
+    the row had changed; the find itself was still true.
+    """
+    if _confirmation_would_be_lost(conn, match_id, cand):
+        log.info(
+            "keeping the stored confirmation of %s#%s -> twitch.tv/%s: this run "
+            "found no surviving broadcast, which is Twitch's retention and not "
+            "evidence about the match",
+            cand.player.name, cand.player.tag, cand.channel_login,
+        )
+        return
     conn.execute(
         """
         INSERT INTO encounter (match_id, puuid, riot_id, channel_id, channel_login,
@@ -572,6 +679,27 @@ def _remember_encounter(
             cand.verdict, json.dumps(cand.evidence.__dict__), db.utcnow(),
         ),
     )
+
+
+def _confirmation_would_be_lost(
+    conn: sqlite3.Connection, match_id: str, cand: Candidate
+) -> bool:
+    """Is this row about to trade a confirmation for "the VOD has expired"?
+
+    Narrow on purpose. A rejection that rests on anything we actually learned
+    - a different game in the frames, somebody else's Riot ID in the bio - is
+    a real change of mind and must be written down. This covers only the one
+    case that is guaranteed to happen to every match eventually and says
+    nothing at all: no broadcast of it survives to be looked at.
+    """
+    if cand.verdict != "rejected" or cand.evidence.vod_overlap_s > 0:
+        return False
+    row = conn.execute(
+        "SELECT verdict FROM encounter WHERE match_id = ? AND puuid = ? "
+        "AND channel_id = ?",
+        (match_id, cand.player.puuid, cand.channel_id),
+    ).fetchone()
+    return row is not None and row["verdict"] in ("confirmed", "likely")
 
 
 def _prefix_related(a: str, b: str, *, min_len: int = 3) -> bool:
@@ -781,9 +909,16 @@ def clip_derived_candidates(
         if player is None:
             # Weaker: the channel name resembles the Riot ID. Only ever acted on
             # because the channel independently proved it was live on Valorant here.
+            # The same bar Layer 1 uses. Left at the three-character default,
+            # this tied NeoN#Rage to twitch.tv/NeonQuin - a channel that merely
+            # begins with those four letters and happened to be streaming
+            # Valorant - and the clip test then called it confirmed and wrote
+            # the alias down forever. Four letters of a prefix is a resemblance
+            # between strangers, not a lead.
             player = next(
                 (p for p in unresolved
-                 if _prefix_related(p.name, login) or _prefix_related(p.name, display.get(bid, ""))),
+                 if _prefix_related(p.name, login, min_len=MIN_PREFIX_LEN)
+                 or _prefix_related(p.name, display.get(bid, ""), min_len=MIN_PREFIX_LEN)),
                 None,
             )
             source = "clip_window"
@@ -849,13 +984,22 @@ def resolve_match(
         """
         if watcher is None or cand.vod is None:
             return
-        lo = max(0.0, cand.vod.created_epoch - start)
-        hi = min(end, cand.vod.end_epoch) - start
+        # Where the match really sits in this broadcast, not where its own
+        # timestamp says. `metadata.started_at` is the queue pop; the map
+        # finishes loading about a hundred seconds later, and sampling without
+        # that correction aimed every frame a buy phase and most of a round
+        # early -- past the round-end scoreboard, which is the one frame that
+        # returns all ten names at once. It cost nothing to fix and nothing to
+        # keep: the same ten frames, pointed at the right seconds.
+        cal = calibrate.load(conn, match.id, cand.vod.id)
+        base = start - cand.vod.created_epoch + cal.shift_s
+        lo = max(0.0, cand.vod.created_epoch - start - cal.shift_s)
+        hi = min(float(end - start), cand.vod.end_epoch - start - cal.shift_s)
         if hi - lo < MIN_WATCH_WINDOW_S:
             return
         seen = watch(
             watcher.reader, watcher.frames, cand.vod.id,
-            start - cand.vod.created_epoch, kills, lobby, my_name,
+            base, kills, lobby, my_name,
             limit=watcher.limit, window=(lo, hi),
             exclude_name=cand.player.name,
         )
@@ -865,6 +1009,7 @@ def resolve_match(
         ev.me_seen_in_vod = seen.me_seen
         ev.valorant_ui_frames = seen.valorant_frames
         ev.vod_not_this_match = seen.saw_nothing
+        ev.vod_other_match = seen.other_valorant
         report.frames_read += seen.frames_read
         # Hand the parsed frames on. Calibration wants a round countdown off
         # frames exactly like these, and paying twice to read one broadcast
@@ -918,6 +1063,16 @@ def resolve_match(
         if cand.verdict == "confirmed":
             _remember_alias(conn, cand.player, cand.channel_id,
                             cand.source.split(":")[-1], cand.confidence)
+        elif cand.evidence.vod_other_match and _forget_alias(
+            conn, cand.player, cand.channel_id
+        ):
+            report.aliases_dropped += 1
+            log.info(
+                "dropped the alias %s#%s -> twitch.tv/%s: read %d frames of VOD %s "
+                "and none of that lobby was on screen",
+                cand.player.name, cand.player.tag, cand.channel_login,
+                cand.evidence.frames_read, cand.vod.id if cand.vod else "?",
+            )
         calibrate_vod(cand)
         report.file(cand)
 
@@ -1068,6 +1223,105 @@ def resolve_match(
             settle(cand)
 
 
+def evidence_from_row(blob: str | None) -> Evidence | None:
+    """The stored evidence of an encounter, read back as an Evidence.
+
+    Tolerant in both directions, because the dataclass gains fields: a row
+    written before one existed simply does not set it, and a row naming a
+    field that has since gone is not worth discarding over.
+    """
+    if not blob:
+        return None
+    try:
+        data = json.loads(blob)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    known = {f.name for f in fields(Evidence)}
+    kept = {k: (tuple(v) if isinstance(v, list) else v)
+            for k, v in data.items() if k in known}
+    try:
+        return Evidence(**kept)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class Restatement:
+    """What re-reading the old verdicts under the current rules changed."""
+
+    rows: int = 0
+    changed: int = 0
+    withdrawn: int = 0
+    aliases_dropped: int = 0
+
+    def __bool__(self) -> bool:
+        return bool(self.changed or self.aliases_dropped)
+
+    def summary(self) -> str:
+        return (
+            f"{self.changed} stored verdict(s) restated under the current rules, "
+            f"{self.withdrawn} no longer confirmed, "
+            f"{self.aliases_dropped} alias(es) withdrawn"
+        )
+
+
+def restate_verdicts(conn: sqlite3.Connection) -> Restatement:
+    """Re-judge every encounter we have already stored, without asking anybody.
+
+    The evidence is kept on the row, so a change to what the evidence *means*
+    can be applied to the whole database for nothing: no Twitch call, no
+    HenrikDev call, no frame. That matters because the alternative is the
+    worst of both - a rule we know to be wrong, left standing on every match
+    old enough that its broadcasts have expired and can never be re-read.
+
+    Two things are recomputed rather than trusted. The verdict, because
+    "a Valorant clip during the match" no longer confirms anything on its own.
+    And `name_prefix`, because the clip pool used to accept four letters of a
+    shared prefix - which is how NeoN#Rage became twitch.tv/NeonQuin and
+    next#xnte became twitch.tv/NextLuna, in matches neither of them played.
+    Both are decided from the row itself, so this is a re-reading and not a
+    re-investigation.
+    """
+    out = Restatement()
+    rows = conn.execute(
+        "SELECT id, riot_id, channel_id, channel_login, puuid, verdict, evidence "
+        "FROM encounter WHERE evidence IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        ev = evidence_from_row(row["evidence"])
+        if ev is None:
+            continue
+        out.rows += 1
+        name = (row["riot_id"] or "").partition("#")[0]
+        login = row["channel_login"] or ""
+        exact = bool(name) and normalise(login) == normalise(name)
+        ev.name_exact = ev.name_exact and exact
+        if ev.name_prefix and not _prefix_related(name, login, min_len=MIN_PREFIX_LEN):
+            ev.name_prefix = False
+        verdict = ev.verdict()
+        if verdict == row["verdict"]:
+            continue
+        out.changed += 1
+        if row["verdict"] == "confirmed":
+            out.withdrawn += 1
+        conn.execute(
+            "UPDATE encounter SET verdict = ?, confidence = ?, evidence = ? WHERE id = ?",
+            (verdict,
+             {"confirmed": 0.95, "likely": 0.5, "unconfirmed": 0.25, "rejected": 0.0}[verdict],
+             json.dumps(ev.__dict__), row["id"]),
+        )
+        if verdict != "confirmed":
+            name, _, tag = (row["riot_id"] or "").partition("#")
+            if name and tag and _forget_alias(
+                conn, Player(puuid=row["puuid"], name=name, tag=tag, team=None),
+                row["channel_id"],
+            ):
+                out.aliases_dropped += 1
+    return out
+
+
 def audit_verdicts(
     cfg: Config, *, limit: int = 100, frames: int = MAX_FRAMES * 2
 ) -> tuple[list[str], list[str]]:
@@ -1208,6 +1462,12 @@ def resolve_recent(
     report = ResolveReport()
     cancel = cancel or NullToken()
     with db.session(cfg.db_path) as conn:
+        # Before anything is fetched: re-read what is already stored under the
+        # rules in force now. It costs one local pass and it is the only way a
+        # match whose broadcasts have expired ever gets its verdict corrected,
+        # because nothing can be re-read from a VOD that Twitch has deleted.
+        report.restated = restate_verdicts(conn)
+        conn.commit()
         if match_ids is not None:
             if not match_ids:
                 return report

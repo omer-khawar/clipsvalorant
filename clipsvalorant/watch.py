@@ -43,6 +43,11 @@ KILLFEED_LEAD_S = 2.0
 # on. Four keeps them without admitting anything a coincidence could produce.
 CERTAIN_NAMES = 4
 MAX_FRAMES = 10
+# What counts as having looked, before "no lobby name here" is allowed to mean
+# "this is somebody else's match". Half the frame budget, of which most showed
+# Valorant's own furniture rather than a loading screen or a menu.
+ENOUGH_FRAMES = 5
+ENOUGH_VALORANT = 3
 
 
 def _normalise_key(text: str) -> str:
@@ -79,6 +84,31 @@ class Watched:
         place -- so counting it here would leave us unable to rule anything out.
         """
         return self.frames_read >= 3 and not self.names and self.valorant_frames == 0
+
+    @property
+    def other_valorant(self) -> bool:
+        """Valorant was plainly on screen, and none of this lobby was in it.
+
+        This used to be the one thing we refused to conclude -- "maybe an
+        overlay, maybe the streamer was in a menu" -- and that caution cost the
+        single worst false positive the project has produced. twitch.tv/NeonQuin
+        was reported as NeoN#Rage in yrn#wkmts's Lotus match of 18 November on
+        the strength of a Valorant clip inside the window. Ten frames were read
+        at the time, five of them unmistakably Valorant, and not one of the
+        eight readable lobby names appeared. Pulled by hand afterwards, the
+        frame the page linked to showed ROUND 3, 0-2, with five agents none of
+        which were in our match: a different game, started twelve minutes later.
+
+        Zero names out of eight across five Valorant frames is not a thin
+        reading. The two broadcasts confirmed by other means returned nine and
+        ten names on their first frame, and the ones that were other matches
+        returned none -- there is nothing in between to be careful about.
+        """
+        return (
+            self.frames_read >= ENOUGH_FRAMES
+            and self.valorant_frames >= ENOUGH_VALORANT
+            and not self.names
+        )
 
 
 def sample_offsets(kills: list[tuple[int, float]], *, limit: int = MAX_FRAMES,
@@ -182,6 +212,12 @@ def watch(reader, frames, vod_id: str, vod_offset_s: float,
         seen.names |= hits
         if my_name and my_name in hits:
             seen.me_seen = True
-        if seen.certain:
+        if seen.certain or seen.other_valorant:
+            # Both are answers, and the second one is the commoner by far:
+            # most candidates are the wrong person, and reading five more
+            # frames of somebody else's match cannot change that. Across one
+            # lobby of razor#d4c's that is the difference between ten frames
+            # per rejected candidate and five, on the single slowest thing a
+            # scan does.
             break
     return seen

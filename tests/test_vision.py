@@ -146,15 +146,20 @@ def test_thin_coverage_with_nothing_on_screen_is_still_rejected():
 
 def test_a_vod_we_could_not_open_changes_nothing():
     """No OCR engine, an expired VOD, a subscriber-only broadcast: Layer 5 goes
-    quiet and the layers above it decide as they did before."""
+    quiet and the layers above it decide as they did before - which is to say
+    they reach 'likely' and stop, because none of them can tell this player
+    from a stranger with a similar name who was also playing Valorant."""
     ev = Evidence(vod_covers=True, name_prefix=True, bio_names_player=True,
                   title_says_valorant=True, frames_read=0)
-    assert ev.verdict() == "confirmed"
+    assert ev.verdict() == "likely"
 
 
-def test_direct_evidence_still_wins_when_the_screen_is_unreadable():
+def test_a_clip_with_no_tie_to_the_player_is_not_even_a_candidate():
+    """A Valorant clip from a covering broadcast and nothing linking the
+    channel to this player is a description of every Valorant streamer who was
+    live that evening."""
     ev = Evidence(vod_covers=True, clips_inside_match=2, frames_read=0)
-    assert ev.verdict() == "confirmed"
+    assert ev.verdict() == "unconfirmed"
 
 
 def test_seeing_the_lobby_counts_as_tying_to_this_match():
@@ -206,10 +211,33 @@ def test_a_timer_alone_does_not_save_a_broadcast_from_being_ruled_out():
     assert Watched(frames_read=10, timer_frames=9, valorant_frames=0).saw_nothing
 
 
-def test_valorant_on_screen_stops_us_ruling_it_out():
-    """It is Valorant and we could not read the names - maybe an overlay, maybe
-    the streamer was in a menu. Not confirmed, but not denied either."""
-    assert not Watched(frames_read=10, valorant_frames=4).saw_nothing
+def test_valorant_on_screen_is_not_the_absence_curry_was():
+    """Two different findings, and only one of them is "nothing was there".
+
+    Curry's broadcast had no Valorant in it at all, which is what `saw_nothing`
+    means. A broadcast full of Valorant with none of this lobby in it is the
+    opposite kind of answer - a positive reading of somebody else's match - and
+    conflating the two is how NeonQuin survived being looked at.
+    """
+    seen = Watched(frames_read=10, valorant_frames=4)
+    assert not seen.saw_nothing
+    assert seen.other_valorant
+
+
+def test_a_different_game_of_valorant_is_something_we_can_say():
+    """Measured on twitch.tv/NeonQuin against yrn#wkmts's Lotus match of
+    18 November: ten frames read, seven of them unmistakably Valorant, zero of
+    the eight readable lobby names. Pulled by hand, the frame the page linked
+    to showed ROUND 3 at 0-2 with five agents from a different match."""
+    assert Watched(frames_read=10, valorant_frames=7).other_valorant
+
+
+def test_a_glance_is_not_enough_to_call_it_somebody_elses_match():
+    """Two frames of Valorant and no names is a stream we barely looked at."""
+    assert not Watched(frames_read=4, valorant_frames=4).other_valorant
+    assert not Watched(frames_read=10, valorant_frames=2).other_valorant
+    assert not Watched(frames_read=10, valorant_frames=9,
+                       names={"Ally1"}).other_valorant
 
 
 def test_certainty_needs_the_whole_threshold():
