@@ -76,6 +76,13 @@ and 1 warm, and `/v4/matches` **1 point for ten whole matches**. That last one i
 `_bulk_head` exists. It reaches only the ten most recent and ignores `page`, so it
 supplements the listing walk rather than replacing it.
 
+**False negatives are the open problem, and they are silent.** A streamer wrongly
+rejected looks exactly like a match where nobody was streaming, and the rules that can
+now reject one — a Valorant broadcast with none of the lobby in it — were added without
+re-counting how often that fires. Read *The false negatives this is open to* in the
+README before touching a verdict rule, and measure the three things it lists first. A
+demotion to "likely" still shows on the page; a rejection shows nothing.
+
 **Hardware dominates everything.** One match costs ~4.7s on a 12-core laptop and ~34s on
 the 1/8 OCPU box. Before concluding that something got slower, check which machine the
 two numbers came from. Two separate wrong diagnoses in this repository's history were

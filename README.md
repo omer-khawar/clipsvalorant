@@ -973,6 +973,70 @@ channels we never thought to look at, because the name resembles nothing and
 nobody clipped them. Reading a broadcast cannot help with a broadcast we never
 open. That is the next thing worth building, not a better verdict rule.
 
+### The false negatives this is open to, which nobody has measured yet
+
+Open problem, written down rather than acted on. Nothing below has been
+measured; it is the case for measuring it.
+
+The count above - seven rejections in a 44-match database that were actually
+judgements, 99.6% being "no video survived" - was taken before a Valorant
+broadcast with none of the lobby in it became a *rejecting* signal. That change
+is right on its own evidence, and it is also the first rule in this project that
+can throw away a real streamer on the strength of ten frames. The judgement
+surface has grown and has not been re-counted.
+
+What prompts this is a base rate that does not look believable. `aliii#2008`
+carried five finds across a hundred matches, and a player with far fewer matches
+carried two. `yrn#wkmts` is Radiant, which is the smallest population on the
+ladder and the one most densely packed with people who stream, and after the
+fixes above the account resolves to nothing at all. One account proves nothing,
+but "a Radiant player met no streamers in a fortnight" is a claim that should
+have to earn itself.
+
+Four reasons a rejection here could be wrong, none of them yet ruled out:
+
+**One VOD stands in for a channel.** A candidate is weighed against the single
+broadcast that overlaps the match. A streamer who went live twice that day has
+another, and "this VOD is not the match" says nothing whatever about the other
+one. The code does not currently know the difference between *this broadcast*
+and *this channel*.
+
+**Variety streamers switch games inside one broadcast.** Ten frames sampled from
+one stretch of a six-hour stream describe that stretch. Rejecting a channel
+because the frames landed in the hour they played something else is the same
+mistake as the clip test, run backwards.
+
+**The sampling and the shift are circular.** Frames are read at an offset
+computed from the shift, and the shift is measured from frames. Get it wrong and
+you look in the wrong place, see somebody else's match, and conclude you have the
+wrong person - which is exactly the shape of the right answer. Dating a frame by
+the ROUND banner breaks the circle, but only on frames where the banner is
+legible, and nothing yet reports how often that is.
+
+**Ten frames of a six-hour VOD is a twentieth of one percent of it.** That is
+ample for confirming - one frame with four lobby names settles it - and it is
+very thin for denying. Confirmation and denial are being held to the same
+evidence, and they are not symmetrical claims.
+
+What has to be measured first, in this order, before any rule changes:
+
+1. The base rate. Of the players in `yrn#wkmts`'s lobbies, how many have a Twitch
+   channel at all? Until that number exists there is no way to tell an
+   implausible zero from an ordinary one.
+2. Re-sort the rejections by reason on a database scanned under the current
+   rules, and see how far "we read it and it was somebody else's match" has
+   risen from one.
+3. For the two channels this rejected by name, whether any VOD of theirs holds
+   the match *anywhere*, read by hand. That settles whether this is a sampling
+   failure or a correct answer.
+
+And the constraint that makes it hard: the obvious fix - more frames, more VODs,
+more channels - is exactly what the budget in CLAUDE.md forbids. Whatever this
+turns into has to buy its evidence more cheaply, not buy more of it. Note that
+the clip test, now demoted to "likely", still puts its candidate on the page: a
+demotion is visible, where a rejection is silent, and it is the silent one that
+needs the care.
+
 ### Measuring recall, and the layer that was not built
 
 Knowing what the tool claims is easy; knowing what it misses is not. A missed
