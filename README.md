@@ -1106,6 +1106,104 @@ the clip test, now demoted to "likely", still puts its candidate on the page: a
 demotion is visible, where a rejection is silent, and it is the silent one that
 needs the care.
 
+#### Reading the rejections by hand (2026-11-21)
+
+`yrn#wkmts` had six candidates whose broadcast still existed. The scan reads
+ten frames of each, aimed at the moments that matter. This read them again at
+a three-minute grid across the whole broadcast, plus finely inside the match,
+using the same name matcher - so "none of that lobby was on screen" had a real
+chance to be wrong.
+
+**The rejection that was checked hardest was right.** `twitch.tv/NeonQuin`,
+5.9 hours, 157 frames read, **42 of them plainly Valorant, and not one lobby
+name anywhere in the broadcast**. They were playing Valorant for most of that
+stream and never played *that* match. The ten frames the scan read reached the
+same answer as a hundred and fifty-seven.
+
+**And the one that looked like a miss was a collision.** `twitch.tv/nika` was
+the best false-negative candidate in the database: the scan saw one lobby name,
+`shadow 斬`, which is three short of the bar. Reading 164 frames across 6.25
+hours found that name twelve times - and **zero Valorant frames in the entire
+broadcast**. The frames say why:
+
+```
+smite2 home store profile gods season events level272
+izanamishadowstalker emberwarden ... kumbhakarnaracetoradiant
+```
+
+nika was playing **SMITE 2** for six hours. The "lobby name" was `shadow`,
+which is what `shadow 斬` normalises to once the CJK character is stripped,
+sitting inside the skin name *Izanami Shadowstalker*. Not a missed streamer: a
+six-letter English word matching inside an unrelated one.
+
+That is a real mechanism and it is not rare in principle. Of the 2,460 distinct
+lobby names long enough to search for across these databases, **978 (40%)
+normalise to six characters or fewer**, and even a ninety-word sample list of
+ordinary English words catches twenty-two of them — `ghost`, `snake`, `water`,
+`raven`, `neon`, `shadow`. What stops it mattering is `CERTAIN_NAMES = 4`: one
+collision buys "unconfirmed", which is exactly what nika got.
+
+All six, after a first pass that had to be thrown away. That pass walked each
+VOD from its start and gave up after eight dead frames, which on a fourteen-
+and a nineteen-hour broadcast never reached a match sitting eleven to thirteen
+hours in - so "0 frames read" was a fact about the sampling, not the broadcast.
+Sampling the match window first fixed it. Only one of the three was genuinely
+gone from Twitch, checked against the API rather than assumed.
+
+| channel | VOD | frames read | inside the match | Valorant frames | lobby names | verdict held? |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| nika | 6.2h | 164 | 39 | 0 | `shadow`, a SMITE skin | yes, unconfirmed |
+| NeonQuin | 5.9h | 157 | 39 | **42** | none | yes, rejected |
+| bayonet888 | 5.0h | 81 | 21 | 0 | none | yes, rejected |
+| whiskeyburt | 14.8h | 209 | 31 | 0 | none | yes, rejected |
+| speed_gunner | 19.4h | 273 | 40 | 0 | `mell`, outside the match | yes, rejected |
+| devastated_offf | 1.3h | — | — | — | — | VOD deleted since |
+
+**884 frames across roughly fifty-one hours of broadcast, and not one lobby
+member on screen during any of those matches.** Every verdict held.
+
+Four of the five were not even Valorant streams. `bayon` → bayonet888,
+`Whiskey` → whiskeyburt, `SPEED` → speed_gunner and `NIKA` → nika are all
+Layer 1 name resemblances, and none of those channels had Valorant on screen in
+any frame sampled. Layer 5 ruled out exactly what it should have. The only
+candidate who really was playing Valorant was the only one it had to think
+about.
+
+#### The guard that would have broken it
+
+The obvious fix is to count a lobby name only on a frame that carries
+Valorant's own furniture. nika's 164 frames had none. Measured against every
+confirmed or likely encounter in every database before changing anything:
+
+| | |
+| --- | ---: |
+| encounters re-read | 31 |
+| name sightings on a frame with Valorant UI words | 107 |
+| name sightings only ever seen off such a frame | **16** |
+| encounters that would lose evidence under a per-frame guard | **8** |
+| encounters with no Valorant frame anywhere in the read | **2** |
+
+Both versions of the guard destroy real finds. `twitch.tv/henkyyyval` and
+`twitch.tv/kazuhira323` are confirmed on four and three lobby names and have
+**no Valorant UI word on any of their ten frames**. Here is the frame that
+confirms henkyyyval:
+
+```
+info  02  aktivujtewindows  d3mur shaaw myagi1x  prejdtedonastavenfaaktivujtesystemwindows
+```
+
+Three lobby members, a round number, and a Slovak Windows activation watermark.
+It is overwhelming evidence and it carries none of the fifteen words in
+`VALORANT_UI_WORDS`, because that list is gameplay-HUD vocabulary and this is
+not a gameplay HUD. So `looks_like_valorant` is a narrow detector that misses
+real Valorant screens, and gating name evidence on it would have turned two
+confirmations into silence - the precise failure this section exists to find.
+
+**Nothing was changed.** Three names on one frame is stronger evidence than any
+UI word, the bar that protects against collisions is the count of distinct
+names and it held, and the only rule change available was measured to cost more
+than it saved.
+
 ### Measuring recall, and the layer that was not built
 
 Knowing what the tool claims is easy; knowing what it misses is not. A missed

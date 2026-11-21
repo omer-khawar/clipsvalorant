@@ -52,9 +52,36 @@ ordinary afternoon rather than evidence of anything. The question "shouldn't a
 Radiant player meet somebody" is answered, and the answer is that Twitch
 retention, not rank and not name matching, sets the ceiling.
 
-Still open: reading those six broadcasts end to end, rather than at the ten
-frames the scan budgets, to see whether any of them holds the match somewhere
-the sampling never looked.
+**Those six broadcasts have now been read end to end** (the long form is
+*Reading the rejections by hand* in the README), and no false negative came out
+of it. `twitch.tv/NeonQuin` gave 157 frames, 42 of them plainly Valorant, and
+not one lobby name in 5.9 hours: the rejection was right and the scan's ten
+frames reached the same answer. `twitch.tv/nika`, the best candidate for a miss
+in the whole database, was playing SMITE 2 for six hours - its single "lobby
+name" was `shadow`, the normalised form of `shadow 斬`, matching inside the skin
+name *Izanami Shadowstalker*.
+
+What that turned up instead is a collision risk on the *confirming* side: 978
+of the 2,460 searchable lobby names (40%) normalise to six characters or fewer,
+and plenty of those are ordinary words. `CERTAIN_NAMES = 4` is what keeps it
+harmless, and it held - nika scored one and stayed unconfirmed.
+
+The obvious guard, counting a name only on a frame carrying Valorant UI words,
+was measured against all 31 confirmed or likely encounters before being written:
+it would strip evidence from 8 of them and destroy 2 confirmations outright,
+because `looks_like_valorant` misses real Valorant screens. Nothing was changed.
+
+Still open, and smaller than it looked:
+
+- `looks_like_valorant` is a narrow detector. It reads False on a frame showing
+  three lobby members and a round number, because its fifteen words are
+  gameplay-HUD vocabulary. Anything that gates on it inherits that blind spot -
+  including the `other_valorant` rejection, which needs three Valorant frames
+  before it fires and will therefore simply not fire rather than fire wrongly.
+  Conservative in the right direction, but it should be known.
+- Whether a name that normalises to an ordinary word should need more than one
+  sighting. The measurement above says the current bar already handles it; this
+  is only worth revisiting if a false confirmation ever shows up.
 
 ---
 
