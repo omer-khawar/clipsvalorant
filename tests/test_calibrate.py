@@ -364,3 +364,77 @@ def test_from_reads_ignores_frames_with_no_clock_on_them():
 def _mmss(seconds: float) -> str:
     seconds = max(0, int(round(seconds)))
     return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+# --------------------------------------------- the round named on the screen
+
+def label_box(text, *, cx=0.46, top=0.138, width=1280, height=720):
+    """The "ROUND 7 ////// ATTACKERS" banner, where OCR actually returns it.
+
+    The fractions are measured off two real frames: x 0.440-0.482,
+    y 0.138-0.151 on a 1280x720 VOD frame.
+    """
+    half = 0.021 * width
+    return TextBox(text, cx * width - half, top * height,
+                   cx * width + half, (top + 0.013) * height)
+
+
+def test_the_round_banner_dates_a_frame_outright():
+    """Measured on twitch.tv/sllumtackss's Corrode broadcast: the frame OCR
+    read as 'ROUND10' at 0:12 implied a shift of 115.96, against the 115.9
+    that thirteen frames of voting had settled on. One frame, to a tenth of a
+    second, because the banner removes the only thing the vote was guessing.
+    """
+    read = frame([timer_box("0:12"), label_box("ROUND 4")])
+    assert calibrate.read_round_label(read) == 4
+    # HUD round 4 is Riot's round 3, which started at 304.3s on this match.
+    shift = calibrate.shift_from_label(
+        STARTS[3] - 12.0 + TRUE_SHIFT, 0.0, 12.0, 4, STARTS
+    )
+    assert shift == pytest.approx(TRUE_SHIFT)
+
+
+def test_an_overlay_saying_round_two_is_not_the_banner():
+    """Same trap as the countdown: a wrongly dated frame cannot be outvoted,
+    because being dated is exactly what lets it beat the votes."""
+    assert calibrate.read_round_label(frame([label_box("ROUND 2", cx=0.12)])) is None
+    assert calibrate.read_round_label(frame([label_box("ROUND 2", top=0.60)])) is None
+    assert calibrate.read_round_label(frame([label_box("ROUNDA")])) is None
+    assert calibrate.read_round_label(frame([label_box("ROUND 99")])) is None
+
+
+def test_a_banner_from_another_match_dates_to_nothing():
+    """twitch.tv/NeonQuin, read against yrn#wkmts's Lotus match: the frame the
+    page linked to said ROUND 3 at 0:00, which puts the match start 764s away
+    from where its own timestamp does. That is not a shift, it is a different
+    game - and refusing to date it is the second thing that catches a channel
+    the clip test had already called confirmed."""
+    assert calibrate.shift_from_label(5674.0, 4584.0, 0.0, 3, {2: 215.8}) is None
+
+
+def test_two_dated_frames_outrank_three_guesses():
+    """A guessed vote is one of thirty-odd answers a frame could have given,
+    squeezed into a 215-second window; dated frames name their own round, and
+    two of them can only agree if both readings were right - rounds are of
+    irregular lengths, so an off-by-one does not survive a second frame."""
+    reads = [
+        (STARTS[3] - 12.0 + TRUE_SHIFT,
+         frame([timer_box("0:12"), label_box("ROUND 4")])),
+        (STARTS[5] - 7.0 + TRUE_SHIFT,
+         frame([timer_box("0:07"), label_box("ROUND 6")])),
+    ]
+    cal = calibrate.from_reads(reads, base=0.0, starts=STARTS, vod_id="v")
+    assert cal.measured
+    assert cal.shift_s == pytest.approx(TRUE_SHIFT, abs=0.2)
+
+
+def test_frames_with_no_banner_still_go_to_the_vote():
+    """The banner is read off roughly one frame in three, so the voting this
+    replaces for those frames has to stay exactly as it was."""
+    reads = [
+        (STARTS[r] - 10.0 + TRUE_SHIFT, frame([timer_box("0:10")]))
+        for r in (1, 3, 5)
+    ]
+    cal = calibrate.from_reads(reads, base=0.0, starts=STARTS, vod_id="v")
+    assert cal.measured
+    assert cal.shift_s == pytest.approx(TRUE_SHIFT, abs=0.2)

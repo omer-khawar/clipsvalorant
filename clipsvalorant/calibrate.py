@@ -70,6 +70,26 @@ FALLBACK_SHIFT_S = 109.0
 
 _BUY_WORDS = ("buyphase", "pressbtobuy")
 
+# "ROUND 7 ////// ATTACKERS", drawn above the BUY PHASE banner and nowhere
+# else. It is worth more than everything else on the frame put together: a
+# countdown alone cannot say which round it belongs to, so a frame showing
+# 0:21 offers one answer per round and the right one has to win a vote. The
+# round number dates the frame outright, and a frame dated outright cannot be
+# outvoted by a coincidence.
+#
+# Read on four frames pulled by hand, the OCR returned 'ROUND3', 'ROUND4' and
+# 'ROUND 10' cleanly and mangled the fourth into the slashes beside it. So
+# this is a shortcut that is often available, never required, and the voting
+# below stays exactly as it was for the frames that do not offer it.
+_ROUND_LABEL_RE = re.compile(r"^round\s*(\d{1,2})$", re.I)
+LABEL_BAND_Y = (0.10, 0.24)
+LABEL_BAND_X = (0.38, 0.62)
+# Riot numbers rounds from zero and the HUD counts from one. Two frames of the
+# same broadcast agreeing is what proves this rather than assumes it: rounds
+# are of irregular length, so an off-by-one would make two labelled frames
+# disagree by the difference between two round lengths rather than agree.
+HUD_ROUND_OFFSET = 1
+
 
 @dataclass(frozen=True)
 class Calibration:
@@ -148,6 +168,48 @@ def read_timer(frame: FrameRead) -> float | None:
     return None if best is None else best[0]
 
 
+def read_round_label(frame: FrameRead) -> int | None:
+    """Which round the screen says it is, as Valorant counts them, or None.
+
+    Confined to the strip under the countdown, for the same reason
+    `read_timer` is: a stream overlay saying "ROUND 2" of something else would
+    date the frame confidently and wrongly, and a wrongly dated frame is worse
+    than an undated one because it cannot be outvoted.
+    """
+    if not frame.width or not frame.height:
+        return None
+    for box in frame.boxes:
+        found = _ROUND_LABEL_RE.match((box.text or "").strip())
+        if not found:
+            continue
+        mid_x = (box.x0 + box.x1) / 2 / frame.width
+        mid_y = (box.y0 + box.y1) / 2 / frame.height
+        if not (LABEL_BAND_X[0] <= mid_x <= LABEL_BAND_X[1]
+                and LABEL_BAND_Y[0] <= mid_y <= LABEL_BAND_Y[1]):
+            continue
+        value = int(found.group(1))
+        if 1 <= value <= 50:
+            return value
+    return None
+
+
+def shift_from_label(
+    offset_in_vod: float, base: float, timer_s: float, label: int,
+    starts: dict[int, float],
+) -> float | None:
+    """The one shift a frame that named its own round implies.
+
+    The banner only appears during the buy phase, so the countdown is always
+    counting down to this round's barriers dropping -- which removes the other
+    guess `votes_from` has to make.
+    """
+    start = starts.get(label - HUD_ROUND_OFFSET)
+    if start is None:
+        return None
+    shift = offset_in_vod - base - (start - timer_s)
+    return shift if SHIFT_MIN_S <= shift <= SHIFT_MAX_S else None
+
+
 def votes_from(
     offset_in_vod: float, base: float, timer_s: float, is_buy: bool,
     starts: dict[int, float],
@@ -204,21 +266,51 @@ def scan_offsets(
 
 
 def _votes_in(reads: Iterable[tuple[float, object]], base: float,
-              starts: dict[int, float]) -> list[float]:
-    """Every shift the given frames vote for, pooled."""
-    votes: list[float] = []
+              starts: dict[int, float]) -> tuple[list[float], list[float]]:
+    """Every shift the given frames imply: the dated ones, then the guessed.
+
+    Kept apart because they are not the same kind of number. A dated shift
+    comes from a frame that said which round it was; a guessed one is one of
+    thirty-odd answers that frame could equally have given, filtered to a
+    215-second window. Pooling them lets the second kind outnumber the first.
+    """
+    dated: list[float] = []
+    guessed: list[float] = []
     for offset, frame in reads:
         if frame is None:
             continue
         timer = read_timer(frame)  # type: ignore[arg-type]
         if timer is None:
             continue
+        label = read_round_label(frame)  # type: ignore[arg-type]
+        if label is not None:
+            shift = shift_from_label(offset, base, timer, label, starts)
+            if shift is not None:
+                dated.append(shift)
+                continue
         blob = frame.blob  # type: ignore[attr-defined]
-        votes.extend(votes_from(
+        guessed.extend(votes_from(
             offset, base, timer,
             any(word in blob for word in _BUY_WORDS), starts,
         ))
-    return votes
+    return dated, guessed
+
+
+# Two frames that each named their own round and agree is proof rather than
+# weight of numbers: rounds are of irregular length, so two frames from
+# different rounds can only agree on a shift if both readings were right.
+MIN_DATED = 2
+
+
+def _settle(dated: list[float], guessed: list[float], vod_id: str) -> Calibration:
+    """The best answer the frames support, or the estimate."""
+    shift, agreed = best_cluster(dated)
+    if agreed >= MIN_DATED:
+        return Calibration(shift, "measured", agreed, vod_id)
+    shift, agreed = best_cluster(guessed)
+    if agreed >= MIN_VOTES:
+        return Calibration(shift, "measured", agreed, vod_id)
+    return ESTIMATE
 
 
 def from_reads(
@@ -240,10 +332,8 @@ def from_reads(
     """
     if not starts:
         return ESTIMATE
-    shift, agreed = best_cluster(_votes_in(reads, base, starts))
-    if agreed < MIN_VOTES:
-        return ESTIMATE
-    return Calibration(shift, "measured", agreed, vod_id)
+    dated, guessed = _votes_in(reads, base, starts)
+    return _settle(dated, guessed, vod_id)
 
 
 def measure(
@@ -266,11 +356,12 @@ def measure(
         if frame is not None:
             reads.append((offset, frame))
 
-    shift, agreed = best_cluster(_votes_in(reads, base, starts))
-    if agreed < MIN_VOTES:
-        log.debug("calibration of %s inconclusive (%d agreeing)", vod_id, agreed)
-        return ESTIMATE
-    return Calibration(shift, "measured", agreed, vod_id)
+    dated, guessed = _votes_in(reads, base, starts)
+    cal = _settle(dated, guessed, vod_id)
+    if not cal.measured:
+        log.debug("calibration of %s inconclusive (%d dated, %d guessed)",
+                  vod_id, len(dated), len(guessed))
+    return cal
 
 
 # ---------------------------------------------------------------- storage
