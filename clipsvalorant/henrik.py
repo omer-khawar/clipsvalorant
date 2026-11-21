@@ -9,6 +9,7 @@ one. We read the X-RateLimit-* headers at runtime rather than hardcoding a numbe
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any
 
@@ -22,6 +23,16 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://api.henrikdev.xyz"
 USER_AGENT = "clipsvalorant/0.1 (personal match-to-VOD tool)"
 
+# The most matches /v4/matches will return in one answer. Asking for more is
+# not refused, it is silently capped, and `page` is accepted and ignored -
+# measured on 2026-11-21, where size=20 returned 10 and page=2 returned the
+# same ten ids as page=1. So this is the whole of what one call can reach.
+BULK_SIZE = 10
+
+# How much of the window to keep in hand. A call that arrives with one point
+# left is the one that gets the 429, and a 429 costs a point to be told so.
+RESERVE = 1
+
 
 class HenrikError(RuntimeError):
     """An API call failed in a way we cannot recover from."""
@@ -29,6 +40,52 @@ class HenrikError(RuntimeError):
 
 class RateLimited(HenrikError):
     pass
+
+
+class _Budget:
+    """What one API key has left in this minute, shared by every client holding it.
+
+    The window belongs to the key, not to the object that happens to be
+    holding it, and a single scan builds three clients: one to ask which
+    region the account plays on, one to ingest, one to count the queues the
+    scan is not looking at. Each used to start with no idea what the others
+    had spent, so each spent a call to discover the window was already empty.
+    That is what "quota nearly spent" three times in one scan looked like.
+
+    The deadline is absolute for the same reason. `x-ratelimit-reset` is the
+    seconds left when the response was written, and sleeping that number
+    later sleeps a window that has already turned over - forty seconds of
+    OCR between two calls used to buy a full extra minute of waiting.
+    """
+
+    __slots__ = ("remaining", "reset_at", "limit")
+
+    def __init__(self) -> None:
+        self.remaining: int | None = None
+        self.reset_at: float = 0.0
+        self.limit: int | None = None
+
+    def seconds_left(self) -> float:
+        return max(0.0, self.reset_at - time.monotonic())
+
+
+_BUDGETS: dict[str, _Budget] = {}
+_BUDGET_LOCK = threading.Lock()
+
+
+def budget_for(api_key: str) -> _Budget:
+    """The shared window state for this key, created on first use."""
+    with _BUDGET_LOCK:
+        budget = _BUDGETS.get(api_key)
+        if budget is None:
+            budget = _BUDGETS[api_key] = _Budget()
+        return budget
+
+
+def forget_budgets() -> None:
+    """Drop every remembered window. For tests, which must not inherit one."""
+    with _BUDGET_LOCK:
+        _BUDGETS.clear()
 
 
 class HenrikClient:
@@ -46,9 +103,9 @@ class HenrikClient:
         self._cancel = cancel or NullToken()
         self._max_retries = max_retries
         self._owns_client = client is None
-        # Quota state from the last response, so we can pace instead of absorbing 429s.
-        self._remaining: int | None = None
-        self._reset_in: float = 60.0
+        # Quota state, shared with every other client using this key, so that
+        # pacing is a property of the window rather than of this object.
+        self._budget = budget_for(api_key)
         self._client = client or httpx.Client(
             base_url=BASE_URL,
             timeout=timeout,
@@ -118,28 +175,69 @@ class HenrikClient:
         Their limiter charges 1 point per call PLUS 1 per background Riot request it
         triggers, so a cold match detail can cost more than the one call you made.
         That makes reactive 429 handling alone wasteful - we pre-empt instead.
+
+        What is recorded is a deadline rather than a duration. The header says
+        how long was left when the response was written, and the next call may
+        be a minute of OCR away.
         """
         raw_remaining = resp.headers.get("x-ratelimit-remaining")
         raw_reset = resp.headers.get("x-ratelimit-reset")
-        try:
-            self._remaining = int(raw_remaining) if raw_remaining is not None else None
-        except ValueError:
-            self._remaining = None
-        try:
-            if raw_reset is not None:
-                self._reset_in = min(max(float(raw_reset), 1.0), 120.0)
-        except ValueError:
-            pass
+        raw_limit = resp.headers.get("x-ratelimit-limit")
+        with _BUDGET_LOCK:
+            try:
+                self._budget.remaining = (
+                    int(raw_remaining) if raw_remaining is not None else None
+                )
+            except ValueError:
+                self._budget.remaining = None
+            try:
+                if raw_reset is not None:
+                    left = min(max(float(raw_reset), 1.0), 120.0)
+                    self._budget.reset_at = time.monotonic() + left
+            except ValueError:
+                pass
+            try:
+                if raw_limit is not None:
+                    self._budget.limit = int(raw_limit)
+            except ValueError:
+                pass
+            left_now = self._budget.remaining
         log.debug("%s -> %s (quota left: %s)", resp.request.url.path,
-                  resp.status_code, self._remaining)
+                  resp.status_code, left_now)
 
     def _wait_for_quota(self) -> None:
-        """Sleep out the window when we are about to run dry."""
-        if self._remaining is not None and self._remaining <= 1:
-            log.info("Quota nearly spent, pausing %.0fs for the window to reset",
-                     self._reset_in)
-            self._cancel.nap(self._reset_in)
-            self._remaining = None  # unknown again until the next response
+        """Sleep out the window when we are about to run dry.
+
+        The wait is what is left of the window now, which is usually less
+        than the header said and is never more.
+        """
+        with _BUDGET_LOCK:
+            remaining = self._budget.remaining
+            if remaining is None or remaining > RESERVE:
+                return
+            wait = self._budget.seconds_left()
+            limit = self._budget.limit
+            # Cleared inside the lock so that of several threads arriving at
+            # an empty window, one waits and announces it and the rest do not.
+            self._budget.remaining = None
+        if wait <= 0:
+            return
+        # Said in full because the short version read like a failure. This is
+        # the client doing its job: the key allows so many calls a minute, the
+        # scan has used them, and the next minute is nearly here.
+        log.info(
+            "HenrikDev allows %s calls a minute and this scan has used them - "
+            "waiting %.0fs for the next window",
+            limit if limit is not None else "a limited number of",
+            wait,
+        )
+        self._cancel.nap(wait)
+
+    @property
+    def quota_left(self) -> int | None:
+        """Points left in this minute, or None if no call has reported yet."""
+        with _BUDGET_LOCK:
+            return self._budget.remaining
 
     @staticmethod
     def _retry_after(resp: httpx.Response) -> float:
@@ -192,6 +290,50 @@ class HenrikClient:
             f"/valorant/v1/stored-matches/{region}/{name}/{tag}", params=params
         )
         return [StoredMatch.model_validate(item) for item in payload.get("data", [])]
+
+    def recent_matches(
+        self,
+        name: str,
+        tag: str,
+        region: str,
+        *,
+        mode: str | None = "competitive",
+        size: int = BULK_SIZE,
+    ) -> list[Match]:
+        """GET /valorant/v4/matches/{affinity}/{platform}/{name}/{tag}
+
+        The same payload `match_detail` returns - roster, rounds and every
+        kill - but for up to ten matches at a time, and HenrikDev charges one
+        point for the lot. Measured against this key on 2026-11-21: ten full
+        matches cost a single point, where ten `match_detail` calls cost
+        eleven. That is the difference between a forty-match scan sleeping
+        out two windows and not sleeping at all.
+
+        It reaches only the ten most recent, and `page` is accepted and
+        ignored, so it supplements the listing walk rather than replacing it.
+        """
+        params: dict[str, Any] = {"size": max(1, min(BULK_SIZE, size))}
+        if mode:
+            params["mode"] = mode
+        try:
+            payload = self._get(f"/valorant/v4/matches/{region}/pc/{name}/{tag}", params)
+        except HenrikError as exc:
+            if "404" not in str(exc):
+                raise
+            log.debug("Platform-segment v4 matches route 404'd, retrying without it")
+            payload = self._get(f"/valorant/v4/matches/{region}/{name}/{tag}", params)
+
+        out: list[Match] = []
+        for item in payload.get("data") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                out.append(Match.model_validate(item).with_raw(item))
+            except ValueError as exc:
+                # One unparseable match in a batch of ten must not cost the
+                # other nine, which are already paid for.
+                log.warning("Skipped a match in the bulk answer: %s", exc)
+        return out
 
     def match_detail(self, match_id: str, region: str) -> Match:
         """GET /valorant/v4/match/{affinity}/{match_id}

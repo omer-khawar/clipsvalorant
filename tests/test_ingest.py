@@ -107,12 +107,14 @@ class _Client:
     parameter that is accepted and ignored.
     """
 
-    def __init__(self, listed, *, honours_page=True):
+    def __init__(self, listed, *, honours_page=True, bulk=None):
         self.listed = listed
         self.honours_page = honours_page
         self.calls = []
         self.modes = []
         self.detail_calls = []
+        self.bulk = list(bulk or [])
+        self.bulk_calls = []
 
     def __enter__(self):
         return self
@@ -127,6 +129,10 @@ class _Client:
             page = 1
         start = (page - 1) * size
         return self.listed[start:start + size]
+
+    def recent_matches(self, name, tag, region, *, mode=None, size=10):
+        self.bulk_calls.append((mode, size))
+        return self.bulk
 
     def match_detail(self, match_id, region):
         self.detail_calls.append(match_id)
@@ -400,3 +406,105 @@ def test_other_modes_asks_nothing_when_nothing_is_filtered(cfg, monkeypatch):
 
     assert other_modes(cfg, mode=None, since_epoch=None) == {}
     assert client.calls == []
+
+
+# ------------------------------------------- ten matches for the price of one
+
+def _bulk_match(sample_payload, match_id, started_at):
+    """One real match payload, re-labelled, the way the bulk answer returns it."""
+    import json
+
+    from clipsvalorant.models import Match
+
+    data = json.loads(json.dumps(sample_payload["data"]))
+    data["metadata"]["match_id"] = match_id
+    data["metadata"]["started_at"] = started_at.isoformat().replace("+00:00", "Z")
+    return Match.model_validate(data).with_raw(data)
+
+
+def test_the_newest_matches_arrive_in_one_call_not_one_each(cfg, monkeypatch,
+                                                            sample_payload):
+    """The measurement this exists to keep: /v4/matches returns ten full
+    matches for one point, where ten match_detail calls cost eleven. A scan
+    that pays per match sleeps out two windows to ingest forty of them."""
+    from datetime import datetime, timezone
+    from clipsvalorant.ingest import ingest
+
+    now = datetime.now(timezone.utc)
+    listed = _listing(now, [1, 2, 3])
+    bulk = [_bulk_match(sample_payload, e.meta.id, e.meta.started_at)
+            for e in listed[:2]]
+    client = _Client(listed, bulk=bulk)
+    monkeypatch.setattr("clipsvalorant.ingest.HenrikClient", lambda *a, **k: client)
+
+    report = ingest(cfg, limit=20)
+
+    assert report.in_bulk == 2
+    assert client.bulk_calls == [("competitive", 10)]
+    assert client.detail_calls == ["m2"], "only what the bulk answer could not reach"
+    assert "2 of them in one call" in report.summary()
+
+
+def test_one_new_match_does_not_buy_a_bulk_answer(cfg, monkeypatch, sample_payload):
+    """It is the same single call either way, and a point spent to save a
+    point is a point spent."""
+    from datetime import datetime, timezone
+    from clipsvalorant.ingest import ingest
+
+    now = datetime.now(timezone.utc)
+    listed = _listing(now, [1])
+    client = _Client(listed, bulk=[])
+    monkeypatch.setattr("clipsvalorant.ingest.HenrikClient", lambda *a, **k: client)
+
+    ingest(cfg, limit=20)
+
+    assert client.bulk_calls == []
+    assert client.detail_calls == ["m0"]
+
+
+def test_a_scan_with_nothing_new_spends_nothing_on_details(cfg, monkeypatch,
+                                                           sample_payload):
+    """People re-enter the same Riot ID constantly. The second scan should
+    cost the listing and nothing else."""
+    from datetime import datetime, timezone
+    from clipsvalorant.ingest import ingest
+
+    now = datetime.now(timezone.utc)
+    listed = _listing(now, [1, 2, 3])
+    bulk = [_bulk_match(sample_payload, e.meta.id, e.meta.started_at) for e in listed]
+    client = _Client(listed, bulk=bulk)
+    monkeypatch.setattr("clipsvalorant.ingest.HenrikClient", lambda *a, **k: client)
+
+    first = ingest(cfg, limit=20)
+    assert first.stored == 3
+
+    again = _Client(listed, bulk=bulk)
+    monkeypatch.setattr("clipsvalorant.ingest.HenrikClient", lambda *a, **k: again)
+    second = ingest(cfg, limit=20)
+
+    assert second.skipped == 3
+    assert again.bulk_calls == []
+    assert again.detail_calls == []
+
+
+def test_a_bulk_answer_that_never_comes_costs_only_itself(cfg, monkeypatch):
+    """A new endpoint must not be able to break ingest. If it fails, every
+    match it would have covered costs its own call, exactly as before."""
+    from datetime import datetime, timezone
+    from clipsvalorant.henrik import HenrikError
+    from clipsvalorant.ingest import ingest
+
+    now = datetime.now(timezone.utc)
+    listed = _listing(now, [1, 2, 3])
+    client = _Client(listed)
+
+    def explode(*a, **k):
+        raise HenrikError("500 on /valorant/v4/matches")
+
+    client.recent_matches = explode
+    monkeypatch.setattr("clipsvalorant.ingest.HenrikClient", lambda *a, **k: client)
+
+    report = ingest(cfg, limit=20)
+
+    assert report.in_bulk == 0
+    assert client.detail_calls == ["m0", "m1", "m2"]

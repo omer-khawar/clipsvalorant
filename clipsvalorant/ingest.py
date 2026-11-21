@@ -16,7 +16,7 @@ from datetime import timezone
 from clipsvalorant import db
 from clipsvalorant.cancel import CancelToken, NullToken
 from clipsvalorant.config import Config
-from clipsvalorant.henrik import HenrikClient, HenrikError
+from clipsvalorant.henrik import BULK_SIZE, HenrikClient, HenrikError
 from clipsvalorant.kills import find_highlights, is_player
 from clipsvalorant.models import Match
 
@@ -52,6 +52,10 @@ class IngestReport:
     # ran to the cutoff deliberately keeps the whole page it crossed on -
     # entries past the window and all, which `too_old` then drops.
     oldest_listed: int | None = None
+    # How many of the new matches arrived in the one bulk answer rather than
+    # costing a call each. Reported because the whole point of the bulk call
+    # is quota, and a number nobody can see is a claim nobody can check.
+    in_bulk: int = 0
     errors: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -61,6 +65,8 @@ class IngestReport:
             f"{self.skipped} already known",
             f"{self.highlights} highlight(s)",
         ]
+        if self.in_bulk:
+            parts.append(f"{self.in_bulk} of them in one call")
         if self.pages > 1:
             parts.append(f"{self.pages} listing pages")
         if self.too_old:
@@ -88,6 +94,46 @@ def _listed_epoch(entry) -> int | None:
         return _epoch(entry.meta.started_at)
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+def _bulk_head(
+    client,
+    cfg: Config,
+    listed: list,
+    already: set[str],
+    *,
+    mode: str | None,
+    refetch: bool,
+    report: IngestReport,
+) -> dict[str, Match]:
+    """Buy the newest unknown matches in one call instead of one call each.
+
+    `/v4/matches` returns the ten most recent matches in full for a single
+    point, where ten `match_detail` calls cost eleven. It only reaches the
+    ten most recent, and it filters by mode exactly as the listing does, so
+    the matches it can answer for are the head of the walk we just did.
+
+    Worth one point only when it covers at least two of them: for a single
+    new match it is the same one call either way, and a scan with nothing
+    new should spend nothing at all. A failure here is not an error - every
+    match it would have covered simply costs its own call, as before.
+    """
+    head = listed[:BULK_SIZE]
+    need = {e.meta.id for e in head if refetch or e.meta.id not in already}
+    if len(need) < 2:
+        return {}
+
+    try:
+        batch = client.recent_matches(
+            cfg.riot_name, cfg.riot_tag, cfg.region, mode=mode, size=BULK_SIZE
+        )
+    except HenrikError as exc:
+        log.info("The bulk answer did not come; falling back to one call each (%s)", exc)
+        return {}
+
+    out = {m.metadata.match_id: m for m in batch if m.metadata.match_id in need}
+    report.in_bulk = len(out)
+    return out
 
 
 def _list_window(
@@ -443,6 +489,8 @@ def ingest(
                 cancel=cancel,
             )
             report.seen = len(listed)
+            in_bulk = _bulk_head(client, cfg, listed, already, mode=mode,
+                                 refetch=refetch, report=report)
 
             for entry in listed:
                 # Between matches, not inside one: a half-written match is
@@ -459,7 +507,9 @@ def ingest(
                         continue
 
                 try:
-                    match = client.match_detail(match_id, cfg.region)
+                    match = in_bulk.get(match_id) or client.match_detail(
+                        match_id, cfg.region
+                    )
                     found = persist_match(
                         conn,
                         match,

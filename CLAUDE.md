@@ -61,11 +61,20 @@ exists for this and `IngestReport.complete` reports whether it got to the bottom
 **Scans default to `mode="competitive"`**, which on a real account hides about a third
 of a fortnight. If something is missing, check the queue before suspecting the matcher.
 
-**Rate limits.** HenrikDev Basic is 30 requests a minute; Twitch's app token is a bucket
+**Rate limits.** HenrikDev Basic is 30 points a minute; Twitch's app token is a bucket
 of roughly 800 points a minute. Both clients watch the response headers and sleep rather
-than fail, so "quota nearly spent, pausing 60s" in the log is the client working, not an
-error. Deeper windows make it more likely because candidate lookup runs eight threads
-wide.
+than fail, so "HenrikDev allows 30 calls a minute and this scan has used them" in the
+log is the client working, not an error. Deeper windows make it more likely because
+candidate lookup runs eight threads wide.
+
+The HenrikDev window belongs to the *key*, not to the client object, and a scan builds
+three clients out of one key. `henrik.budget_for` is the shared state they all pace
+against; it holds an absolute deadline rather than the header's countdown, because a
+reset read before a minute of OCR has a minute less left to wait. Measured costs on a
+Basic key (2026-11-21): account 1 point, stored-matches 1-2, a match detail ~1.6 cold
+and 1 warm, and `/v4/matches` **1 point for ten whole matches**. That last one is why
+`_bulk_head` exists. It reaches only the ten most recent and ignores `page`, so it
+supplements the listing walk rather than replacing it.
 
 **Hardware dominates everything.** One match costs ~4.7s on a 12-core laptop and ~34s on
 the 1/8 OCPU box. Before concluding that something got slower, check which machine the
