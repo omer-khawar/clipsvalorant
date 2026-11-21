@@ -742,6 +742,75 @@ cache:
 | VOD frames read | 20 | **10** |
 | Confirmed | 1, and it was the wrong person | 0 |
 
+#### Eight accounts, end to end (2026-11-21)
+
+Every run below went through the web UI's own path on this machine: a 14-day
+window, Competitive only, each account's database in whatever state earlier
+scans had left it.
+
+| account | | matches checked | calls | points | quota pauses | wall clock |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| razor#d4c | repeat | 10 of 41 | 4 | 6 | 0 | 157s |
+| aliii#2008 | repeat | 30 of 93 | 3 | 4 | 0 | 184s |
+| yrn#wkmts | repeat | 44 of 45 | 3 | 4 | 0 | 164s |
+| muddy#mud1 | new, NA | 36 | 30 | 55 | 1 | 466s |
+| d3mur#ari | new, EU | 19 | 13 | 23 | 0 | 319s |
+| ZETA Hater#0712 | new, AP | 40 | 34 | 61 | 2 | 463s |
+| blackcatw#Hartz | new, KR | 30 | 24 | 43 | 1 | 141s |
+| resenha master#pollo | new, BR | 16 | 10 | 17 | 0 | 155s |
+
+**The HenrikDev side is finished.** A repeat scan is three or four calls and
+never waits for a window. razor's run skipped 31 of its 41 matches as already
+settled and bought three of its ten new ones in a single call. Even a cold
+account on the far side of the world costs at most 61 points, which is two
+minutes of a Basic key.
+
+**The time is now entirely Twitch and OCR, and it does not scale with matches.**
+razor checked ten matches in 157s; yrn checked forty-four in 164s. The floor is
+the per-match sweep: every match pulls every Valorant clip created worldwide in
+its window and reads a bio for each channel behind them - 1,206 bios for razor's
+ten matches, 5,357 for yrn's forty-four - before a single frame is read. What
+actually moves the number is frames: muddy read 140 and took 466s, blackcatw
+read 10 and took 141s.
+
+A hundred matches at yrn's rate is about six minutes here, and seven times that
+on the deployed box. Under five minutes is close but not yet true, and the lever
+is no longer the API.
+
+#### How often there is anything to find at all
+
+The same eight accounts, counting opportunities rather than answers. "A
+candidate" is a channel plausible enough to weigh; "a surviving broadcast" is
+one of those with a VOD that still covers the match.
+
+| account | matches | lobby-mates | with a candidate | with a surviving broadcast | confirmed | likely |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| razor#d4c | 40 | 261 | 197 | 7 | 0 | 0 |
+| aliii#2008 | 93 | 651 | 531 | 23 | 1 | 3 |
+| yrn#wkmts | 45 | 334 | 215 | **6** | 0 | 0 |
+| muddy#mud1 | 36 | 251 | 192 | 12 | 0 | 3 |
+| d3mur#ari | 19 | 130 | 92 | 6 | 2 | 1 |
+| ZETA Hater#0712 | 40 | 260 | 168 | 8 | 0 | 0 |
+| blackcatw#Hartz | 30 | 222 | 102 | 2 | 0 | 0 |
+| resenha master#pollo | 16 | 118 | 85 | 3 | 0 | 1 |
+| **total** | **319** | **2,227** | **1,582 (71%)** | **67 (3.0%)** | **3** | **8** |
+
+Seventy-one per cent of the people you play with have *something* that looks
+like a Twitch channel, and three per cent have one whose broadcast of that match
+still exists. Sixty-seven openings across three hundred and nineteen matches,
+and eleven of them turned into a find.
+
+This is the answer to "a Radiant player must have met somebody". `yrn#wkmts` had
+**six** openings in a fortnight. At the rate the other seven accounts convert
+them, six openings are worth about one find, and drawing zero from six is an
+ordinary afternoon. The ladder is not the constraint and neither is the name
+matching; Twitch deleting broadcasts is.
+
+Worth noting what razor's row does *not* say. It shows zero confirmed in the
+window while the page shows two, because vaerie and cocapuppy are on matches
+that have since aged out of fourteen days. That is the exact gap the "not
+re-checked for N days" line on each card now exists to explain.
+
 ### How a streamer is confirmed, and the two ways to get it wrong
 
 Finding the channel is the easy half. Proving it is the right person is the whole

@@ -3,7 +3,9 @@
 Notes for Claude. Everything here is either a fact about the environment that cannot be
 read off the code, or a trap that has already cost a day once. The architecture itself
 is in [PLAN.md](PLAN.md), the reasoning and the measurements are in
-[README.md](README.md), and the deployment is in [deploy/ORACLE.md](deploy/ORACLE.md).
+[README.md](README.md), the deployment is in [deploy/ORACLE.md](deploy/ORACLE.md), and
+what is known to be unfinished is in [OPEN.md](OPEN.md) — read that before deciding
+something is settled.
 
 ## Running things
 
