@@ -622,6 +622,9 @@ class _NoReport:
     likely: tuple = ()
     unverified: tuple = ()
     errors: tuple = ()
+    # Falsy, so the "we changed our mind about stored verdicts" note stays
+    # out of a run that restated nothing.
+    restated = None
 
     def summary(self) -> str:
         return "nothing"
@@ -1308,3 +1311,40 @@ def test_the_queue_control_reaches_the_api():
     assert 'data-mode="any"' in web.PAGE
     assert "mode: S.mode" in web.PAGE
     assert 'mode: "competitive"' in web.PAGE
+
+
+def test_a_second_search_does_not_pay_for_what_the_first_one_settled(cfg, monkeypatch):
+    """Reported as a 30-minute scan of an account scanned several times before.
+
+    `sweep.matches_due` has always known which matches are worth resolving;
+    the page did not use it, so pressing Search re-ran the whole funnel over
+    every match in the window - a name search per player and a broadcast
+    listing per candidate - to arrive back at the answer already on disk.
+    """
+    from clipsvalorant.ingest import IngestReport
+
+    monkeypatch.setattr("clipsvalorant.ingest.ingest",
+                        lambda c, **k: IngestReport(seen=2, stored=0))
+    asked: list[list[str]] = []
+
+    def fake_resolve(acct, *, match_ids, **_):
+        asked.append(list(match_ids))
+        return _NoReport()
+
+    monkeypatch.setattr("clipsvalorant.resolve.resolve_recent", fake_resolve)
+    monkeypatch.setattr("clipsvalorant.web._correct_region", lambda acct, job: acct)
+    other = web.config_for(cfg, "Someone#ELSE")
+    with db.session(other.db_path) as conn:
+        for n in range(3):
+            conn.execute(
+                "INSERT INTO match (id, started_at, started_at_epoch, "
+                "ingested_at, raw_json, last_resolved_at, resolve_attempts) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (f"m{n}", "", RECENT - n * 3600, "", "{}", db.utcnow(), 1))
+    cfg = dataclasses.replace(cfg, twitch_client_id="id", twitch_client_secret="s")
+    job = web.Job(id="j", riot_id="Someone#ELSE", key="")
+    web.run_search(cfg, job, days=14, watch=False)
+
+    assert job.state == "done"
+    assert asked == [], "re-resolved matches that were settled hours ago"
+    assert "checked already" in " ".join(job.snapshot()["lines"])

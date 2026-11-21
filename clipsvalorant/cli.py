@@ -289,6 +289,8 @@ def resolve(
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
+    if report.restated:
+        typer.secho(report.restated.summary(), fg=typer.colors.YELLOW)
     typer.echo(report.summary())
     for err in report.errors:
         typer.secho(f"  ! {err}", fg=typer.colors.YELLOW, err=True)

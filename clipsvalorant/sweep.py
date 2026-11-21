@@ -88,8 +88,29 @@ class SweepReport:
         return ", ".join(parts)
 
 
-def matches_due(conn: sqlite3.Connection, *, now: int | None = None) -> tuple[list[str], int, int]:
-    """Which matches to resolve this run. Returns (ids, expired, settled)."""
+def matches_due(
+    conn: sqlite3.Connection,
+    *,
+    now: int | None = None,
+    since_epoch: int | None = None,
+    need_highlight: bool = True,
+) -> tuple[list[str], int, int]:
+    """Which matches to resolve this run. Returns (ids, expired, settled).
+
+    `since_epoch` narrows the question to a window somebody asked about, so a
+    match outside it is neither due nor counted: it was never in scope.
+
+    `need_highlight` is what separates the unattended sweep from somebody
+    pressing Search. The sweep exists to find things worth a notification, and
+    a match with no multi-kill of yours in it has nothing to link to. The page
+    is a different question - it shows every round of a confirmed match, so an
+    ordinary match somebody streamed is exactly what a person came to look at.
+
+    This is the whole of the "do not pay twice" policy, and until now the web
+    UI did not use it: every search re-resolved every match in the window,
+    which for somebody re-typing their own Riot ID is a few hundred Twitch
+    calls and several minutes to reach the answer already on disk.
+    """
     now = int(time.time()) if now is None else now
     rows = conn.execute(
         """
@@ -98,8 +119,10 @@ def matches_due(conn: sqlite3.Connection, *, now: int | None = None) -> tuple[li
                (SELECT COUNT(*) FROM encounter e
                  WHERE e.match_id = m.id AND e.verdict = 'confirmed') AS confirmed
         FROM match m
+        WHERE m.started_at_epoch >= ?
         ORDER BY m.started_at_epoch DESC
-        """
+        """,
+        (since_epoch if since_epoch is not None else 0,),
     ).fetchall()
 
     due: list[str] = []
@@ -109,7 +132,7 @@ def matches_due(conn: sqlite3.Connection, *, now: int | None = None) -> tuple[li
         if age_days > RETENTION_DAYS:
             expired += 1
             continue
-        if not row["highlights"]:
+        if need_highlight and not row["highlights"]:
             # Nothing of yours happened here, so there is nothing to link to.
             settled += 1
             continue

@@ -864,7 +864,8 @@ def run_search(
     asked for, which is what stops a wide window becoming unbounded API calls.
     """
     from clipsvalorant.ingest import ingest, other_modes
-    from clipsvalorant.resolve import resolve_recent
+    from clipsvalorant.resolve import resolve_recent, restate_verdicts
+    from clipsvalorant.sweep import matches_due
     from clipsvalorant.henrik import HenrikClient, HenrikError
 
     days = max(1, min(MAX_DAYS, int(days)))
@@ -922,18 +923,45 @@ def run_search(
                     "Switch the queue to All to include them."
                 )
         with db.session(acct.db_path) as conn:
-            ids = [
-                r["id"]
-                for r in conn.execute(
-                    "SELECT id FROM match WHERE started_at_epoch >= ?"
-                    " ORDER BY started_at_epoch DESC",
-                    (cutoff,),
-                )
-            ]
+            in_window = conn.execute(
+                "SELECT COUNT(*) AS n FROM match WHERE started_at_epoch >= ?",
+                (cutoff,),
+            ).fetchone()["n"]
+            # Before deciding what is still worth fetching: re-judge what is
+            # already stored under the rules in force now. It is a local pass
+            # over rows we already have, it costs no call, and it has to
+            # happen here rather than inside the resolve - a scan where every
+            # match is settled never reaches the resolve at all, and that is
+            # exactly the scan of an account whose old verdicts need fixing.
+            restated = restate_verdicts(conn)
+            if restated:
+                job.note(restated.summary())
+            conn.commit()
+            # Only the matches whose answer could still change. The sweep has
+            # worked this way since it was written; the page did not, and
+            # re-typing a Riot ID therefore re-ran the whole funnel over
+            # matches that were settled days ago - a Twitch call per player
+            # per match, to arrive back at what was already on disk.
+            ids, expired, settled = matches_due(
+                conn, since_epoch=cutoff, need_highlight=False
+            )
             edges = conn.execute(
                 "SELECT MAX(started_at_epoch) AS newest FROM match"
             ).fetchone()
             newest = edges["newest"]
+
+        if in_window and not ids:
+            already = expired + settled
+            job.say(
+                f"All {already} match(es) in the last {days} days have been "
+                "checked already, so nothing was re-fetched"
+                + (f" ({expired} of them older than Twitch keeps broadcasts, "
+                   "which is past helping)" if expired else "")
+                + ". Showing what was found."
+            )
+            job.step("done", done=0, total=0)
+            job.state = "done"
+            return
 
         if not ids:
             if newest:
@@ -977,6 +1005,12 @@ def run_search(
             job.state = "done"
             return
 
+        if settled or expired:
+            job.say(
+                f"{settled + expired} match(es) in this window were settled by an "
+                "earlier run and are not being re-checked - that is the quota and "
+                "the minutes they would have cost."
+            )
         job.step("resolve", done=0, total=len(ids))
         job.say(
             f"Checking {len(ids)} match(es) from the last {days} days for players "
@@ -1010,6 +1044,10 @@ def run_search(
             acct, match_ids=ids, watch_vods=watch, on_match=tick,
             cancel=job.token,
         )
+        # Said before the summary, because a result disappearing between two
+        # scans of the same account looks exactly like the page losing it.
+        if found.restated:
+            job.note(found.restated.summary())
         job.say(found.summary())
         for err in found.errors[:5]:
             job.say(f"! {err}")
