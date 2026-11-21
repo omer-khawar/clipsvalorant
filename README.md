@@ -442,6 +442,26 @@ whole round would have to fit every frame at once, and real rounds do not run to
 fixed length — 85s, then 74s, then 90s — so it cannot. In practice five to eight frames
 agree to within a second.
 
+Except that some frames do say which round it is. Valorant draws **ROUND 7 //////
+ATTACKERS** above the buy-phase banner, and the OCR reads it: of four frames pulled by
+hand, three came back as `ROUND3`, `ROUND4` and `ROUND 10`, and the fourth mangled the
+digit into the slashes beside it. A frame that names its own round is dated outright
+rather than put to a vote, and one of them is worth more than the whole ballot — read
+against `twitch.tv/sllumtackss`'s Corrode broadcast, the single `ROUND 10` frame gave
+115.96s where thirteen frames of voting had settled on 115.9.
+
+It also refuses to date a frame that cannot belong to this match. The frame the page
+linked to on `twitch.tv/NeonQuin` read `ROUND 3` at 0:00, which puts the start of the
+match 764 seconds from where its own timestamp does — outside any plausible agent
+select, so no shift is offered at all. The voting had no such scruple and returned
+110s, which is a perfectly ordinary-looking number arrived at from somebody else's game.
+
+Frames are also now *sampled* at the corrected offset rather than the naive one. A pass
+looking for lobby names aims at round ends, where the scoreboard shows all ten at once,
+and it was aiming a buy phase and most of a round early — reliably missing the one frame
+worth the most. Same ten frames, same cost, pointed at the right seconds; it is part of
+why the same streamer could be confirmed on one run and not the next.
+
 ```bash
 python -m clipsvalorant calibrate
 ```
@@ -679,6 +699,49 @@ minute at a time while a rate limit refills, and finishes with fewer confirmatio
 you expected looks precisely like a scanner that is broken. It is worth knowing which
 machine a timing came off before believing a profile.
 
+#### The scan that had nothing left to find, and did it all again
+
+The sweep has always known which matches are worth resolving: never the ones past
+Twitch's retention, never the ones already confirmed, never the ones looked at a few
+hours ago. `sweep.matches_due` is that policy and it is twenty lines long.
+
+The page did not use it. Pressing Search resolved **every match in the window, every
+time** — a name search per player and a broadcast listing per candidate, a few hundred
+Twitch calls per scan, to arrive back at what was already on disk. Reported as a
+30-minute scan of `razor#d4c`, an account that had been scanned several times already.
+
+Against this repository's own `razor#d4c` database, with a 14-day window:
+
+| | matches resolved |
+|---|---|
+| Re-run on the day it was last scanned, before | 44 of 44 |
+| Re-run on the day it was last scanned, now | **0** of 44 |
+| Re-run two days later, now | 10 of 39 |
+
+The second thing that run did was worse than slow. Twitch deletes past broadcasts after
+7 to 14 days, so a re-examination of an old match reaches "no VOD holds enough of it"
+and writes *rejected* over whatever was there — including `twitch.tv/cocapuppy`,
+confirmed off ten of ten lobby names on the first frame. That is a fact about retention
+and not about the lobby, the confirmation it overwrites can never be made again because
+the video is gone, and `_remember_encounter` now refuses it. A rejection we actually
+learned something to reach is still written down.
+
+#### Reading five frames instead of ten
+
+Most candidates are the wrong person — 2,486 of 2,490 encounters in that database — and
+each one was read to the full ten-frame budget before being filed. Once five frames have
+come back with Valorant on screen and none of the lobby in it, five more cannot change
+the answer, so the pass stops there.
+
+Measured on one match of `yrn#wkmts`'s, same machine, same lobby, both from a cold frame
+cache:
+
+| | before | after |
+|---|---|---|
+| Wall clock | 52s | **44s** |
+| VOD frames read | 20 | **10** |
+| Confirmed | 1, and it was the wrong person | 0 |
+
 ### How a streamer is confirmed, and the two ways to get it wrong
 
 Finding the channel is the easy half. Proving it is the right person is the whole
@@ -709,19 +772,61 @@ candidate is confirmed only by:
 - **the lobby's own names, read off the broadcast** - four or more of the *other* players in
   the match appearing on screen in that VOD. Decisive, independent of channel size, and the
   only signal that can also rule a candidate *out*. See *Reading the broadcast* below; or
-- **a Valorant clip cut from the covering VOD at an offset inside the match** — decisive, and
-  the only signal that is independent of channel size. Clips carry `video_id`, `vod_offset`
-  and `game_id`, which is the one way to reconstruct what a past broadcast contained, since
-  `GET /helix/videos` carries no game id and `GET /helix/streams` only answers for channels
-  live right now; or
-- **a Riot ID the channel advertises**, name and tagline both agreeing; or
-- **three weak signals agreeing**: the channel is named for the player, its bio names them in
-  plain words, and the broadcast was Valorant. None of these is worth much alone. Together
-  they reach the small streamers that clip evidence structurally cannot.
+- **a Riot ID the channel advertises**, name and tagline both agreeing.
+
+That is the whole list, and it used to be longer. Everything else — a name that resembles
+another name, a bio naming the player in plain words, a broadcast that was Valorant, a clip
+cut from it during the match — reaches **likely**, which the page shows and the alias table
+refuses.
 
 Ruled out when we read the broadcast and the match was not in it, when the broadcast's clips
 are all some other game, when its title names another game, when every advertised Riot ID has
 a different tagline, or when no broadcast holds at least 60% of the match.
+
+### The clip test proved the wrong thing
+
+A Valorant clip cut from the covering VOD at an offset inside the match used to confirm a
+candidate outright. The argument was that clips carry `video_id`, `vod_offset` and `game_id`,
+which is the one way to reconstruct what a past broadcast contained — `GET /helix/videos`
+carries no game id and `GET /helix/streams` only answers for channels live right now.
+
+All of that is true and none of it is about the match. The clip says Valorant was on screen
+during those minutes. For a channel that streams Valorant daily, that is true of every match
+its broadcast happens to overlap, so it cannot tell the player from a stranger. It is the
+`curry` fallacy with one extra step: curry was ruled out because the clips were Deadlock, and
+a Valorant streamer passes the same test every time.
+
+Reported by a user of `yrn#wkmts`, and then measured. Two confirmed streamers, neither of
+whom was in the match:
+
+| | |
+|---|---|
+| Channel | `twitch.tv/NeonQuin`, confirmed as `NeoN#Rage` |
+| Match | Lotus, 18 November 2026, 17:02:22 UTC |
+| Evidence that confirmed it | one Valorant clip from the covering VOD, at offset 5979 |
+| The frame the page linked to | VOD `2932423001` at 1:34:34 — **ROUND 3, score 0-2** |
+| What the page said was there | round 11 of a 13-6 match |
+| The five agents on screen | none of the five in our match |
+
+`twitch.tv/NextLuna` was confirmed as `next#xnte` in a Haven match on 6 November the same
+way. Both ties came from the same second defect: the clip pool matched a channel to a player
+on `_prefix_related`'s **three-character default**, which Layer 1 overrides to five and
+Layer 4 did not. `NeoN` -> `neonquin` and `next` -> `nextluna` are four letters of a shared
+prefix between strangers. Layer 4 now uses the same five-character bar as Layer 1.
+
+Layer 5 had already looked at NeonQuin's broadcast and read ten frames of it, five of them
+unmistakably Valorant, with **zero of the eight readable lobby names**. The code called that
+inconclusive — "maybe an overlay, maybe the streamer was in a menu" — and the clip test
+confirmed the channel anyway, two checks further down. Both halves are fixed: Valorant on
+screen with none of this lobby in it is now a positive reading of *somebody else's match*,
+and it is weighed before anything circumstantial.
+
+The cost of being wrong here is not one bad row. A confirmation writes a permanent alias,
+Layer 2 returns it first on every later match, and the mistake comes back looking like
+history repeating as corroboration. `restate_verdicts` re-judges every stored encounter from
+the evidence already on the row — no API call, no frame — which is the only way a match whose
+broadcasts Twitch has deleted ever gets corrected. Run against this repository's own
+`razor#d4c` database, it left both real finds (`vaerie`, `cocapuppy`) untouched.
 
 Two details that carry more weight than they look like they should. The **broadcast title** is
 a free game check — *"short valo stream"* against *"SECRET DEADLOCK STREAM"* — and a
