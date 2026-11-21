@@ -78,12 +78,26 @@ and 1 warm, and `/v4/matches` **1 point for ten whole matches**. That last one i
 `_bulk_head` exists. It reaches only the ten most recent and ignores `page`, so it
 supplements the listing walk rather than replacing it.
 
-**False negatives are the open problem, and they are silent.** A streamer wrongly
-rejected looks exactly like a match where nobody was streaming, and the rules that can
-now reject one — a Valorant broadcast with none of the lobby in it — were added without
-re-counting how often that fires. Read *The false negatives this is open to* in the
-README before touching a verdict rule, and measure the three things it lists first. A
+**False negatives are silent, and the three measurements have now been taken.** A
+streamer wrongly rejected looks exactly like a match where nobody was streaming, so this
+was measured rather than argued: 0.41% of 9,724 stored rejections were judgements at
+all, 884 frames across six broadcasts found no missed streamer, and the base rate says
+three per cent of the people you play with have a surviving broadcast of the match. Read
+*Reading the rejections by hand* in the README before touching a verdict rule. A
 demotion to "likely" still shows on the page; a rejection shows nothing.
+
+**`looks_like_valorant` misses real Valorant screens.** `VALORANT_UI_WORDS` is
+gameplay-HUD vocabulary, and a scoreboard is not a gameplay HUD: `twitch.tv/henkyyyval`
+is confirmed on four lobby names read off frames with no UI word on them at all. Never
+gate name evidence on it — measured, that would strip evidence from 8 of 31 confirmed
+or likely encounters and destroy 2 confirmations. `other_valorant` gates on it, which is
+safe only because it needs three Valorant frames and so fails silent rather than wrong.
+
+**A lobby name is matched as a substring of the frame's text.** `shadow 斬` normalises
+to `shadow` and matched inside the SMITE skin name *Izanami Shadowstalker*; 40% of the
+searchable names in these databases normalise to six characters or fewer. `CERTAIN_NAMES
+= 4` is the only thing standing between that and a false confirmation, so do not lower
+it.
 
 **Hardware dominates everything.** One match costs ~4.7s on a 12-core laptop and ~34s on
 the 1/8 OCPU box. Before concluding that something got slower, check which machine the
