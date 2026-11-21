@@ -307,7 +307,7 @@ def match_timeline(conn: sqlite3.Connection, match_id: str) -> dict[str, Any]:
 
 _CLIP_SQL = """
 SELECT e.match_id, e.riot_id, e.channel_login, e.vod_id, e.verdict,
-       e.same_team, e.evidence, e.verified_how,
+       e.same_team, e.evidence, e.verified_how, e.found_at, e.checked_at,
        m.started_at_epoch, m.map, m.map_id, m.mode, m.queue,
        m.rounds_won, m.rounds_lost, m.my_team_won,
        c.profile_image_url, c.display_name AS channel_display,
@@ -324,6 +324,21 @@ LEFT JOIN match_vod_offset o
 WHERE e.vod_id IS NOT NULL AND e.verdict IN ('confirmed', 'likely')
 ORDER BY m.started_at_epoch DESC, h.time_in_match_ms ASC
 """
+def _clip_sql(conn: sqlite3.Connection) -> str:
+    """The clip query, minus any column this database has not been given yet.
+
+    The page opens every database read-only on purpose, so looking at an
+    account never writes to it - which also means the migration that adds a
+    column has not necessarily run before a read. `checked_at` arrived after
+    these databases did, and a page that cannot open last week's results is
+    a worse page than one that cannot say when they were last checked.
+    """
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(encounter)")}
+    if "checked_at" in have:
+        return _CLIP_SQL
+    return _CLIP_SQL.replace("e.checked_at", "NULL AS checked_at")
+
+
 # That join is LEFT for a reason worth keeping. As an inner join, a match
 # containing no highlight produced no rows at all, so the streamer vanished
 # from the page entirely - not "a confirmed broadcast with nothing starred
@@ -490,6 +505,61 @@ def _moment(
     }
 
 
+def _is_stale(checked_at: str | None) -> bool:
+    """True when this row was settled by an earlier scan, not by this one.
+
+    "Earlier" is an hour, which is far longer than any scan and far shorter
+    than the gap between two of them.
+    """
+    if not checked_at:
+        return True
+    try:
+        when = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - when).total_seconds() > 3600
+
+
+def _last_looked(checked_at: str | None, found_at: str | None) -> str:
+    """When somebody last actually looked at this, in words a card can wear.
+
+    The question this answers is the one that made a scan look broken: the
+    page shows every streamer the database holds, while the log counts only
+    the ones this run looked at, so a find from a fortnight ago appeared on
+    a page whose log said it had confirmed nothing. Both numbers were right.
+
+    A row with no `checked_at` predates the column, and saying "not checked
+    since" of it would be inventing a fact - it says when it was found and
+    stops there.
+    """
+    stamp = checked_at or found_at
+    if not stamp:
+        return ""
+    try:
+        when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    if not checked_at:
+        return f"found {when.strftime('%d %b').lstrip('0')}"
+
+    age = (datetime.now(timezone.utc) - when).total_seconds()
+    if age < 180:
+        return "checked just now"
+    if age < 3600:
+        return f"checked {int(age // 60)} min ago"
+    if age < 86400:
+        hours = int(age // 3600)
+        return f"checked {hours} hour{'s' if hours > 1 else ''} ago"
+    days = int(age // 86400)
+    if days < 14:
+        return f"not re-checked for {days} day{'s' if days > 1 else ''}"
+    return f"not re-checked since {when.strftime('%d %b').lstrip('0')}"
+
+
 def clip_groups(
     conn: sqlite3.Connection, *, lead: int = LEAD_S, assets: Any = None,
 ) -> list[dict[str, Any]]:
@@ -504,7 +574,7 @@ def clip_groups(
     groups: dict[tuple[str, str], dict[str, Any]] = {}
     created: dict[str, int] = {}
 
-    for row in conn.execute(_CLIP_SQL):
+    for row in conn.execute(_clip_sql(conn)):
         key = (row["match_id"], row["channel_login"])
         created.setdefault(row["vod_id"], int(row["created_epoch"]))
         group = groups.get(key)
@@ -518,6 +588,8 @@ def clip_groups(
                 "verdict": row["verdict"],
                 "same_team": bool(row["same_team"]),
                 "source": row["verified_how"] or "",
+                "checked": _last_looked(row["checked_at"], row["found_at"]),
+                "stale": _is_stale(row["checked_at"]),
                 "map": row["map"] or "?",
                 "map_id": row["map_id"] or "",
                 "avatar": row["profile_image_url"] or "",
@@ -2030,6 +2102,13 @@ body{
 .badge{flex:none;font-size:9px;text-transform:uppercase;letter-spacing:.18em;padding:3px 7px;
   border-radius:999px;border:1px solid var(--line);color:var(--muted);line-height:1}
 .badge.confirmed{border-color:color-mix(in srgb,var(--accent) 55%,transparent);color:var(--accent)}
+.mflags{flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:4px}
+.checked{font-size:9px;letter-spacing:.04em;color:var(--muted);white-space:nowrap;
+  opacity:.75}
+/* The stale one is deliberately the loss colour at low weight: a remembered
+   find is not a warning, but it is the thing a reader should notice before
+   trusting the page over the log. */
+.checked.old{color:var(--loss);opacity:.75}
 
 .mrow2{display:flex;align-items:center;gap:9px}
 .agent{width:30px;height:30px;border-radius:9px;flex:none;object-fit:cover;
@@ -2554,7 +2633,18 @@ function renderMatches(){
             : '<span class="av ph">' + esc((g.channel || "?")[0].toUpperCase()) + '</span>') +
           '<span class="mwho"><span class="ch">' + esc(g.channel_name || g.channel) + '</span>' +
             '<span class="sub">played as ' + esc(short(g.riot_id)) + '</span></span>' +
-          '<span class="badge ' + esc(g.verdict) + '">' + esc(g.verdict) + '</span>' +
+          '<span class="mflags"><span class="badge ' + esc(g.verdict) + '">' +
+            esc(g.verdict) + '</span>' +
+          /* Which of these came out of this scan and which were already on
+             disk. Without it the page contradicts its own log: it shows
+             every streamer the database holds while the log counts only the
+             ones this run looked at, and a fortnight-old find on a page
+             whose log says "0 confirmed" reads as a scanner that lost one. */
+          (g.checked
+            ? '<span class="checked' + (g.stale ? ' old' : '') + '">' +
+                esc(g.checked) + '</span>'
+            : '') +
+          '</span>' +
         '</span>' +
         '<span class="mrow2">' +
           (me.agent_id ? '<img class="agent" src="/api/icon/agent/' + esc(me.agent_id) +

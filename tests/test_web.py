@@ -1348,3 +1348,67 @@ def test_a_second_search_does_not_pay_for_what_the_first_one_settled(cfg, monkey
     assert job.state == "done"
     assert asked == [], "re-resolved matches that were settled hours ago"
     assert "checked already" in " ".join(job.snapshot()["lines"])
+
+
+# ------------------------------------- which of these did this scan look at
+
+def test_a_remembered_find_says_it_was_not_re_checked():
+    """The contradiction this removes: the page shows every streamer the
+    database holds while the log counts only what this run looked at, so a
+    find from a fortnight ago appeared under a log reading "0 confirmed" and
+    looked exactly like a scanner that had lost one."""
+    from datetime import datetime, timedelta, timezone
+
+    from clipsvalorant.web import _is_stale, _last_looked
+
+    now = datetime.now(timezone.utc)
+    stamp = lambda dt: dt.isoformat().replace("+00:00", "Z")
+
+    assert _last_looked(stamp(now), None) == "checked just now"
+    assert not _is_stale(stamp(now))
+
+    old = stamp(now - timedelta(days=9))
+    assert _last_looked(old, None) == "not re-checked for 9 days"
+    assert _is_stale(old)
+
+
+def test_a_row_from_before_we_recorded_checks_does_not_invent_one():
+    """Saying "not re-checked since" of a row that never had the column is
+    inventing a fact. It says when it was found and stops there."""
+    from datetime import datetime, timedelta, timezone
+
+    from clipsvalorant.web import _is_stale, _last_looked
+
+    found = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    text = _last_looked(None, found)
+    assert text.startswith("found ")
+    assert "re-checked" not in text
+    assert _is_stale(None)
+
+
+def test_restating_a_verdict_is_not_a_check(tmp_path):
+    """restate_verdicts re-judges evidence already on the row. Nothing was
+    looked at, so a card must not come away claiming a frame was read."""
+    from clipsvalorant import db
+    from clipsvalorant.resolve import restate_verdicts
+
+    path = tmp_path / "restate.db"
+    with db.session(path) as conn:
+        conn.execute(
+            "INSERT INTO match (id, started_at, started_at_epoch, region, "
+            "ingested_at, raw_json) VALUES ('m1', '2026-11-01T00:00:00Z', 1, "
+            "'eu', '2026-11-01T00:00:00Z', '{}')"
+        )
+        conn.execute(
+            "INSERT INTO encounter (match_id, puuid, riot_id, channel_id, "
+            "channel_login, vod_id, confidence, verdict, evidence, found_at, "
+            "checked_at) VALUES ('m1','p','NeoN#Rage','c','neonquin','v',0.95,"
+            "'confirmed','{\"clips_inside_match\": 1}','2026-11-01T00:00:00Z',"
+            "'2026-11-01T00:00:00Z')"
+        )
+        conn.commit()
+        restate_verdicts(conn)
+        row = conn.execute("SELECT verdict, checked_at FROM encounter").fetchone()
+
+    assert row["verdict"] != "confirmed", "a clip alone no longer confirms"
+    assert row["checked_at"] == "2026-11-01T00:00:00Z", "nothing was looked at"

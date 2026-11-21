@@ -186,6 +186,10 @@ CREATE TABLE IF NOT EXISTS encounter (
     verdict         TEXT,
     evidence        TEXT,
     found_at        TEXT NOT NULL,
+    -- When this row was last settled by actually looking. found_at never
+    -- moves, so without this a card could not tell "confirmed in this scan"
+    -- from "remembered from a fortnight ago and not re-checked since".
+    checked_at      TEXT,
     UNIQUE (match_id, puuid, channel_id)
 );
 

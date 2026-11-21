@@ -661,22 +661,26 @@ def _remember_encounter(
             cand.player.name, cand.player.tag, cand.channel_login,
         )
         return
+    # The same stamp in both columns on a first find, and only `checked_at`
+    # moves afterwards: "when we settled this" and "when we first saw it" are
+    # different questions and a card wants to answer both.
+    now = db.utcnow()
     conn.execute(
         """
         INSERT INTO encounter (match_id, puuid, riot_id, channel_id, channel_login,
                                vod_id, their_team, same_team, confidence, verified_how,
-                               verdict, evidence, found_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                               verdict, evidence, found_at, checked_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(match_id, puuid, channel_id) DO UPDATE SET
             vod_id = excluded.vod_id, confidence = excluded.confidence,
             verified_how = excluded.verified_how, verdict = excluded.verdict,
-            evidence = excluded.evidence
+            evidence = excluded.evidence, checked_at = excluded.checked_at
         """,
         (
             match_id, cand.player.puuid, f"{cand.player.name}#{cand.player.tag}",
             cand.channel_id, cand.channel_login, cand.vod.id if cand.vod else None,
             cand.player.team, int(same_team), cand.confidence, cand.source,
-            cand.verdict, json.dumps(cand.evidence.__dict__), db.utcnow(),
+            cand.verdict, json.dumps(cand.evidence.__dict__), now, now,
         ),
     )
 
@@ -1306,6 +1310,9 @@ def restate_verdicts(conn: sqlite3.Connection) -> Restatement:
         out.changed += 1
         if row["verdict"] == "confirmed":
             out.withdrawn += 1
+        # `checked_at` is deliberately untouched. This re-judges evidence that
+        # is already on the row; nothing was looked at, and a card saying
+        # "checked just now" would be claiming a frame nobody read.
         conn.execute(
             "UPDATE encounter SET verdict = ?, confidence = ?, evidence = ? WHERE id = ?",
             (verdict,
@@ -1411,8 +1418,8 @@ def audit_verdicts(
                 )
                 conn.execute(
                     "UPDATE encounter SET verdict = 'confirmed', "
-                    "verified_how = 'audit:vod_names' WHERE id = ?",
-                    (row["id"],),
+                    "verified_how = 'audit:vod_names', checked_at = ? WHERE id = ?",
+                    (db.utcnow(), row["id"]),
                 )
                 conn.commit()
             elif row["verdict"] == "unconfirmed" and seen.saw_nothing:
@@ -1423,8 +1430,8 @@ def audit_verdicts(
                 )
                 conn.execute(
                     "UPDATE encounter SET verdict = 'rejected', "
-                    "verified_how = 'audit:not_this_match' WHERE id = ?",
-                    (row["id"],),
+                    "verified_how = 'audit:not_this_match', checked_at = ? WHERE id = ?",
+                    (db.utcnow(), row["id"]),
                 )
                 conn.commit()
             elif seen.names:
