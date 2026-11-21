@@ -106,3 +106,29 @@ observed, and the thing it was observed on should be named.
 results: a window that was truncated, a queue that was skipped, a match that was never
 listed. A scan that quietly reports on a subset is the single failure mode that has
 wasted the most time, so when output could mislead, make it say so.
+
+## The budget
+
+These are hard constraints on any fix, not preferences. A change that improves an
+answer and breaks one of these has not improved anything.
+
+**A scan must never get slower.** Whatever the current wall-clock for a scan is, that
+is the ceiling; faster is the only acceptable direction. Measure both sides on the same
+machine before claiming either (see *Hardware dominates everything*).
+
+**Stay inside the quota.** Hitting a rate limit and waiting for it to reset is a bug,
+not a cost of doing business. HenrikDev Basic is 30 requests a minute and Twitch's app
+token is about 800 points a minute; work within them by making fewer calls, not by
+sleeping longer.
+
+**Never re-scan what is already known.** People re-enter the same Riot ID constantly,
+and a full re-scan of matches already in the database spends quota and minutes to
+arrive at the answer already on disk. The database is there for exactly this; if the
+persistence it needs does not exist, build it.
+
+**Test locally.** The deployed box has 952 MB of RAM and an eighth of an OCPU. Run
+experiments on this machine, where neither memory nor disk nor CPU is the thing being
+measured.
+
+**Subagents run on Sonnet.** Any subagent spawned for work in this repository is
+started with the Sonnet model.
