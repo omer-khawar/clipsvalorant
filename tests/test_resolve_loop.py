@@ -9,6 +9,7 @@ look" into "there was nothing there". These pin all three down.
 """
 
 import threading
+import time
 
 import pytest
 
@@ -359,3 +360,142 @@ def test_frames_are_sampled_where_the_match_is_not_where_its_timestamp_says(
     assert min(offsets) > 600 + calibrate.FALLBACK_SHIFT_S
     naive = [o - calibrate.FALLBACK_SHIFT_S for o in offsets]
     assert all(o >= 600 for o in naive)
+
+
+# ------------------------------- what an interrupted scan leaves behind
+
+MATCH_ID = "11111111-2222-3333-4444-555555555555"
+
+# An hour ago on the real clock, because `last_resolved_at` is written with
+# the real clock too. A fixed epoch for one and `utcnow()` for the other
+# makes "resolved a moment ago" read as weeks stale, which is how the first
+# version of this test passed while proving nothing.
+STARTED = int(time.time()) - 3600
+
+
+class _StubTwitch:
+    """Enough of a client for the loop to turn over. The lookups are not
+    what these tests are about - where the bookkeeping lands is."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def game_id(self, name):
+        return "valorant"
+
+
+def _one_match(cfg, payload):
+    """One real match on disk, never looked at, ready to be resolved."""
+    import json
+
+    with db.session(cfg.db_path) as conn:
+        conn.execute(
+            "INSERT INTO match (id, started_at, started_at_epoch, ingested_at, "
+            "raw_json) VALUES (?,?,?,?,?)",
+            (MATCH_ID, "", STARTED, "", json.dumps(payload["data"])),
+        )
+        conn.commit()
+
+
+def _bookkeeping(cfg):
+    with db.session(cfg.db_path) as conn:
+        row = conn.execute(
+            "SELECT last_resolved_at, resolve_attempts FROM match"
+        ).fetchone()
+    return row["last_resolved_at"], row["resolve_attempts"]
+
+
+@pytest.fixture()
+def loop(cfg, sample_payload, monkeypatch):
+    """A database with one match in it and no network underneath."""
+    from clipsvalorant import resolve as resolve_mod
+
+    _one_match(cfg, sample_payload)
+    monkeypatch.setattr(resolve_mod, "TwitchClient",
+                        lambda *a, **k: _StubTwitch())
+    return cfg
+
+
+def test_the_attempt_is_recorded_before_the_work_not_after(loop, monkeypatch):
+    """The failure this prevents is a scan that resumes perfectly and never
+    advances. A host that stops part-way through a match used to leave no
+    trace the match had been tried at all, so the next run chose the same
+    one, died in the same place, and went on doing that forever."""
+    from clipsvalorant import resolve as resolve_mod
+
+    during: list[int] = []
+
+    def peek(conn, *a, **k):
+        during.append(
+            conn.execute("SELECT resolve_attempts AS n FROM match").fetchone()["n"]
+        )
+
+    monkeypatch.setattr(resolve_mod, "resolve_match", peek)
+    resolve_mod.resolve_recent(loop, limit=5, watch_vods=False)
+
+    assert during == [1], "the attempt was not on disk while the work was running"
+
+
+def test_an_interrupted_match_keeps_its_attempt_but_no_resolved_stamp(
+    loop, monkeypatch
+):
+    """`resolve_attempts` answers "how often did we try" and
+    `last_resolved_at` answers "did we get to the end". A match killed
+    part-way has to say yes to the first and no to the second, or the
+    due-list cannot tell a match nobody has looked at from one that defeats
+    every run it meets."""
+    from clipsvalorant import resolve as resolve_mod
+
+    def die(*a, **k):
+        raise RuntimeError("the host stopped")
+
+    monkeypatch.setattr(resolve_mod, "resolve_match", die)
+    with pytest.raises(RuntimeError):
+        resolve_mod.resolve_recent(loop, limit=5, watch_vods=False)
+
+    stamped, attempts = _bookkeeping(loop)
+    assert attempts == 1, "an interrupted match left no record of the attempt"
+    assert stamped is None, "a match that never finished was stamped resolved"
+
+
+def test_a_match_that_defeats_every_run_is_eventually_left_alone(loop, monkeypatch):
+    """MAX_ATTEMPTS has to be a ceiling on being interrupted and not only on
+    failing. Without that, one match too slow to finish inside the window
+    blocks everything behind it: every resumed scan picks it first, dies in
+    the same place, and no later match is ever reached."""
+    from clipsvalorant import resolve as resolve_mod
+    from clipsvalorant.sweep import MAX_ATTEMPTS, matches_due
+
+    monkeypatch.setattr(resolve_mod, "resolve_match",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("cut off")))
+
+    for _ in range(MAX_ATTEMPTS):
+        with pytest.raises(RuntimeError):
+            resolve_mod.resolve_recent(loop, limit=5, watch_vods=False)
+
+    with db.session(loop.db_path) as conn:
+        due, _, _ = matches_due(conn, need_highlight=False)
+    assert due == [], "a match that can never finish is still being retried"
+
+
+def test_a_match_that_finishes_is_stamped_and_then_skipped(loop, monkeypatch):
+    """The other half of the same contract, and the whole of picking up
+    where a scan left off: a match that got to the end is not asked again,
+    which is what makes a resumed scan shorter than the one it follows."""
+    from clipsvalorant import resolve as resolve_mod
+    from clipsvalorant.sweep import matches_due
+
+    monkeypatch.setattr(resolve_mod, "resolve_match", lambda *a, **k: None)
+    resolve_mod.resolve_recent(loop, limit=5, watch_vods=False)
+
+    stamped, attempts = _bookkeeping(loop)
+    assert stamped is not None, "a finished match was not stamped as resolved"
+    assert attempts == 1
+
+    with db.session(loop.db_path) as conn:
+        due, _, settled = matches_due(conn, need_highlight=False)
+    assert due == [], "a match resolved a moment ago was offered up again"
+    assert settled == 1

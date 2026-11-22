@@ -1412,3 +1412,70 @@ def test_restating_a_verdict_is_not_a_check(tmp_path):
 
     assert row["verdict"] != "confirmed", "a clip alone no longer confirms"
     assert row["checked_at"] == "2026-11-01T00:00:00Z", "nothing was looked at"
+
+
+# ------------------------------------- the deadline a host puts on a scan
+
+
+def test_no_uptime_limit_means_there_is_nothing_to_warn_about(monkeypatch):
+    """None and zero are different answers and the page reads them
+    differently: zero says the time is up, None says this host has no clock
+    worth mentioning. Defaulting to zero would nag on a machine with no
+    limit at all, which is most of them."""
+    monkeypatch.delenv(web.UPTIME_LIMIT_ENV, raising=False)
+    assert web.host_stops_in() is None
+
+
+def test_an_unreadable_uptime_limit_is_read_as_no_limit(monkeypatch):
+    """A typo in a deployment variable must not take the page down with it,
+    and "no limit" is the only safe reading of one nobody can parse."""
+    monkeypatch.setenv(web.UPTIME_LIMIT_ENV, "five minutes")
+    assert web.host_stops_in() is None
+
+
+def test_a_limit_of_zero_is_no_limit_not_an_instant_deadline(monkeypatch):
+    monkeypatch.setenv(web.UPTIME_LIMIT_ENV, "0")
+    assert web.host_stops_in() is None
+
+
+def test_the_deadline_is_what_is_left_not_what_was_configured(monkeypatch):
+    """Two minutes into a five-minute window leaves three. The page counts
+    down from this rather than from whenever it happened to load."""
+    monkeypatch.setenv(web.UPTIME_LIMIT_ENV, "300")
+    monkeypatch.setattr(web, "_STARTED_AT", time.monotonic() - 120)
+    assert 175 <= web.host_stops_in() <= 180
+
+
+def test_a_deadline_already_passed_is_zero_and_never_negative(monkeypatch):
+    """A negative number would render as a countdown running backwards."""
+    monkeypatch.setenv(web.UPTIME_LIMIT_ENV, "60")
+    monkeypatch.setattr(web, "_STARTED_AT", time.monotonic() - 600)
+    assert web.host_stops_in() == 0
+
+
+def test_a_ticket_from_before_a_restart_still_carries_the_deadline(cfg, monkeypatch):
+    """This is the answer a page gets when its scan was cut off, so it is
+    the one that has to say whether this host lives on a clock. It is the
+    difference between telling somebody the host stopped and guessing."""
+    monkeypatch.setenv(web.UPTIME_LIMIT_ENV, "300")
+    queue = web.Queue(cfg, lambda *a, **k: None)
+    try:
+        snap = queue.snapshot("a-ticket-from-a-process-that-is-gone")
+    finally:
+        queue.close()
+    assert snap["state"] == "unknown"
+    assert snap["host_stops_in"] is not None
+
+
+def test_an_unlimited_host_says_so_rather_than_saying_nothing(cfg, monkeypatch):
+    """The key is present and null on a machine with no limit, because the
+    page has to tell "there is no deadline" apart from "this server is old
+    enough not to mention one"."""
+    monkeypatch.delenv(web.UPTIME_LIMIT_ENV, raising=False)
+    queue = web.Queue(cfg, lambda *a, **k: None)
+    try:
+        snap = queue.snapshot("another-ticket-nobody-holds")
+    finally:
+        queue.close()
+    assert "host_stops_in" in snap
+    assert snap["host_stops_in"] is None

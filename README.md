@@ -41,6 +41,7 @@ Then edit `.env`:
 | `RIOT_REGION` | `eu`, `na`, `ap`, `kr`, `latam` or `br` |
 | `DB_PATH` | Defaults to `data/clipsvalorant.db` |
 | `CLIPS_PASSWORD` | Optional, and empty is right for local use. One shared password for the web UI, needed only if you bind it past localhost — see [Deploying it](#deploying-it) |
+| `CLIPS_UPTIME_LIMIT_S` | Optional. How long this host lets the process live, in seconds — Fly's free trial stops a Machine after 300. Set it and the page warns before the deadline and offers to pick a cut-off scan back up; leave it unset and no deadline is ever mentioned |
 
 ### Getting a HenrikDev API key
 

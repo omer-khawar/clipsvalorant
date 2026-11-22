@@ -130,6 +130,17 @@ survive (17 of 31 on 198 frames, unchanged). Before changing a rule in `watch`,
 work out what it does to a candidate that reads *nothing*, because that is 56
 of every 67.
 
+**The attempt is recorded before the work, and moving it back breaks
+resuming.** `resolve_recent` increments `resolve_attempts` and commits
+*before* calling `resolve_match`, then stamps `last_resolved_at` after. It
+reads like redundant bookkeeping and it is not: the two columns answer
+different questions, "how often did we try" and "did we get to the end". A
+match killed part-way — a deploy, Fly's trial stopping the Machine on its
+five-minute timer — used to leave no trace it had been tried, so the next
+run chose the same match, died in the same place, and a scan that resumed
+perfectly never advanced past it. Recording the attempt first is what makes
+`MAX_ATTEMPTS` a ceiling on being interrupted as well as on failing.
+
 **A frame budget may be reordered but not enlarged.** Nearly every candidate is the
 wrong person and spends the whole budget, so adding a frame per candidate taxes the
 common case directly while the gains land only on the rare one. `END_ANCHOR_AT` frames

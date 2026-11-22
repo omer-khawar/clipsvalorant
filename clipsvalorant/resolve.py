@@ -1687,11 +1687,27 @@ def resolve_recent(
                 if me is None:
                     continue
                 report.matches_checked += 1
+                # The attempt is written down before the work, not after it.
+                # A match killed part-way - a deploy, a host that stops on a
+                # timer - otherwise leaves no trace it was ever tried, so the
+                # next run picks the same match, dies in the same place, and a
+                # scan that resumes perfectly cleanly never advances past it.
+                # Recording the attempt first makes MAX_ATTEMPTS a ceiling on
+                # being interrupted as well as on failing.
+                conn.execute(
+                    "UPDATE match SET resolve_attempts = resolve_attempts + 1 "
+                    "WHERE id = ?",
+                    (row["id"],),
+                )
+                conn.commit()
                 resolve_match(conn, client, match, my_puuid=me.puuid, report=report,
                               game_id=game_id, watcher=watcher, cancel=cancel)
+                # Only a match that got all the way through is stamped as
+                # resolved. `resolve_attempts` says how often we tried;
+                # `last_resolved_at` says we finished, and `matches_due` reads
+                # them as different questions.
                 conn.execute(
-                    "UPDATE match SET last_resolved_at = ?, "
-                    "resolve_attempts = resolve_attempts + 1 WHERE id = ?",
+                    "UPDATE match SET last_resolved_at = ? WHERE id = ?",
                     (db.utcnow(), row["id"]),
                 )
                 conn.commit()

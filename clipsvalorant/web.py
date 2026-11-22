@@ -90,6 +90,42 @@ MAX_JOB_LINES = 400
 # no session to expire and no cookie to get wrong.
 PASSWORD_ENV = "CLIPS_PASSWORD"
 
+# How long this host lets the process live, in seconds, or unset for "as long
+# as it likes". Fly's trial stops a Machine five minutes after it starts,
+# whatever it is in the middle of, and a deploy to the box ends a scan just as
+# abruptly. Neither is detectable from in here, so the number is configuration
+# rather than a guess: on a machine with no limit this stays unset and the page
+# never mentions a deadline, which is the only honest default. The work itself
+# survives either way - `resolve_recent` commits each match as it finishes -
+# so this exists to turn a scan that vanishes into one that says why.
+UPTIME_LIMIT_ENV = "CLIPS_UPTIME_LIMIT_S"
+
+# When the process started, by a clock that cannot step sideways. Wall time
+# would move the deadline if ntp corrected mid-scan, which is exactly when a
+# scan is counting on it.
+_STARTED_AT = time.monotonic()
+
+
+def host_stops_in() -> int | None:
+    """Seconds until this host is expected to stop the process, or None.
+
+    None means "no limit is configured", which is a different answer from
+    zero and has to stay that way: zero tells the page to warn that time is
+    up, and None tells it there is nothing to warn about.
+    """
+    raw = os.environ.get(UPTIME_LIMIT_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        limit = float(raw)
+    except ValueError:
+        # A typo in a deployment variable must not take the page down with
+        # it; "no limit" is the safe reading of an unreadable one.
+        return None
+    if limit <= 0:
+        return None
+    return max(0, int(limit - (time.monotonic() - _STARTED_AT)))
+
 # The tab icon: the mark on the brand sheet's black tile. Inline rather than
 # a file on disk because the whole UI is one module and a favicon is not
 # worth a second deployable artefact; SVG rather than ICO because it stays
@@ -1281,8 +1317,13 @@ class Queue:
                 # Not an error. A ticket from before a restart, or one that
                 # has aged out, should put the page back to a usable state
                 # rather than show it a failure it can do nothing about.
-                return {"state": "unknown"}
+                #
+                # The deadline rides along even here, because this is the
+                # answer a page gets when its scan was cut off: it is what
+                # lets the page say "the host stopped" instead of guessing.
+                return {"state": "unknown", "host_stops_in": host_stops_in()}
             snap = job.snapshot()
+            snap["host_stops_in"] = host_stops_in()
             if job.state == "queued":
                 ahead = 0
                 for other in self._waiting:
@@ -1937,6 +1978,19 @@ body{
   padding:11px 14px;font-size:13px;color:#e5484d;background:color-mix(in srgb,#e5484d 7%,transparent)}
 .err[hidden]{display:none}
 
+/* The interrupted-scan notice. Accent rather than red: a host that stopped
+   on its own timer is not a failure, and the matches it finished are on
+   disk, so this is an offer and has to look like one. */
+.resume{margin-top:12px;border:1px solid color-mix(in srgb,var(--accent) 45%,transparent);
+  border-radius:12px;padding:11px 14px;font-size:13px;color:var(--ink);
+  background:color-mix(in srgb,var(--accent) 7%,transparent);line-height:1.45}
+.resume[hidden]{display:none}
+.rbtns{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.resume button{border:1px solid var(--line);background:var(--panel);color:var(--ink);
+  font:inherit;font-size:12px;border-radius:9px;padding:6px 11px;cursor:pointer}
+.resume button:hover{border-color:var(--accent)}
+.resume button[hidden]{display:none}
+
 /* ---- the quiet line of totals (was four big tiles) ---- */
 .totals{display:flex;flex-wrap:wrap;gap:0 28px;align-items:baseline;margin:20px 0 6px;
   padding-bottom:14px;border-bottom:1px solid var(--hair)}
@@ -2384,6 +2438,13 @@ body{
       <div class="notes" id="notes"></div>
       <button class="logbtn" id="logbtn" type="button" aria-expanded="false">Show log</button>
       <pre class="log" id="log" hidden></pre>
+    </div>
+    <div class="resume" id="resume" hidden>
+      <div id="rmsg"></div>
+      <div class="rbtns">
+        <button class="rgo" id="rgo" type="button" hidden>Pick up where it left off</button>
+        <button class="rno" id="rno" type="button" hidden>Not now</button>
+      </div>
     </div>
     <div class="err" id="err" hidden></div>
   </section>
@@ -3089,6 +3150,51 @@ function readTicket(){ try { return localStorage.getItem(TICKET) || ""; } catch(
 function saveTicket(t){ S.ticket = t || ""; try { localStorage.setItem(TICKET, S.ticket); } catch(e){} }
 function dropTicket(){ S.ticket = ""; try { localStorage.removeItem(TICKET); } catch(e){} }
 
+/* What it would take to ask this same question again, plus how far it got
+   and when we last saw it alive. The options belong in here as much as the
+   Riot ID: resuming with a different window is a different question, and
+   would re-ask one already answered. */
+var SCAN = "vg:scan";
+
+/* How recently a scan must have been seen alive for its disappearance to be
+   an interruption rather than a ticket that simply aged out. The poll runs
+   every 900ms, so anything inside a minute was running when we last looked;
+   the server keeps a finished job for twenty minutes, which is the other end
+   of the same question. */
+var RESUME_FRESH_MS = 60000;
+
+/* When to start saying the host is about to stop. Long enough to read the
+   sentence and decide, short enough not to nag through most of a window. */
+var WARN_AT_S = 60;
+
+function readScan(){
+  try { return JSON.parse(localStorage.getItem(SCAN) || "null"); } catch(e){ return null; }
+}
+function markScan(fields){
+  var rec = readScan() || {};
+  for (var k in fields) { if (Object.prototype.hasOwnProperty.call(fields, k)) { rec[k] = fields[k]; } }
+  try { localStorage.setItem(SCAN, JSON.stringify(rec)); } catch(e){}
+}
+function dropScan(){ try { localStorage.removeItem(SCAN); } catch(e){} }
+
+/* One strip, two jobs: a warning while the scan is still alive, and an
+   offer once it is not. They are the same sentence at different times, so
+   they are the same element rather than two that can both be on screen. */
+function banner(msg, offer){
+  $("#rmsg").textContent = msg;
+  $("#rgo").hidden = !offer;
+  $("#rno").hidden = !offer;
+  $("#resume").hidden = false;
+}
+function clearBanner(){ $("#resume").hidden = true; }
+
+/* Whether the server told us it lives on a clock. A number means yes - zero
+   is a real answer and means "now" - and null or a missing key mean there is
+   no limit to mention. */
+function limited(j){
+  return !!j && j.host_stops_in !== null && j.host_stops_in !== undefined;
+}
+
 function watch(){
   if (!S.ticket) { return; }
   if (S.poll) { clearInterval(S.poll); }
@@ -3153,16 +3259,50 @@ function hideGate(){
 function poll(){
   api("/api/job?ticket=" + encodeURIComponent(S.ticket)).then(function(j){
     /* Unknown covers a ticket from before a restart and one that has aged
-       out. Either way the page belongs back in a state you can use. */
+       out. Either way the page belongs back in a state you can use - but
+       which of the two it was decides whether there is anything to offer. */
     if (!j || j.state === "idle" || j.state === "unknown") {
-      unwatch(); hideGate(); dropTicket(); return;
+      var rec = readScan();
+      unwatch(); hideGate(); dropTicket();
+      if (rec && rec.riot && (Date.now() - (rec.seen || 0)) < RESUME_FRESH_MS) {
+        /* It was alive a moment ago, so it did not finish: the process it
+           was running in went away. Every match it got through is already
+           committed, so what is left is a shorter scan, not the same one. */
+        banner(
+          (limited(j) ? "This host stops the app on a timer, and it stopped mid-scan. "
+                      : "The app restarted mid-scan. ")
+          + (rec.total
+              ? rec.done + " of " + rec.total + " match(es) were checked and saved"
+              : "What it had checked was saved")
+          + ", and picking up again skips them.",
+          true);
+      } else {
+        dropScan();
+      }
+      return;
     }
-    if (j.state === "queued") { paintGate(j); return; }
+    if (j.state === "queued") {
+      markScan({done: 0, total: 0, seen: Date.now()});
+      paintGate(j);
+      return;
+    }
 
     hideGate();
     $("#prog").hidden = false;
     $("#go").disabled = true;
-    if (j.state === "running") { $("#stop").hidden = false; $("#stop").disabled = false; }
+    if (j.state === "running") {
+      $("#stop").hidden = false; $("#stop").disabled = false;
+      markScan({done: j.done || 0, total: j.total || 0, seen: Date.now()});
+      /* Said while the scan is still alive, so that a refresh is a choice
+         rather than a surprise. */
+      if (limited(j) && j.host_stops_in <= WARN_AT_S) {
+        banner("This host stops the app in " + j.host_stops_in + "s. Whatever "
+               + "has finished by then is saved, and you will be offered the rest.",
+               false);
+      } else {
+        clearBanner();
+      }
+    }
     $("#pphase").textContent = PHASES[j.phase] || j.phase || "Working";
     var fill = $("#pfill");
     if (j.total > 0) {
@@ -3186,6 +3326,11 @@ function poll(){
     if (j.state !== "running") {
       unwatch();
       dropTicket();
+      /* It reached an end of its own - finished, failed, or stopped on
+         purpose. None of those is an interruption, so there is nothing to
+         offer to pick up. */
+      dropScan();
+      clearBanner();
       fill.classList.remove("indet");
       fill.style.width = j.state === "cancelled" ? fill.style.width : "100%";
       $("#pphase").textContent = j.state === "error" ? "Failed"
@@ -3199,11 +3344,22 @@ function poll(){
   }).catch(function(){});
 }
 
-$("#scanform").addEventListener("submit", function(ev){
-  ev.preventDefault();
+/* Put a segmented control back where it was, not just the state behind it:
+   a window picker reading 14 beside a scan that resumed asking for 7 is a
+   lie, and the next scan would act on it. Best effort - the request itself
+   uses the saved options either way. */
+function restoreChoice(sel, key, value){
+  var hit = null;
+  $$(sel + " button").forEach(function(b){
+    if (String(b.dataset[key]) === String(value)) { hit = b; }
+  });
+  if (!hit) { return; }
+  $$(sel + " button").forEach(function(o){ o.setAttribute("aria-checked", String(o === hit)); });
+}
+
+function startScan(riot){
   fail("");
-  var riot = $("#riot").value.trim();
-  if (!riot) { fail("Enter a Riot ID as name#tag."); return; }
+  clearBanner();
   api("/api/search", {
     method: "POST", headers: {"Content-Type": "application/json"},
     /* The ceiling has to follow the window, or picking 14 days quietly
@@ -3219,10 +3375,35 @@ $("#scanform").addEventListener("submit", function(ev){
     try { localStorage.setItem("vg:riot", riot); } catch(e){}
     nameplate(riot);
     saveTicket(j.id || "");
+    /* Written down before the first poll, so that a host which stops in the
+       next second still leaves something to pick up. */
+    markScan({riot: riot, days: S.days, mode: S.mode,
+              done: 0, total: 0, seen: Date.now()});
     if (j.state === "queued") { paintGate(j); }
     watch();
   }).catch(function(e){ $("#go").disabled = false; fail(String(e.message || e)); });
+}
+
+$("#scanform").addEventListener("submit", function(ev){
+  ev.preventDefault();
+  var riot = $("#riot").value.trim();
+  if (!riot) { fail("Enter a Riot ID as name#tag."); return; }
+  startScan(riot);
 });
+
+/* Picking up is the same question again, with the same window and the same
+   queue. Nothing else would do: the matches already on disk were skipped
+   under those options, and a different window would not skip them. */
+$("#rgo").addEventListener("click", function(){
+  var rec = readScan();
+  if (!rec || !rec.riot) { clearBanner(); dropScan(); return; }
+  if (rec.days) { S.days = Number(rec.days); restoreChoice("#window", "days", rec.days); }
+  if (rec.mode !== undefined) { S.mode = rec.mode; restoreChoice("#queue", "mode", rec.mode); }
+  $("#riot").value = rec.riot;
+  startScan(rec.riot);
+});
+
+$("#rno").addEventListener("click", function(){ clearBanner(); dropScan(); });
 
 function abandon(btn){
   if (btn) { btn.disabled = true; }
@@ -3243,7 +3424,9 @@ $("#stop").addEventListener("click", function(){
 $("#gateleave").addEventListener("click", function(){
   var btn = this;
   abandon(btn).then(function(){
-    unwatch(); hideGate(); dropTicket();
+    /* Leaving the line is a decision, not an interruption, so it takes the
+       saved scan with it and nothing offers to pick it up. */
+    unwatch(); hideGate(); dropTicket(); dropScan(); clearBanner();
     btn.disabled = false;
   });
 });
