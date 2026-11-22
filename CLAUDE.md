@@ -110,6 +110,26 @@ names off one frame - and aimed with the median it settled 2 encounters in 31. A
 select also hides the enemy team, so any pre-match frame has a ceiling of four names.
 The post-game scoreboard has neither problem, which is why it is the one that shipped.
 
+**A warm frame cache hides the cost of moving a frame, and that shipped a
+regression.** The anchors were justified by an A/B against `data/frames`, which
+already held every killfeed frame those encounters had read, so it measured OCR
+on segments that were on disk and reported the frame count unchanged. The count
+*was* unchanged. What changed was where in the broadcast the frames are, and a
+frame in a new stretch of VOD is a segment to fetch. Run cold, eight rejections
+wrote 164 cache files against 140 and took 11% longer. **Any claim about frame
+cost must be measured against an empty cache** - `ab_cold.py`'s approach, a
+fresh temp directory per arm with the arms alternating order.
+
+**The common case is the wrong person, so a rule that fires on "not enough
+evidence" fires on everything.** `ENOUGH_TO_STAY = 3` was written as "fewer
+than three names means try the scoreboard", which is true of every rejection,
+because a candidate who is not in the match reads zero names and always will.
+`ANCHOR_AFTER = 1` is the fix: at least one name already in hand. Rejections get
+no anchor frames and cost exactly what they did; the three extra confirmations
+survive (17 of 31 on 198 frames, unchanged). Before changing a rule in `watch`,
+work out what it does to a candidate that reads *nothing*, because that is 56
+of every 67.
+
 **A frame budget may be reordered but not enlarged.** Nearly every candidate is the
 wrong person and spends the whole budget, so adding a frame per candidate taxes the
 common case directly while the gains land only on the rare one. `END_ANCHOR_AT` frames

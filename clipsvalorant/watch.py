@@ -78,6 +78,17 @@ END_ANCHOR_AT = (25.0, 45.0, 10.0, 75.0)
 KILLFEED_FIRST = 3
 ENOUGH_TO_STAY = 3
 
+# The lower bound, and the whole reason this is not simply "fewer than three".
+# A candidate who is the wrong person reads zero lobby names and always will,
+# so "fewer than three" is true of every rejection - which is 56 of every 67
+# candidates, the case the budget rule is about. An anchor sits past the end of
+# the match, in a stretch of the broadcast the killfeed frames never go near,
+# so it is a segment that has to be fetched where a neighbouring killfeed frame
+# often is not. Measured on the 1/8 OCPU box, one match went from 92s to 265s
+# on that alone. One name already in hand is the cheapest evidence that this
+# broadcast is worth a second look.
+ANCHOR_AFTER = 1
+
 
 def _normalise_key(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (text or "").lower())
@@ -283,7 +294,7 @@ def watch(reader, frames, vod_id: str, vod_offset_s: float,
     if look([vod_offset_s + at for at in killfeed[:KILLFEED_FIRST]]):
         return seen
     rest = killfeed[KILLFEED_FIRST:]
-    if len(seen.names) < ENOUGH_TO_STAY:
+    if ANCHOR_AFTER <= len(seen.names) < ENOUGH_TO_STAY:
         rest = end_anchors(match_end_s, tail_s) + rest
     look([vod_offset_s + at for at in rest])
     return seen

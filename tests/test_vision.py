@@ -161,17 +161,42 @@ _TAIL = {"match_end_s": 1100.0, "tail_s": 100.0}
 
 
 def test_the_scoreboard_is_tried_once_the_killfeed_has_stopped_paying():
-    """Three killfeed frames showing nothing is the signal that this broadcast
-    does not read well, and the post-game scoreboard is the better bet from
-    there. Measured over the 31 confirmed and likely encounters on disk, this
-    settles 17 against 14 and reads 185 frames against 202."""
-    reader, frames, asked = _driver({1125: ["alpha", "bravo", "charlie", "delta"]})
-    seen = watch(reader, frames, "v1", 0.0, _KILLS,
-                 wanted_names([(n, False) for n in
-                               ("alpha", "bravo", "charlie", "delta")]), **_TAIL)
+    """A killfeed that is reading, but not fast enough, is what the scoreboard
+    is for. One name says this broadcast is worth a second look; the post-game
+    screen then carries the whole lobby at once. Measured over the 31 confirmed
+    and likely encounters on disk, this settles 17 against 14 on 198 frames
+    against 208."""
+    names = wanted_names([(n, False) for n in
+                          ("alpha", "bravo", "charlie", "delta")])
+    reader, frames, asked = _driver({
+        105: ["alpha"], 1125: ["alpha", "bravo", "charlie", "delta"]})
+    seen = watch(reader, frames, "v1", 0.0, _KILLS, names, **_TAIL)
     assert seen.certain
     assert 1125.0 in asked
     assert asked.index(1125.0) == KILLFEED_FIRST  # straight after the three
+
+
+def test_a_candidate_with_no_names_at_all_never_reaches_the_scoreboard():
+    """This is the bug that shipped, and it cost a real scan real minutes.
+
+    The rule was "fewer than three names in hand", which sounded selective and
+    is true of *every* rejection, because the wrong person reads zero names and
+    always will. Nearly every candidate is the wrong person, so the common case
+    was the one being sent to the anchors.
+
+    That matters even though the frame budget is unchanged, because an anchor
+    sits past the end of the match, in a stretch of broadcast the killfeed
+    frames never go near - a segment that must be fetched where a neighbouring
+    killfeed frame often need not be. Run cold, eight rejections wrote 164
+    cache files against 140 and took 11% longer; gated on one name they write
+    140 against 140. The warm A/B that let this through could not see it,
+    because every killfeed segment it needed was already on disk.
+    """
+    names = wanted_names([(n, False) for n in ("alpha", "bravo", "charlie", "delta")])
+    reader, frames, asked = _driver({1125: ["alpha", "bravo", "charlie", "delta"]})
+    seen = watch(reader, frames, "v1", 0.0, _KILLS, names, **_TAIL)
+    assert not seen.certain, "a candidate with nothing on its killfeed was settled"
+    assert not any(at > 1100.0 for at in asked), "a rejection paid for the scoreboard"
 
 
 def test_a_killfeed_that_is_nearly_there_is_not_interrupted():

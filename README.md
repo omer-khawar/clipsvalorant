@@ -811,6 +811,46 @@ window while the page shows two, because vaerie and cocapuppy are on matches
 that have since aged out of fourteen days. That is the exact gap the "not
 re-checked for N days" line on each card now exists to explain.
 
+#### What the warm cache hid (2026-11-22)
+
+The anchors above shipped on an A/B that reported the frame count unchanged -
+765 frames against 767 over 89 rejections - and that number was correct and
+beside the point. It was measured against `data/frames`, 4.4GB and 9,683 files,
+already holding every killfeed frame those encounters had ever read. It
+measured OCR on segments that were already on disk.
+
+The anchors do not change how many frames are read. They change **where**. A
+killfeed frame sits near the kills, often in a segment a neighbouring frame
+already pulled; an anchor sits past the end of the match, in a stretch of
+broadcast nothing has touched. Same count, more to download. Run cold - a fresh
+cache per arm, arms alternating so network drift lands on neither:
+
+| | total | frames | cache files written |
+|---|---:|---:|---:|
+| anchors off | 139.8s | 72 | 140 |
+| anchors on | 154.8s | 72 | **164** |
+
+Eleven per cent on the case that is 56 of every 67, which is exactly what the
+budget rule forbids.
+
+The rule was the error. "Fewer than three names in hand" sounds selective and
+is true of **every** rejection, because the wrong person reads zero names and
+always will. So the frames went to the common case and the benefit went to the
+rare one. `ANCHOR_AFTER = 1` requires one name first: cold, the arms now write
+140 files against 140 and run 86.1s against 87.4s, while the confirmed and
+likely set still settles 17 of 31 on 198 frames with all three gains intact
+(redefy, subroza, punz).
+
+What this did **not** explain was a twenty-minute scan on the box, and that is
+worth recording too, because two confident wrong diagnoses were offered before
+anyone measured. The box wrote 79 frames in ninety minutes, so frames were
+never the bottleneck there. Timed on the box, one match: 265s on its first,
+fully cold pass, 92s under the old code once that pass had warmed the frames
+and playlists, and **30s under the new code with the bio and listing caches
+populated**. The runs warm each other, so they do not make a clean A/B - but
+the twenty minutes was a cold scan of eight matches that had never had their
+broadcasts read, not a regression in the per-match cost.
+
 #### The bios we had already read (2026-11-21)
 
 With the frames reordered, the rest of a scan's time is Twitch, and most of
