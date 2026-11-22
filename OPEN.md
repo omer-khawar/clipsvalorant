@@ -168,9 +168,15 @@ ceiling rather than the current cost.
 A hundred matches at that rate is about **six minutes on this machine**, and the
 box is roughly seven times slower. So "under five minutes for a hundred" is
 close but not yet true, and it will not be the API that gets it there. The
-shared-cache question in section 2 is now the biggest lever on speed as well as
-on quota - and half of it has since been taken, for a re-scan at least. What is
-left of it is the first scan of an account nobody has scanned before.
+shared-cache question in section 2 looked like the biggest lever on speed, and
+measuring it showed it is not: bios are paid for a hundred at a time, so having
+them on disk removes about 1.4% of a scan's requests. The listings are the
+lever. Asking "does this channel have a broadcast?" was ~80% of the requests a
+scan made and ~88% of the answers were no, which `twitch_vod` could not record
+because it only holds a row for a channel that *has* one. Writing the absence
+down removed 89% of those requests. See *The question nobody was asking* below.
+The branch `claude/hungry-kilby-5aa68d` rewrites this section more fully with
+the contention measurement that settled the shared-database question.
 
 **What it needs from a host**, which is what rules most of them out: `ffmpeg`
 and `yt-dlp` on PATH, onnxruntime for OCR, a persistent disk for the databases

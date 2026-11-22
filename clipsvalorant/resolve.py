@@ -429,6 +429,11 @@ class ResolveReport:
     # `bios_read`, because the two numbers say different things: one is what
     # this scan cost Twitch, the other is what it did not have to.
     bios_cached: int = 0
+    # Broadcast listings asked for, and the ones answered off disk because the
+    # channel had no archive by the time the match ended. Asking is the
+    # most-made request in the program, so these two are worth seeing apart.
+    listings_read: int = 0
+    listings_known: int = 0
     frames_read: int = 0
     calibrated: int = 0
     uncalibrated: int = 0
@@ -473,6 +478,9 @@ class ResolveReport:
             f"{self.clips_seen} clip(s) from {self.clip_channels} channel(s), "
             f"{self.bios_read} bio(s) read, "
             + (f"{self.bios_cached} already on disk, " if self.bios_cached else "")
+            + (f"{self.listings_read} broadcast listing(s), " if self.listings_read else "")
+            + (f"{self.listings_known} channel(s) known to have none, "
+               if self.listings_known else "")
             + (f"{self.frames_read} VOD frame(s) read, " if self.frames_read else "")
             + (f"{self.aliases_dropped} earlier tie(s) withdrawn, "
                if self.aliases_dropped else "")
@@ -771,8 +779,68 @@ def _prefix_related(a: str, b: str, *, min_len: int = 3) -> bool:
     return a.startswith(b) or b.startswith(a)
 
 
+# Clock skew between this machine and Twitch's, and nothing to do with
+# streaming. It costs a handful of channels being asked about again and removes
+# the one way the comparison in `_no_archive_before` could be wrong.
+LISTING_SKEW_S = 60
+
+
+def _no_archive_before(conn: sqlite3.Connection, ids: list[str],
+                       match_end: int) -> set[str]:
+    """Channels already known to have had no archive by the time this match ended.
+
+    A VOD comes into being with the broadcast it records and is never added
+    retroactively, so an empty listing is not a snapshot that goes stale - it
+    is a permanent answer about every match that had already finished when we
+    asked. If a channel had no archive at that moment, nothing covering an
+    earlier match can appear afterwards, and a broadcast beginning later cannot
+    reach back over a match that is already over. Deletion runs the same way,
+    so a no never becomes a yes.
+
+    That is why this is keyed on when we asked rather than on an expiry, and
+    why it is sound in a way a timed cache would not be: the comparison is
+    against the match, not against the clock. A channel asked about before the
+    match ended is simply absent here and gets asked again.
+    """
+    if not ids or match_end <= 0:
+        return set()
+    cutoff = match_end + LISTING_SKEW_S
+    out: set[str] = set()
+    # SQLite binds 999 parameters by default and a lobby can exceed that.
+    for start_i in range(0, len(ids), 400):
+        chunk = ids[start_i:start_i + 400]
+        marks = ",".join("?" * len(chunk))
+        out.update(r["channel_id"] for r in conn.execute(
+            f"SELECT channel_id FROM twitch_no_archive "
+            f"WHERE asked_at_epoch >= ? AND channel_id IN ({marks})",
+            (cutoff, *chunk),
+        ))
+    return out
+
+
+def _remember_archive_state(conn: sqlite3.Connection, channel_id: str,
+                            had_any: bool) -> None:
+    """Write down that a channel had no archive, or that it has one after all.
+
+    The row is removed the moment a listing comes back with anything in it, so
+    a negative can never outlive the broadcast that disproves it.
+    """
+    if had_any:
+        conn.execute("DELETE FROM twitch_no_archive WHERE channel_id = ?",
+                     (channel_id,))
+        return
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT INTO twitch_no_archive (channel_id, asked_at_epoch, asked_at) "
+        "VALUES (?,?,?) ON CONFLICT(channel_id) DO UPDATE SET "
+        "asked_at_epoch = excluded.asked_at_epoch, asked_at = excluded.asked_at",
+        (channel_id, int(now.timestamp()), now.isoformat(timespec="seconds")),
+    )
+
+
 def _prefetch_videos(
     client: TwitchClient, channel_ids: set[str], report: ResolveReport,
+    conn: sqlite3.Connection | None = None, match_end: int = 0,
 ) -> dict[str, list[Vod] | str]:
     """Each channel's broadcast listing, fetched all at once.
 
@@ -780,18 +848,38 @@ def _prefetch_videos(
     which is kept rather than dropped, because "we could not look" and "there
     was nothing there" are the two answers this program most needs to tell
     apart.
+
+    `conn` and `match_end` let the channels we already know have no archive be
+    answered without a request. Without them every channel is fetched, which is
+    what this did before and what the audit path still wants.
     """
     out: dict[str, list[Vod] | str] = {}
     ids = sorted(channel_ids)
     if not ids:
         return out
-    with ThreadPoolExecutor(max_workers=min(LOOKUP_WORKERS, len(ids))) as pool:
-        jobs = {pool.submit(client.videos, cid, limit=100): cid for cid in ids}
+    known = _no_archive_before(conn, ids, match_end) if conn is not None else set()
+    for cid in known:
+        out[cid] = []
+    report.listings_known += len(known)
+    ask = [cid for cid in ids if cid not in known]
+    if not ask:
+        return out
+    with ThreadPoolExecutor(max_workers=min(LOOKUP_WORKERS, len(ask))) as pool:
+        jobs = {pool.submit(client.videos, cid, limit=100): cid for cid in ask}
         for job, cid in jobs.items():
             try:
                 out[cid] = job.result()
             except Exception as exc:
                 out[cid] = str(exc)
+    report.listings_read += len(ask)
+    if conn is not None:
+        for cid in ask:
+            got = out.get(cid)
+            # A failed fetch is not an answer about the channel, so it writes
+            # nothing: "we could not look" must never be stored as "there was
+            # nothing there".
+            if isinstance(got, list):
+                _remember_archive_state(conn, cid, bool(got))
     return out
 
 
@@ -1265,7 +1353,8 @@ def resolve_match(
     # players, and the result is handed to gather_evidence rather than
     # fetched again there.
     listings = _prefetch_videos(
-        client, {c.channel_id for _, cs in per_player for c in cs}, report
+        client, {c.channel_id for _, cs in per_player for c in cs}, report,
+        conn, end,
     )
 
     # Evidence first for the whole lobby, because it is what decides which

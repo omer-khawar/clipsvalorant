@@ -22,6 +22,8 @@ from clipsvalorant.resolve import (
     Evidence,
     ResolveReport,
     _fresh_bios,
+    _no_archive_before,
+    _prefetch_videos,
     _prefix_related,
     _remember_channel,
     _same_id,
@@ -326,6 +328,123 @@ def test_a_channel_from_the_clip_pool_needs_five_characters_to_be_tied_to_a_play
     assert tied == {"cocapuppy": "CocaPup"}
 
 
+# --- the channels that have no broadcasts at all ------------------------
+
+
+def _listings(answers: dict):
+    """A client whose listing for each channel is given, and a log of the asking.
+
+    An answer that is an exception is raised rather than returned, which is
+    the "we could not look" case the cache must never confuse with an empty
+    archive.
+    """
+    asked: list[str] = []
+
+    class _Client:
+        def videos(self, channel_id, *, limit=100, kind="archive"):
+            asked.append(channel_id)
+            got = answers.get(channel_id, [])
+            if isinstance(got, Exception):
+                raise got
+            return got
+
+    return _Client(), asked
+
+
+def test_a_channel_with_no_archive_is_not_asked_about_again():
+    """Asking is the most-made request in the program and the answer is usually no.
+
+    Measured over a twenty-four match replay, 880 of 1,193 Twitch requests
+    were broadcast listings and 756 of them came back empty. `twitch_vod`
+    cannot answer any of that, because it only ever holds a row for a channel
+    that *has* a broadcast, so the absence was thrown away every time and
+    bought again on the next match.
+
+    The skipped channel reads as an empty list and not as a string, which is
+    the distinction `gather_evidence` branches on: "there was nothing there"
+    rather than "we could not look".
+    """
+    client, asked = _listings({"c1": []})
+    report = ResolveReport()
+    with _fresh_db() as conn:
+        _prefetch_videos(client, {"c1"}, report, conn, 1000)
+        out = _prefetch_videos(client, {"c1"}, report, conn, 1000)
+    assert asked == ["c1"]
+    assert out["c1"] == [] and not isinstance(out["c1"], str)
+    assert (report.listings_read, report.listings_known) == (1, 1)
+
+
+def test_a_channel_asked_about_before_the_match_ended_is_asked_again():
+    """The whole soundness of this rests on comparing against the match, not a clock.
+
+    An empty listing is permanent only for matches that were already over when
+    we asked: nothing covering an earlier match can appear afterwards, and a
+    broadcast starting later cannot reach back over a match already finished.
+    Asked *before* the match ended, the answer says nothing about it, and a
+    timed cache would have happily used it anyway.
+    """
+    client, asked = _listings({"c1": []})
+    with _fresh_db() as conn:
+        _prefetch_videos(client, {"c1"}, ResolveReport(), conn, 0)
+        conn.execute("UPDATE twitch_no_archive SET asked_at_epoch = 500")
+        assert _no_archive_before(conn, ["c1"], 1000) == set()
+        _prefetch_videos(client, {"c1"}, ResolveReport(), conn, 1000)
+    assert asked == ["c1", "c1"]
+
+
+def test_a_broadcast_that_turns_up_later_removes_the_note():
+    """A negative must never outlive the broadcast that disproves it."""
+    with _fresh_db() as conn:
+        empty, _ = _listings({"c1": []})
+        _prefetch_videos(empty, {"c1"}, ResolveReport(), conn, 1000)
+        assert conn.execute("SELECT COUNT(*) FROM twitch_no_archive").fetchone()[0] == 1
+        conn.execute("UPDATE twitch_no_archive SET asked_at_epoch = 0")
+        streaming, _ = _listings({"c1": [_vod(0, 3600)]})
+        _prefetch_videos(streaming, {"c1"}, ResolveReport(), conn, 1000)
+        assert conn.execute("SELECT COUNT(*) FROM twitch_no_archive").fetchone()[0] == 0
+
+
+def test_a_listing_we_could_not_fetch_changes_nothing_we_knew():
+    """A rate limit or a 502 is not an answer about the channel either way.
+
+    It must not be written down as an empty archive, and it must not erase a
+    note already earned - the failure arrives as a string where a list is
+    expected, and anything truthy reads as "has broadcasts" to the writer. A
+    bad minute on Twitch's side should cost one request later at worst, which
+    is the same rule as everywhere else here: "we could not look" and "there
+    was nothing there" never collapse into each other.
+    """
+    def count(conn, cid):
+        return conn.execute(
+            "SELECT COUNT(*) FROM twitch_no_archive WHERE channel_id = ?",
+            (cid,)).fetchone()[0]
+
+    with _fresh_db() as conn:
+        answered, _ = _listings({"c2": []})
+        _prefetch_videos(answered, {"c2"}, ResolveReport(), conn, 1000)
+        # Old enough to be asked about again, so the failure reaches the writer.
+        conn.execute("UPDATE twitch_no_archive SET asked_at_epoch = 0")
+        broke, _ = _listings({"c2": RuntimeError("502 from Twitch")})
+        _prefetch_videos(broke, {"c2"}, ResolveReport(), conn, 1000)
+        kept = count(conn, "c2")
+
+        never, asked = _listings({"c1": RuntimeError("502 from Twitch")})
+        out = _prefetch_videos(never, {"c1"}, ResolveReport(), conn, 1000)
+        stored = count(conn, "c1")
+
+    assert (kept, stored) == (1, 0)
+    assert out["c1"] == "502 from Twitch"
+    assert asked == ["c1"]
+
+
+def test_the_listings_are_still_all_fetched_without_a_database_to_ask():
+    """The audit path calls this with no connection, and must be unaffected."""
+    client, asked = _listings({"c1": [], "c2": []})
+    out = _prefetch_videos(client, {"c1", "c2"}, ResolveReport())
+    assert sorted(asked) == ["c1", "c2"]
+    assert out == {"c1": [], "c2": []}
+
+
 # --- bios the clip pool has already been asked for ----------------------
 
 
@@ -367,8 +486,14 @@ def test_a_bio_already_on_disk_is_not_fetched_again():
     few hundred channels with an audience come back match after match and scan
     after scan. Measured against four real matches of an account already in
     the database, 684 of 684 pool channels had their bio stored and the nine
-    /helix/users calls became none - which is most of what a match with no
-    broadcast to look at costs.
+    /helix/users calls became none.
+
+    This docstring used to call that most of what a match with no broadcast
+    costs, which was wrong and measured wrong. A scan does not pay by the bio:
+    /helix/users takes a hundred ids, so eighty cached bios out of a hundred
+    can still cost the same single request. Replayed properly it is about 1.4%
+    of a scan's requests and 0.07s a match against 4.7s. Worth having and
+    nearly free, but the listings were where the requests actually were.
     """
     client, asked = _pool("c1", "c2")
     with _fresh_db() as conn:

@@ -855,6 +855,53 @@ hand a new account two thirds of its bio lookups before it starts, which is
 the strongest argument yet for the shared-table item in
 [OPEN.md](OPEN.md).
 
+#### The question nobody was asking (2026-11-21)
+
+With the bios cached, a replay of a twenty-four match scan was taken apart by
+request rather than by time, and the answer was not where anyone had been
+looking. **880 of 1,193 Twitch requests were `/helix/videos`** - "does this
+channel have a past broadcast?" - **and 92% of them came back empty.**
+
+`twitch_vod` cannot answer that. It holds a row for a channel that *has* a
+broadcast, so the far commoner answer, the absence, was thrown away every time
+and bought again on the next match. A scan asks once per candidate and a lobby
+produces dozens.
+
+What makes the absence storable is that it is not a snapshot. A VOD comes into
+being with the broadcast it records and is never added retroactively, so an
+empty listing is a **permanent** answer about every match that had already
+finished when we asked: nothing covering an earlier match can appear later, and
+a broadcast beginning later cannot reach back over a match already over.
+Deletion runs the same way, so a no never becomes a yes. `twitch_no_archive`
+therefore stores *when we asked* and the comparison is against the match, not
+against a clock - which is why it is sound where a timed cache would not be. A
+channel asked about before the match ended is simply asked again.
+
+Measured on this laptop, the same ten matches, same warm database, old code
+against new:
+
+| | listings fetched | known to have none | scan |
+|---|---:|---:|---:|
+| before | 468 | — | 17.6s, 17.2s |
+| after | 54 | 415 | 12.0s, 11.3s, 12.4s |
+
+**89% of the listing requests gone, and about a third off the wall-clock** -
+the largest single saving measured in this project so far. 415 of 469
+candidate channels had no archive at all, which independently confirms the
+92% above on different data.
+
+Two honest notes. A third run of the old code took 76.3s; it logged no quota
+pause and two further old-code runs came back at 17.2s and 17.6s, so it is an
+unexplained outlier and is excluded rather than counted as evidence. And the
+first run of the new code still fetched 332 listings, because the table fills
+as the scan goes - the saving is a second scan's, and a first scan of a fresh
+account gets only what repeats inside it.
+
+The thing that could go wrong here is storing "we could not look" as "there
+was nothing there". A rate limit or a 502 arrives where a list was expected,
+and the writer reads anything truthy as "has broadcasts" - so a failure must
+neither be written down nor erase a note already earned. That is a test.
+
 #### The layer that has never once fired
 
 Worth saying plainly, since the above makes it cheap rather than useless.

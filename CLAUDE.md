@@ -134,6 +134,31 @@ it is the only path that reaches a channel whose name says nothing about the
 Riot ID, which is what Layer 4 is *for* -- but weigh any cost it adds against a
 measured yield of nothing. It used to fetch about 170 bios a match for this.
 
+**An empty broadcast listing is permanent, and that is why it is cached.** A
+VOD comes into being with the broadcast it records and is never added
+retroactively, so a channel with no archive at the moment we asked can never
+acquire one covering a match that was *already over* then. `twitch_no_archive`
+stores when we asked and `_no_archive_before` compares that against the match's
+end, never against a clock - a channel asked about before the match ended is
+asked again. Do not turn this into a TTL; the match comparison is the whole
+soundness argument. Measured: 89% of listing requests removed, 468 to 54 over
+ten matches, and about a third off the scan.
+
+**A failed listing is not an answer about a channel.** It arrives as a string
+where a list was expected, and `_remember_archive_state` reads anything truthy
+as "has broadcasts", so an unguarded failure would *delete* a note already
+earned. The `isinstance(got, list)` check in `_prefetch_videos` is what stops
+it and there is a test pinning both directions. This is the same rule as
+`_prefetch_videos` keeping the error string rather than dropping it: "we could
+not look" and "there was nothing there" never collapse into each other.
+
+**Count requests, not items.** The bio cache was pitched as the biggest lever
+left on the strength of 64.1% of bios being on disk, and it is worth about 1.4%
+of a scan's requests, because `/helix/users` takes a hundred ids at a time -
+eighty cached bios out of a hundred still cost the same one request. The
+listings were 80% of the requests and nobody had looked. Before calling
+something the bottleneck, count the calls.
+
 **Hardware dominates everything.** One match costs ~4.7s on a 12-core laptop and ~34s on
 the 1/8 OCPU box. Before concluding that something got slower, check which machine the
 two numbers came from. Two separate wrong diagnoses in this repository's history were

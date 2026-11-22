@@ -145,6 +145,18 @@ CREATE TABLE IF NOT EXISTS twitch_channel (
 
 CREATE INDEX IF NOT EXISTS idx_twitch_channel_login ON twitch_channel (login COLLATE NOCASE);
 
+-- The channels that had no broadcast archive at all, which `twitch_vod` cannot
+-- record because it only ever holds a row for a channel that *has* one. Asking
+-- is 74% of the Twitch requests a scan makes and 92% of the answers are this,
+-- so the absence is the thing worth writing down. `asked_at_epoch` is the whole
+-- mechanism: see `_no_archive_before`.
+CREATE TABLE IF NOT EXISTS twitch_no_archive (
+    channel_id      TEXT PRIMARY KEY,
+    asked_at_epoch  INTEGER NOT NULL,
+    asked_at        TEXT NOT NULL
+);
+
+
 -- The interval index. A VOD is retroactive, so a nightly sweep loses nothing.
 CREATE TABLE IF NOT EXISTS twitch_vod (
     id              TEXT PRIMARY KEY,
