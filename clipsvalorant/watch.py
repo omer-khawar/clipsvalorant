@@ -4,12 +4,15 @@ Opening a VOD is cheap but not free -- roughly three seconds per frame, between
 the seek and the OCR -- so the order in which we sample matters more than the
 number of frames we are willing to spend.
 
-Two kinds of moment put names on screen, and we know when both happen because
-the match history gives us every kill to the millisecond:
+Three kinds of moment put names on screen, and we know when all three happen
+because the match history gives us every kill to the millisecond and the
+match's own length:
 
   * the end of a round, when the scoreboard appears with all ten names at once.
     These are the frames that returned nine names in one go.
   * a few seconds after any kill, while the killfeed still shows who killed whom.
+  * the half-minute after the match ends, when the post-game scoreboard carries
+    the whole lobby with its scores.
 
 Round ends are tried first because they are worth far more per frame. We stop
 as soon as enough distinct names have come back to make the answer certain,
@@ -48,6 +51,32 @@ MAX_FRAMES = 10
 # Valorant's own furniture rather than a loading screen or a menu.
 ENOUGH_FRAMES = 5
 ENOUGH_VALORANT = 3
+
+# Seconds past the end of the match, where the post-game scoreboard sits. It
+# lists every player with their score, so one readable frame here answers the
+# whole question - twitch.tv/henkyyyval returned nine of nine names off a
+# single one. Ordered by how often each paid off over the 31 confirmed and
+# likely encounters on disk rather than by time.
+#
+# The obvious cousin of this idea does not work and was measured before being
+# abandoned: aiming *before* the match, at the load-in screen that shows all
+# ten players with their agents. Agent select hides the enemy team, so a frame
+# that lands early can never carry more than four names, and half of them
+# landed on agent select or on a tracker overlay the streamer had alt-tabbed
+# into. The post-game screen has no such ceiling.
+END_ANCHOR_AT = (25.0, 45.0, 10.0, 75.0)
+
+# The killfeed goes first and the anchors only displace it when it is not
+# working. Three independent names already in hand means this broadcast reads
+# well and one more of its own frames is likely to finish the job -- which is
+# exactly the candidate a scoreboard frame would have crowded out.
+# twitch.tv/killerjohnson77 is the case: three names by its second frame, the
+# fourth not until its ninth, and no anchor frame carrying anything. Measured
+# over the 31 confirmed and likely encounters on disk, this ordering settles
+# 17 against the 14 the killfeed settles alone, reads 185 frames against 202,
+# and loses none of the ones already being found.
+KILLFEED_FIRST = 3
+ENOUGH_TO_STAY = 3
 
 
 def _normalise_key(text: str) -> str:
@@ -145,6 +174,21 @@ def sample_offsets(kills: list[tuple[int, float]], *, limit: int = MAX_FRAMES,
     return out[:limit]
 
 
+def end_anchors(match_end_s: float, tail_s: float) -> list[float]:
+    """The post-game moments this broadcast actually reaches.
+
+    `match_end_s` is the length of the match on the in-match clock, so these
+    come back in the same units as `sample_offsets` and the caller adds the
+    same offset to both. `tail_s` is how much broadcast remains after the
+    match ends -- a stream that stopped on the final round has none of this to
+    offer, and asking for a frame past the end of the video spends a fetch to
+    be told so.
+    """
+    if match_end_s <= 0 or tail_s <= 0:
+        return []
+    return [match_end_s + at for at in END_ANCHOR_AT if at <= tail_s]
+
+
 def _spread(values: list[float], count: int) -> list[float]:
     """`count` values drawn evenly across the list, order preserved."""
     if len(values) <= count:
@@ -157,11 +201,16 @@ def watch(reader, frames, vod_id: str, vod_offset_s: float,
           kills: list[tuple[int, float]], names: dict[str, str],
           my_name: str = "", *, limit: int = MAX_FRAMES,
           window: tuple[float, float] | None = None,
-          exclude_name: str = "") -> Watched:
+          exclude_name: str = "", match_end_s: float = 0.0,
+          tail_s: float = 0.0) -> Watched:
     """Look at a broadcast and report which lobby members appear in it.
 
     `vod_offset_s` is where the match starts inside the VOD: the match's start
     minus the broadcast's start.
+
+    `match_end_s` and `tail_s` open up the post-game scoreboard; without them
+    only the killfeed and the round ends are sampled, which is what every
+    caller did before `end_anchors` existed.
 
     `exclude_name` is the player this channel is a candidate *for*, and it is
     dropped from the search. This matters more than it sounds. A channel
@@ -188,36 +237,53 @@ def watch(reader, frames, vod_id: str, vod_offset_s: float,
         seen.unavailable = "no lobby name long enough to search for"
         return seen
 
-    wanted = [vod_offset_s + at for at in
-              sample_offsets(kills, limit=limit, window=window)]
-    for offset, path in frames.iter_frames(vod_id, wanted):
-        if path is None:
-            seen.frames_failed += 1
-            # A VOD with no playlist at all will never produce a frame; do not
-            # spend the whole budget discovering that ten times over.
-            if seen.frames_failed >= 2 and seen.frames_read == 0:
-                break
-            continue
-        read = reader.read(path)
-        if read is None:
-            seen.frames_failed += 1
-            continue
-        seen.frames_read += 1
-        seen.reads.append((offset, read))
-        if read.looks_like_valorant:
-            seen.valorant_frames += 1
-        if read.has_match_timer:
-            seen.timer_frames += 1
-        hits = read.names_present(names)
-        seen.names |= hits
-        if my_name and my_name in hits:
-            seen.me_seen = True
-        if seen.certain or seen.other_valorant:
-            # Both are answers, and the second one is the commoner by far:
-            # most candidates are the wrong person, and reading five more
-            # frames of somebody else's match cannot change that. Across one
-            # lobby of razor#d4c's that is the difference between ten frames
-            # per rejected candidate and five, on the single slowest thing a
-            # scan does.
-            break
+    def look(offsets: list[float]) -> bool:
+        """Read these moments. True when the answer is in and we should stop."""
+        for offset, path in frames.iter_frames(vod_id, offsets):
+            if path is None:
+                seen.frames_failed += 1
+                # A VOD with no playlist at all will never produce a frame; do
+                # not spend the whole budget discovering that ten times over.
+                if seen.frames_failed >= 2 and seen.frames_read == 0:
+                    return True
+            else:
+                read = reader.read(path)
+                if read is None:
+                    seen.frames_failed += 1
+                else:
+                    seen.frames_read += 1
+                    seen.reads.append((offset, read))
+                    if read.looks_like_valorant:
+                        seen.valorant_frames += 1
+                    if read.has_match_timer:
+                        seen.timer_frames += 1
+                    hits = read.names_present(names)
+                    seen.names |= hits
+                    if my_name and my_name in hits:
+                        seen.me_seen = True
+                    if seen.certain or seen.other_valorant:
+                        # Both are answers, and the second one is the commoner
+                        # by far: most candidates are the wrong person, and
+                        # reading five more frames of somebody else's match
+                        # cannot change that. Across one lobby of razor#d4c's
+                        # that is the difference between ten frames per
+                        # rejected candidate and five, on the single slowest
+                        # thing a scan does.
+                        return True
+            # The budget is frames attempted, not frames read, and it is the
+            # whole budget rather than one per group -- the anchors displace
+            # killfeed frames, they are never spent on top of them. A rejected
+            # candidate therefore costs exactly what it cost before, which is
+            # the case that decides whether a scan got slower.
+            if seen.frames_read + seen.frames_failed >= limit:
+                return True
+        return False
+
+    killfeed = sample_offsets(kills, limit=limit, window=window)
+    if look([vod_offset_s + at for at in killfeed[:KILLFEED_FIRST]]):
+        return seen
+    rest = killfeed[KILLFEED_FIRST:]
+    if len(seen.names) < ENOUGH_TO_STAY:
+        rest = end_anchors(match_end_s, tail_s) + rest
+    look([vod_offset_s + at for at in rest])
     return seen

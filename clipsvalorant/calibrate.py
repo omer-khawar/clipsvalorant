@@ -7,9 +7,19 @@ gap between them is the whole reason this module exists.
 `started_at` is when the game server session began - the moment the queue
 pops and agent select opens. `time_in_match_in_ms` counts from when the map
 loads, after agent select and after every player's client has finished
-loading. Measured against three broadcasts the gap was 101, 109 and 125
-seconds: about a round and a half, and variable, because loading takes as
-long as the slowest machine in the lobby takes.
+loading. The gap is about a round and a half, and variable, because loading
+takes as long as the slowest machine in the lobby takes.
+
+How variable was badly underestimated here. This module was written against
+three broadcasts whose gaps were 101, 109 and 125 seconds, which made the
+median look like a usable substitute for measuring. Across the seventeen
+broadcasts since measured it runs from **75.8s to 210.2s**, so the estimate is
+routinely half a minute out and occasionally a minute and a half. Two things
+follow. A link built on `FALLBACK_SHIFT_S` can miss its moment by more than a
+round, which is why `measured` is carried everywhere rather than folded in.
+And nothing may be aimed blind at a screen that is only up for a few seconds:
+the load-in screen showing all ten names was measured as an anchor on that
+assumption and settled 2 encounters in 31.
 
 Adding the two together, which is the obvious thing to do and what this
 project did at first, puts every link roughly one round early. It is a
@@ -62,10 +72,12 @@ SCAN_STEP_S = 15
 SCAN_FRAMES = 13
 
 # Used when a broadcast cannot be read - no OCR installed, or the stream
-# joined too late to show a countdown. The median of the measurements above.
-# It is better than nothing and worse than measuring, and the two are kept
-# distinguishable everywhere so a link is never presented as more precise
-# than it is.
+# joined too late to show a countdown. The median of the seventeen measured
+# broadcasts, which is also where the original three sat. It is better than
+# nothing and a great deal worse than measuring - half of those seventeen are
+# more than eight seconds from it and the extremes are 33s either side - and
+# the two are kept distinguishable everywhere so a link is never presented as
+# more precise than it is.
 FALLBACK_SHIFT_S = 109.0
 
 _BUY_WORDS = ("buyphase", "pressbtobuy")

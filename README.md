@@ -1204,6 +1204,69 @@ UI word, the bar that protects against collisions is the count of distinct
 names and it held, and the only rule change available was measured to cost more
 than it saved.
 
+#### The one frame that shows the whole lobby (2026-11-21)
+
+A killfeed frame carries two names and four are needed, which is why a
+candidate costs ten frames. Two screens carry all ten at once: the load-in
+screen, which lists both teams with their agents and the map, and the post-game
+scoreboard. Both sit at positions arithmetic already knows - the match's start,
+and its start plus its length - so the appealing version of this idea is to
+replace ten sampled frames with one computed one.
+
+Measured over the 31 confirmed and likely encounters, aiming with the median
+shift the way a real scan must:
+
+| what was aimed at | settled |
+| --- | ---: |
+| one frame at the match start | 2/31 |
+| one frame 25s after the match ends | 4/31 |
+| both | 6/31 |
+| all ten positions | 14/31 |
+
+So the one-frame version does not work, and **the reason is the clock, not the
+screen**. Where a probe happened to land on the true match start the load-in
+screen is right there and complete - `twitch.tv/vaerie` returns **nine of nine
+names off a single frame**. But the gap between `started_at` and the in-match
+clock, measured across seventeen broadcasts, runs from **75.8s to 210.2s**, and
+`calibrate.py` was written against three that happened to fall between 101 and
+125. Aiming with a median that can be half a minute wrong cannot reliably hit a
+screen that is up for twenty seconds.
+
+Re-aimed with each broadcast's own measured shift, the best single position
+still settles only 5 of 17, and the frames say why: **agent select hides the
+enemy team**, so any frame before the match has a ceiling of four names, and
+several streamers were alt-tabbed into a tracker overlay. The pre-match anchor
+has a ceiling the post-game one does not.
+
+What survived is the post-game scoreboard, and not as a replacement. The
+killfeed and the scoreboard are complementary: `twitch.tv/punz` caps at three
+names across ten killfeed frames and gets five off one scoreboard, while
+`twitch.tv/killerjohnson77` has three names by its second killfeed frame, its
+fourth not until its ninth, and nothing on any scoreboard frame. So the
+scoreboard is tried after three killfeed frames, and only when fewer than three
+names are already in hand.
+
+Run through the shipped `watch` both ways, same machine:
+
+| | settled | frames |
+| --- | ---: | ---: |
+| confirmed and likely, before | 14/31 | 208 |
+| confirmed and likely, after | **17/31** | **198** |
+| rejected, before | 0/89 | 765 |
+| rejected, after | 0/89 | 767 |
+
+Three gained, none lost, ten frames saved where it matters and two spent where
+it does not. `twitch.tv/redefy` went from three names in ten frames to **nine
+in seven**. The rejections are flat by construction: the anchors displace
+killfeed frames rather than adding to them, so a candidate that is the wrong
+person costs what it always did, which is the case that decides whether a scan
+got slower.
+
+The collision risk was measured before shipping, because a scoreboard puts ten
+names on screen where a killfeed puts two, and a lobby name is matched as a
+substring. Across **272 anchor frames on 73 rejections, 71 returned no lobby
+name at all and two returned two**. None reached four.
+
 ### Measuring recall, and the layer that was not built
 
 Knowing what the tool claims is easy; knowing what it misses is not. A missed

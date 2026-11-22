@@ -13,10 +13,14 @@ rules for reading it, and for what to do when the answer is no.
 
 from clipsvalorant.resolve import Evidence
 import json
+from pathlib import Path
 
 from clipsvalorant import vision
 from clipsvalorant.vision import FrameRead, TextBox, normalise, wanted_names
-from clipsvalorant.watch import CERTAIN_NAMES, Watched, sample_offsets
+from clipsvalorant.watch import (
+    CERTAIN_NAMES, KILLFEED_FIRST, MAX_FRAMES, Watched, end_anchors,
+    sample_offsets, watch,
+)
 
 
 def _frame(*texts: tuple[str, float, float], size: tuple[int, int] = (1280, 720)) -> FrameRead:
@@ -101,6 +105,111 @@ def test_a_window_holding_none_of_the_action_yields_nothing():
 
 def test_no_kills_means_nowhere_worth_looking():
     assert sample_offsets([]) == []
+
+
+def test_the_post_game_scoreboard_is_looked_for_past_the_end_of_the_match():
+    """It is the one screen that lists the whole lobby with no ceiling on how
+    much of it can be read: twitch.tv/henkyyyval returned nine of nine names
+    off a single frame thirty seconds after the final round."""
+    assert end_anchors(1800.0, 300.0) == [1825.0, 1845.0, 1810.0, 1875.0]
+
+
+def test_a_broadcast_that_stopped_on_the_final_round_offers_no_scoreboard():
+    """Asking for a frame past the end of the video spends a fetch to be told
+    there isn't one, and the budget is in frames, not in useful frames."""
+    assert end_anchors(1800.0, 0.0) == []
+    assert end_anchors(0.0, 300.0) == []
+
+
+def test_only_the_scoreboard_moments_the_broadcast_actually_reaches_are_used():
+    assert end_anchors(1800.0, 30.0) == [1825.0, 1810.0]
+
+
+# ------------------------------------------- spending the budget in the right order
+
+def _driver(on_screen: dict[int, list[str]], dead: tuple[int, ...] = ()):
+    """A reader and a frame store standing in for a real broadcast.
+
+    `on_screen` says which names a given second of the broadcast shows, and
+    `dead` which seconds cannot be fetched at all.
+    """
+    asked: list[float] = []
+
+    class _Frames:
+        def iter_frames(self, vod_id, offsets, ahead=4):
+            for offset in offsets:
+                asked.append(offset)
+                yield offset, (None if int(offset) in dead
+                               else Path(f"{int(offset)}.png"))
+
+    class _Reader:
+        available = True
+
+        def read(self, path):
+            second = int(Path(path).stem)
+            return _frame(*[(name, 10.0, 300.0)
+                            for name in on_screen.get(second, ())])
+
+    return _Reader(), _Frames(), asked
+
+
+# Round ends land on a hundred-second grid, so the killfeed frames are 105,
+# 205 ... 1005 and the match ends at 1100 with a hundred seconds of broadcast
+# left after it.
+_KILLS = [(rnd, rnd * 100.0) for rnd in range(1, 11)]
+_TAIL = {"match_end_s": 1100.0, "tail_s": 100.0}
+
+
+def test_the_scoreboard_is_tried_once_the_killfeed_has_stopped_paying():
+    """Three killfeed frames showing nothing is the signal that this broadcast
+    does not read well, and the post-game scoreboard is the better bet from
+    there. Measured over the 31 confirmed and likely encounters on disk, this
+    settles 17 against 14 and reads 185 frames against 202."""
+    reader, frames, asked = _driver({1125: ["alpha", "bravo", "charlie", "delta"]})
+    seen = watch(reader, frames, "v1", 0.0, _KILLS,
+                 wanted_names([(n, False) for n in
+                               ("alpha", "bravo", "charlie", "delta")]), **_TAIL)
+    assert seen.certain
+    assert 1125.0 in asked
+    assert asked.index(1125.0) == KILLFEED_FIRST  # straight after the three
+
+
+def test_a_killfeed_that_is_nearly_there_is_not_interrupted():
+    """twitch.tv/killerjohnson77 had three names by its second frame, the
+    fourth not until its ninth, and nothing at all on any scoreboard frame.
+    Three names in hand means the broadcast reads well, so its own frames are
+    worth more than a screen that may not be there."""
+    names = wanted_names([(n, False) for n in
+                          ("alpha", "bravo", "charlie", "delta")])
+    reader, frames, asked = _driver({
+        105: ["alpha"], 205: ["bravo"], 305: ["charlie"],
+        905: ["delta"], 1125: ["alpha", "bravo", "charlie", "delta"],
+    })
+    seen = watch(reader, frames, "v1", 0.0, _KILLS, names, **_TAIL)
+    assert seen.certain
+    assert 1125.0 not in asked, "the scoreboard crowded out the frame that settled it"
+
+
+def test_a_rejected_candidate_is_never_charged_for_the_scoreboard():
+    """The anchors displace killfeed frames, they are never spent on top of
+    them. Nearly every candidate is the wrong person, so this is the case that
+    decides whether a scan got slower, and it must cost exactly what it did."""
+    names = wanted_names([(n, False) for n in ("alpha", "bravo", "charlie", "delta")])
+    reader, frames, asked = _driver({})
+    seen = watch(reader, frames, "v1", 0.0, _KILLS, names, **_TAIL)
+    assert not seen.certain
+    assert seen.frames_read == MAX_FRAMES
+    assert len(asked) == MAX_FRAMES
+
+
+def test_a_broadcast_with_no_video_is_abandoned_not_sampled_to_the_end():
+    """Two dead frames and nothing read means there is no playlist to seek
+    into, and the remaining eight fetches will all fail the same way."""
+    names = wanted_names([(n, False) for n in ("alpha", "bravo", "charlie", "delta")])
+    reader, frames, asked = _driver({}, dead=tuple(range(0, 2000)))
+    seen = watch(reader, frames, "v1", 0.0, _KILLS, names, **_TAIL)
+    assert seen.frames_read == 0
+    assert seen.frames_failed == 2
 
 
 # -------------------------------------------------------- ruling things out

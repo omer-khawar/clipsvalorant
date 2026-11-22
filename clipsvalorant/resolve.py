@@ -1001,11 +1001,17 @@ def resolve_match(
         hi = min(float(end - start), cand.vod.end_epoch - start - cal.shift_s)
         if hi - lo < MIN_WATCH_WINDOW_S:
             return
+        length = float(end - start)
         seen = watch(
             watcher.reader, watcher.frames, cand.vod.id,
             base, kills, lobby, my_name,
             limit=watcher.limit, window=(lo, hi),
             exclude_name=cand.player.name,
+            # How much broadcast is left once the match ends, which is where
+            # the post-game scoreboard lives. A stream that stopped on the
+            # final round has none of it and is sampled as before.
+            match_end_s=length,
+            tail_s=max(0.0, (cand.vod.end_epoch - start - cal.shift_s) - length),
         )
         ev = cand.evidence
         ev.frames_read = seen.frames_read
@@ -1409,6 +1415,8 @@ def audit_verdicts(
                 # like the player, so its own overlay agreeing with itself
                 # is not evidence of anything.
                 exclude_name=row["riot_id"].partition("#")[0],
+                match_end_s=float(end - start),
+                tail_s=max(0.0, float(row["end_epoch"] - end)),
             )
             if len(seen.names) >= CERTAIN_NAMES:
                 flips.append(

@@ -97,7 +97,25 @@ safe only because it needs three Valorant frames and so fails silent rather than
 to `shadow` and matched inside the SMITE skin name *Izanami Shadowstalker*; 40% of the
 searchable names in these databases normalise to six characters or fewer. `CERTAIN_NAMES
 = 4` is the only thing standing between that and a false confirmation, so do not lower
-it.
+it. The post-game anchors were measured against this before shipping: 272 anchor frames
+over 73 rejections returned no lobby name on 71 of them and two on the other two.
+
+**The gap between `started_at` and the in-match clock is 76-210 seconds, not ~109.**
+`calibrate.py` was written against three broadcasts that all fell between 101 and 125,
+and seventeen measured since span 75.8s to 210.2s. So `FALLBACK_SHIFT_S` is routinely
+half a minute out, and **nothing may be aimed blind at a screen that is up for only a
+few seconds**. That is what killed the load-in anchor: the screen listing all ten
+players with their agents is real and complete - `twitch.tv/vaerie` gives nine of nine
+names off one frame - and aimed with the median it settled 2 encounters in 31. Agent
+select also hides the enemy team, so any pre-match frame has a ceiling of four names.
+The post-game scoreboard has neither problem, which is why it is the one that shipped.
+
+**A frame budget may be reordered but not enlarged.** Nearly every candidate is the
+wrong person and spends the whole budget, so adding a frame per candidate taxes the
+common case directly while the gains land only on the rare one. `END_ANCHOR_AT` frames
+displace killfeed frames inside `MAX_FRAMES`; measured, rejections went from 765 frames
+to 767 over 89 encounters while confirmations went from 14 to 17 over 31 and from 208
+frames to 198.
 
 **Hardware dominates everything.** One match costs ~4.7s on a 12-core laptop and ~34s on
 the 1/8 OCPU box. Before concluding that something got slower, check which machine the
