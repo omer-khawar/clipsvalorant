@@ -18,6 +18,17 @@ primary_region = "iad"
   PORT = "8080"
   RIOT_REGION = "na"
 
+  # What the free trial does to a Machine: stops it five minutes after it
+  # starts, whatever it is in the middle of, and no environment variable
+  # announces that. So the app is told rather than left to infer it, and it
+  # spends the warning: a countdown before the deadline, and an offer to pick
+  # the scan back up afterwards instead of it simply vanishing. Every match
+  # that finished is already committed, so resuming is a shorter scan.
+  #
+  # Delete this line once a card is on the account. The cap goes with the
+  # trial, and a deadline that never arrives would warn for nothing.
+  CLIPS_UPTIME_LIMIT_S = "300"
+
 [http_service]
   internal_port = 8080
   force_https = true
