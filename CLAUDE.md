@@ -117,6 +117,23 @@ displace killfeed frames inside `MAX_FRAMES`; measured, rejections went from 765
 to 767 over 89 encounters while confirmations went from 14 to 17 over 31 and from 208
 frames to 198.
 
+**Only `/helix/users` carries a channel bio**, so `description IS NULL` in
+`twitch_channel` means "never looked", not "no bio" -- every other way a channel
+gets written down (a clip pool, a search hit) leaves it NULL, and
+`_remember_channel` coalesces rather than overwrites for exactly this reason.
+`description_fetched_at` is when the bio was read; `last_seen` is not a
+substitute, because a channel is seen again every time it turns up in a clip
+pool. `_fresh_bios` trusts a stored bio for `BIO_TTL_S` (a fortnight, Twitch's
+own retention for an unsubscribed channel) and treats an unstamped one as
+`first_seen`, the earliest it can have been read.
+
+**The bio half of Layer 4 has never produced an encounter.** Zero of the 16,923
+on disk across nineteen databases came from `clip_window+bio`; the 24
+clip-derived ones all came from the name-prefix fallback. Do not delete it --
+it is the only path that reaches a channel whose name says nothing about the
+Riot ID, which is what Layer 4 is *for* -- but weigh any cost it adds against a
+measured yield of nothing. It used to fetch about 170 bios a match for this.
+
 **Hardware dominates everything.** One match costs ~4.7s on a 12-core laptop and ~34s on
 the 1/8 OCPU box. Before concluding that something got slower, check which machine the
 two numbers came from. Two separate wrong diagnoses in this repository's history were

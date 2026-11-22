@@ -62,6 +62,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("kill", "y", "REAL"),
     ("twitch_channel", "profile_image_url", "TEXT"),
     ("encounter", "checked_at", "TEXT"),
+    ("twitch_channel", "description_fetched_at", "TEXT"),
 )
 
 

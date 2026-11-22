@@ -10,16 +10,24 @@ evidence tying a channel to *this* match can.
 
 import dataclasses
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from clipsvalorant import db
 
 from clipsvalorant.models import Player
 from clipsvalorant.resolve import (
+    BIO_TTL_S,
     MIN_PREFIX_LEN,
     Evidence,
+    ResolveReport,
+    _fresh_bios,
     _prefix_related,
+    _remember_channel,
     _same_id,
     _tags_in,
     bio_names,
+    clip_derived_candidates,
     game_from_title,
     normalise,
     riot_ids_in,
@@ -27,6 +35,15 @@ from clipsvalorant.resolve import (
 )
 from clipsvalorant.twitch import Vod
 from clipsvalorant.watch import CERTAIN_NAMES
+
+
+def _player(name: str = "Vaerie", tag: str = "1234") -> Player:
+    return Player(puuid="p1", name=name, tag=tag, team="Blue")
+
+
+def _ago(seconds: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat(
+        timespec="seconds")
 
 
 def _vod(created: int, duration: int, title: str = "") -> Vod:
@@ -307,6 +324,152 @@ def test_a_channel_from_the_clip_pool_needs_five_characters_to_be_tied_to_a_play
         )
     tied = {c.channel_login: c.player.name for c in found}
     assert tied == {"cocapuppy": "CocaPup"}
+
+
+# --- bios the clip pool has already been asked for ----------------------
+
+
+class _Lobby:
+    """Enough of a Match for Layer 4, which only ever reads the id."""
+
+    id = "m1"
+
+
+def _pool(*ids: str, bio: str = "no riot id in here"):
+    """A clip pool of these broadcasters, and a record of whose bios we paid for.
+
+    The bio the fake hands back is the *live* one, so a test can tell which
+    path produced a tie: anything found in a different bio came off the disk.
+    """
+    asked: list[str] = []
+
+    class _Client:
+        def clips_in_window(self, *a, **k):
+            return [{"broadcaster_id": i, "broadcaster_login": i,
+                     "broadcaster_name": i} for i in ids]
+
+        def users(self, *, logins=None, ids=None):
+            asked.extend(ids or [])
+            return [{"id": i, "login": i, "display_name": i, "description": bio}
+                    for i in (ids or [])]
+
+    return _Client(), asked
+
+
+def _fresh_db():
+    return db.session(Path(tempfile.mkdtemp()) / "x.db")
+
+
+def test_a_bio_already_on_disk_is_not_fetched_again():
+    """The clip pool repeats, and a second scan must not pay for it twice.
+
+    The pool is every Valorant clip created worldwide in those minutes, so the
+    few hundred channels with an audience come back match after match and scan
+    after scan. Measured against four real matches of an account already in
+    the database, 684 of 684 pool channels had their bio stored and the nine
+    /helix/users calls became none - which is most of what a match with no
+    broadcast to look at costs.
+    """
+    client, asked = _pool("c1", "c2")
+    with _fresh_db() as conn:
+        _remember_channel(conn, {"id": "c1", "login": "c1",
+                                 "description": "already read this one"})
+        clip_derived_candidates(conn, client, _Lobby(), [_player()],
+                                0, 1800, "516575", ResolveReport())
+    assert asked == ["c2"]
+
+
+def test_a_stored_bio_still_ties_a_channel_to_the_player():
+    """The saving must not cost the layer its reach.
+
+    Reading bios is the only part of Layer 4 that reaches a channel whose name
+    says nothing about the Riot ID, so a cache that quietly stopped finding
+    those would be a straight loss. The stored bio names the player and the
+    live one does not, so only the disk can produce this tie.
+    """
+    client, asked = _pool("c1")
+    with _fresh_db() as conn:
+        _remember_channel(conn, {"id": "c1", "login": "someoneelse",
+                                 "description": "main: Vaerie#1234"})
+        found = clip_derived_candidates(conn, client, _Lobby(), [_player()],
+                                        0, 1800, "516575", ResolveReport())
+    assert asked == []
+    assert [(c.channel_login, c.source) for c in found] == [("c1", "clip_window+bio")]
+
+
+def test_a_bio_too_old_to_trust_is_read_again():
+    """A cached bio can only cost a link by being out of date.
+
+    The one way this loses something is a streamer who put their Riot ID in
+    their bio after we last looked. Fourteen days bounds that, and it is
+    Twitch's own retention for a channel without a subscription - so a bio
+    older than the cutoff could only have mattered to a match whose broadcast
+    is already gone.
+    """
+    client, asked = _pool("c1")
+    with _fresh_db() as conn:
+        _remember_channel(conn, {"id": "c1", "login": "c1", "description": "old"})
+        conn.execute(
+            "UPDATE twitch_channel SET description_fetched_at = ?, first_seen = ?",
+            (_ago(BIO_TTL_S + 60), _ago(BIO_TTL_S + 60)),
+        )
+        clip_derived_candidates(conn, client, _Lobby(), [_player()],
+                                0, 1800, "516575", ResolveReport())
+    assert asked == ["c1"]
+
+
+def test_a_channel_known_only_from_a_clip_has_no_bio_to_reuse():
+    """Only /helix/users carries a bio, and the pool itself does not.
+
+    Every channel in the pool gets written down as a side effect of being
+    there, so if the absence of a bio were read as an empty one, the first
+    sighting would poison the cache for a fortnight and the layer would stop
+    finding anything at all.
+    """
+    client, asked = _pool("c1")
+    with _fresh_db() as conn:
+        _remember_channel(conn, {"id": "c1", "broadcaster_login": "c1",
+                                 "display_name": "c1"})
+        assert _fresh_bios(conn, ["c1"]) == {}
+        clip_derived_candidates(conn, client, _Lobby(), [_player()],
+                                0, 1800, "516575", ResolveReport())
+    assert asked == ["c1"]
+
+
+def test_a_sighting_without_a_bio_does_not_make_an_old_one_look_fresh():
+    """`last_seen` moves on every sighting; the bio's own stamp must not.
+
+    A channel turns up in a clip pool constantly, and each of those is a write
+    to its row. If that write moved the bio's timestamp, a bio read once would
+    look freshly checked forever and the fortnight would never elapse.
+    """
+    with _fresh_db() as conn:
+        _remember_channel(conn, {"id": "c1", "login": "c1", "description": "x"})
+        old = _ago(BIO_TTL_S + 60)
+        conn.execute("UPDATE twitch_channel SET description_fetched_at = ?", (old,))
+        _remember_channel(conn, {"id": "c1", "broadcaster_login": "c1"})
+        row = conn.execute(
+            "SELECT description, description_fetched_at AS at FROM twitch_channel"
+        ).fetchone()
+    assert (row["description"], row["at"]) == ("x", old)
+
+
+def test_an_unstamped_bio_is_read_again_rather_than_guessed_at():
+    """Every row written before the column existed has no stamp at all.
+
+    `first_seen` stands in, which is the earliest the bio can have been read.
+    An unknown age therefore reads as the oldest plausible one and the bio is
+    fetched, rather than trusted on the strength of a guess.
+    """
+    with _fresh_db() as conn:
+        _remember_channel(conn, {"id": "c1", "login": "c1", "description": "x"})
+        conn.execute(
+            "UPDATE twitch_channel SET description_fetched_at = NULL, first_seen = ?",
+            (_ago(BIO_TTL_S + 60),),
+        )
+        assert _fresh_bios(conn, ["c1"]) == {}
+        conn.execute("UPDATE twitch_channel SET first_seen = ?", (_ago(60),))
+        assert _fresh_bios(conn, ["c1"]) == {"c1": "x"}
 
 
 # --- re-reading what is already on disk ---------------------------------

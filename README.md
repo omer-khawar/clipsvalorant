@@ -811,6 +811,75 @@ window while the page shows two, because vaerie and cocapuppy are on matches
 that have since aged out of fourteen days. That is the exact gap the "not
 re-checked for N days" line on each card now exists to explain.
 
+#### The bios we had already read (2026-11-21)
+
+With the frames reordered, the rest of a scan's time is Twitch, and most of
+that is one call. Layer 4 asks `/helix/clips` for every Valorant clip created
+during the match -- a pool of roughly 170 channels -- and then reads all of
+their bios through `/helix/users`, looking for a `NAME#TAG` belonging to
+somebody in the lobby. A sixteen-match scan of `d3mur#ari` read **2,805 bios**
+doing it.
+
+That pool is not random. It is whoever was being clipped on Valorant in those
+minutes, which is the same few hundred channels with an audience, match after
+match and scan after scan. Their bios were already in `twitch_channel` from the
+first time, and `schema.sql` has had a `description` column since Phase 2.
+Nothing read it.
+
+Measured against four real matches of an account already in the database:
+
+| | before | after |
+|---|---:|---:|
+| clip-pool channels | 684 | 684 |
+| bios fetched from Twitch | 684 | **0** |
+| `/helix/users` calls | 9 | **0** |
+| seconds spent on them | 0.9 | **0.001** |
+| Riot IDs found in bios | 1 | 1 |
+
+684 of 684 already on disk, because that database was built by scanning that
+account. The reach is unchanged: the one bio that named a lobby member still
+names them, read from SQLite instead of fetched again.
+
+The general case is weaker than 100% and was measured too. Across ten
+databases, 35,039 of 46,771 stored channels carry a bio -- **74.9%** -- and
+every one of them is inside the fortnight the cache trusts. The fortnight is
+Twitch's own VOD retention for a channel without a subscription, so a bio too
+old to use could only ever have mattered to a match whose broadcast is already
+gone. The one thing a cached bio can cost is a streamer who added their Riot ID
+to their bio since we last looked, and fourteen days is the bound on that.
+
+A brand-new account still pays in full on its first scan, because every account
+gets its own database. It need not: the other nine databases between them
+already hold **64.1%** of d3mur's bios. A shared `twitch_channel` table would
+hand a new account two thirds of its bio lookups before it starts, which is
+the strongest argument yet for the shared-table item in
+[OPEN.md](OPEN.md).
+
+#### The layer that has never once fired
+
+Worth saying plainly, since the above makes it cheap rather than useless.
+Across nineteen databases and 16,923 recorded encounters, the number ever found
+by `clip_window+bio` -- a Riot ID read out of a clip-pool channel's bio -- is
+**zero**. Every clip-derived encounter on disk came from the name-prefix
+fallback instead:
+
+| how it was found | encounters | confirmed or likely |
+|---|---:|---:|
+| `name_prefix` | 12,484 | 5 |
+| `name_match` | 4,410 | 10 |
+| `clip_window` | 17 | 7 |
+| `alias:clip_window` | 7 | 5 |
+| `alias:name_prefix` | 2 | 2 |
+| `alias:name_match` | 2 | 2 |
+| `clip_window+bio` | **0** | 0 |
+
+That is not an argument for deleting it. The bio is the only half of Layer 4
+that can reach a channel whose name says nothing about the Riot ID, which is
+the case the whole layer exists for; without it, Layer 4 collapses into "a
+name-resembling channel that was also being clipped". But it does mean the
+cost was buying a possibility rather than a result, and now it costs almost
+nothing.
+
 ### How a streamer is confirmed, and the two ways to get it wrong
 
 Finding the channel is the easy half. Proving it is the right person is the whole

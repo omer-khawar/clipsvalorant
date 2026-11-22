@@ -425,6 +425,10 @@ class ResolveReport:
     clips_seen: int = 0
     clip_channels: int = 0
     bios_read: int = 0
+    # Bios answered off disk instead. Reported rather than folded into
+    # `bios_read`, because the two numbers say different things: one is what
+    # this scan cost Twitch, the other is what it did not have to.
+    bios_cached: int = 0
     frames_read: int = 0
     calibrated: int = 0
     uncalibrated: int = 0
@@ -468,6 +472,7 @@ class ResolveReport:
             f"{self.name_candidates} name candidate(s), "
             f"{self.clips_seen} clip(s) from {self.clip_channels} channel(s), "
             f"{self.bios_read} bio(s) read, "
+            + (f"{self.bios_cached} already on disk, " if self.bios_cached else "")
             + (f"{self.frames_read} VOD frame(s) read, " if self.frames_read else "")
             + (f"{self.aliases_dropped} earlier tie(s) withdrawn, "
                if self.aliases_dropped else "")
@@ -531,15 +536,22 @@ def _known_aliases(conn: sqlite3.Connection, name: str, tag: str) -> list[sqlite
 
 def _remember_channel(conn: sqlite3.Connection, row: dict) -> None:
     now = db.utcnow()
+    # Only a row that actually brought a bio may stamp when the bio was read.
+    # A sighting from a clip or a search carries none, and letting it move the
+    # stamp would make a bio read a fortnight ago look freshly checked.
+    read_at = now if row.get("description") is not None else None
     conn.execute(
         """
         INSERT INTO twitch_channel (id, login, display_name, description,
+                                    description_fetched_at,
                                     profile_image_url, first_seen, last_seen)
-        VALUES (?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
             login = excluded.login,
             display_name = excluded.display_name,
             description = COALESCE(excluded.description, twitch_channel.description),
+            description_fetched_at = COALESCE(excluded.description_fetched_at,
+                                              twitch_channel.description_fetched_at),
             profile_image_url = COALESCE(excluded.profile_image_url,
                                          twitch_channel.profile_image_url),
             last_seen = excluded.last_seen
@@ -549,6 +561,7 @@ def _remember_channel(conn: sqlite3.Connection, row: dict) -> None:
             row.get("broadcaster_login") or row.get("login") or "",
             row.get("display_name"),
             row.get("description"),
+            read_at,
             # Only /helix/users carries this; a search hit does not, which is
             # why it is coalesced rather than overwritten.
             row.get("profile_image_url") or row.get("thumbnail_url"),
@@ -556,6 +569,46 @@ def _remember_channel(conn: sqlite3.Connection, row: dict) -> None:
             now,
         ),
     )
+
+
+# How long a bio already on disk is trusted before it is read again. A stored
+# bio can only cost us a link if the streamer added their Riot ID to it since we
+# last looked, and fourteen days is Twitch's own VOD retention for a channel
+# without a subscription - so a bio older than this could only ever have
+# mattered to a match whose broadcast is already gone.
+BIO_TTL_S = 14 * 24 * 3600
+
+
+def _fresh_bios(conn: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
+    """The bios already on disk that are young enough to use.
+
+    A row with no `description` has never been through /helix/users: every
+    other way a channel gets remembered leaves the bio NULL, so such a row is
+    absent here and will be fetched. Where `description_fetched_at` is NULL --
+    every row written before that column existed -- `first_seen` stands in. It
+    is the earliest the bio can possibly have been read, so an unknown age
+    reads as the oldest plausible one and the bio is fetched again rather than
+    trusted on the strength of a guess.
+    """
+    out: dict[str, str] = {}
+    if not ids:
+        return out
+    cutoff = int(datetime.now(timezone.utc).timestamp()) - BIO_TTL_S
+    # SQLite takes 999 bound parameters in a statement by default, and a clip
+    # pool can carry more channels than that.
+    for start_i in range(0, len(ids), 400):
+        chunk = ids[start_i:start_i + 400]
+        marks = ",".join("?" * len(chunk))
+        for row in conn.execute(
+            "SELECT id, description, "
+            "       COALESCE(description_fetched_at, first_seen) AS read_at "
+            f"FROM twitch_channel WHERE description IS NOT NULL AND id IN ({marks})",
+            chunk,
+        ):
+            read_at = db.to_epoch(row["read_at"])
+            if read_at is not None and read_at >= cutoff:
+                out[row["id"]] = row["description"]
+    return out
 
 
 def _remember_vod(conn: sqlite3.Connection, vod: Vod) -> None:
@@ -890,9 +943,20 @@ def clip_derived_candidates(
     # ID is tied to that player by something stronger than a resemblance.
     bios: dict[str, set[str]] = {}
     ids = list(casters)
-    for start_i in range(0, len(ids), 100):
+    # The pool is every Valorant clip made in those minutes, so the same few
+    # hundred channels with an audience come back match after match and scan
+    # after scan, and their bios are already on disk from the first time.
+    # Measured on data/ui-d3mur-ari.db: 2,509 of its 3,225 channels had a bio
+    # stored while the sixteen-match scan that built it read 2,805 from the API.
+    stored = _fresh_bios(conn, ids)
+    for bid, text in stored.items():
+        found = riot_ids_in(text)
+        if found:
+            bios[bid] = found
+    fetch = [bid for bid in ids if bid not in stored]
+    for start_i in range(0, len(fetch), 100):
         try:
-            for user in client.users(ids=ids[start_i:start_i + 100]):
+            for user in client.users(ids=fetch[start_i:start_i + 100]):
                 _remember_channel(conn, user)
                 found = riot_ids_in(user.get("description") or "")
                 if found:
@@ -900,7 +964,8 @@ def clip_derived_candidates(
         except Exception as exc:
             report.errors.append(f"clip-pool bios failed: {exc}")
             break
-    report.bios_read += len(ids)
+    report.bios_read += len(fetch)
+    report.bios_cached += len(stored)
 
     out: list[Candidate] = []
     for bid, login in casters.items():

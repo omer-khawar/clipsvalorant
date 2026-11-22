@@ -135,6 +135,10 @@ CREATE TABLE IF NOT EXISTS twitch_channel (
     login           TEXT NOT NULL,
     display_name    TEXT,
     description     TEXT,                   -- channel bio; mined for NAME#TAG
+    -- When that bio was read from /helix/users. `last_seen` cannot stand in for
+    -- it: a channel is seen again every time it turns up in a clip pool, and
+    -- only /helix/users carries the bio at all.
+    description_fetched_at TEXT,
     first_seen      TEXT NOT NULL,
     last_seen       TEXT NOT NULL
 );

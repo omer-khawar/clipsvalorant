@@ -121,6 +121,16 @@ Worth answering, in roughly this order:
   saving is real; what it costs in write contention with several scans running
   has not been looked at, and `WORKERS = 1` means there is only ever one writer
   today.
+
+  **This now has a price on it.** Bios are read off disk when they are already
+  there, which on a re-scan of a known account answers the whole clip pool -
+  684 of 684 channels across four real matches, nine `/helix/users` calls down
+  to none. A *new* account gets none of that, because its database is empty.
+  But the other nine databases between them already hold **64.1%** of
+  `d3mur#ari`'s bios, so a shared channel table would hand a first-time scan
+  two thirds of its bio lookups before it starts. That is the whole remaining
+  benefit of this item on the speed side, and it is now a measured number
+  rather than a guess.
 - **Can the VODs themselves be kept?** Right now the segments are fetched,
   one frame is taken, and the rest is thrown away. Keeping even a few seconds
   around each moment that matters would make a re-check free, and would make the
@@ -150,11 +160,17 @@ yrn#wkmts checked forty-four in 164s, because the floor is the per-match Twitch
 sweep - thousands of bios read before a frame is touched - and what moves the
 number past that floor is VOD frames, not matches.
 
+Those bios are now read from disk when they are already there, which on a
+re-scan removes them from the floor entirely. The eight-account numbers above
+were measured before that and have not been re-taken, so treat them as the
+ceiling rather than the current cost.
+
 A hundred matches at that rate is about **six minutes on this machine**, and the
 box is roughly seven times slower. So "under five minutes for a hundred" is
 close but not yet true, and it will not be the API that gets it there. The
 shared-cache question in section 2 is now the biggest lever on speed as well as
-on quota.
+on quota - and half of it has since been taken, for a re-scan at least. What is
+left of it is the first scan of an account nobody has scanned before.
 
 **What it needs from a host**, which is what rules most of them out: `ffmpeg`
 and `yt-dlp` on PATH, onnxruntime for OCR, a persistent disk for the databases
